@@ -23,7 +23,7 @@ C interop ground truth (`libRIST`).
 ## Architecture
 
 ristrust is a **sans-I/O deterministic core** with a thin async host around it —
-the same philosophy as the author's [srtrust](https://github.com/zsiec/srtrust).
+the same philosophy as [srtrust](https://github.com/zsiec/srtrust).
 
 The protocol's ARQ + reordering + de-duplication + RTT/NACK cadence + **SMPTE
 2022-7 multipath merge** live in a pure state machine that never touches a clock,

@@ -1,0 +1,29 @@
+[package]
+name = "rist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Tokio I/O host and public Sender/Receiver API for RIST (Reliable Internet Stream Transport, VSF TR-06)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The deterministic core (driven by the host) and the profile codecs (run by the
+# host's per-profile strategy). The host is the only crate that touches I/O.
+rist-core.workspace = true
+rist-codec.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

@@ -1,0 +1,24 @@
+[package]
+name = "rist-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Pure RIST profile codecs (RTP/RTCP, GRE, Advanced) and crypto, encoding through the rist-core narrow waist"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The narrow waist this crate decodes into / encodes from. The dependency arrow
+# points one way: codecs depend on the core, never the reverse.
+rist-core.workspace = true
+# Crypto (RustCrypto, pure Rust). PSK key derivation is PBKDF2-HMAC-SHA256.
+pbkdf2.workspace = true
+sha2.workspace = true

@@ -1,0 +1,272 @@
+//! Public configuration: all libRIST defaults, a fluent builder, and validation.
+//!
+//! Durations are `std::time::Duration` at the public surface; the session layer
+//! converts them to the core's microsecond domain. Defaults match libRIST exactly
+//! (see the table in `CLAUDE.md`) so a ristrust peer interoperates with libRIST.
+
+use std::time::Duration;
+
+use rist_codec::crypto::AesKeyBits;
+
+use crate::error::ConfigError;
+
+/// The RIST profile (wire dialect) a session speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// VSF TR-06-1: bare RTP/RTCP on an even/odd UDP port pair.
+    Simple,
+    /// VSF TR-06-2: GRE-over-UDP tunnel, PSK encryption, EAP-SRP auth.
+    Main,
+    /// VSF TR-06-3: compact header, AEAD, LZ4 compression, control messages.
+    Advanced,
+}
+
+/// Which wire encoding the receiver uses for negative acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NackType {
+    /// RTCP APP "RIST" `{start, extra}` ranges (libRIST default).
+    Range,
+    /// RFC 4585 Generic NACK (PT 205, FMT 1) `{PID, BLP}` bitmask.
+    Bitmask,
+}
+
+/// Session configuration. Construct via [`Config::default`] (the libRIST defaults)
+/// and refine with the `with_*` builder methods; call [`Config::validate`] before
+/// use (the constructors do this for you).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Config {
+    /// The profile (wire dialect).
+    pub profile: Profile,
+    /// Minimum recovery buffer (`recovery_length_min`).
+    pub buffer_min: Duration,
+    /// Maximum recovery buffer (`recovery_length_max`).
+    pub buffer_max: Duration,
+    /// Reorder tolerance before a gap is treated as loss.
+    pub reorder_buffer: Duration,
+    /// Lower RTT clamp.
+    pub rtt_min: Duration,
+    /// Upper RTT clamp.
+    pub rtt_max: Duration,
+    /// RTT multiplier for the recovery window.
+    pub rtt_multiplier: u32,
+    /// Minimum retransmission requests before giving up.
+    pub min_retries: u32,
+    /// Maximum retransmission requests before giving up.
+    pub max_retries: u32,
+    /// Peer liveness timeout.
+    pub session_timeout: Duration,
+    /// Keepalive cadence.
+    pub keepalive_interval: Duration,
+    /// Recovery bitrate ceiling, in kbps.
+    pub max_bitrate_kbps: u32,
+    /// Virtual source port advertised on the wire.
+    pub virt_src_port: u16,
+    /// Virtual destination port advertised on the wire.
+    pub virt_dst_port: u16,
+    /// NACK wire encoding.
+    pub nack_type: NackType,
+    /// Canonical name (RTCP SDES CNAME), if set.
+    pub cname: Option<String>,
+    /// PSK passphrase (Main/Advanced); `None` means no encryption.
+    pub secret: Option<String>,
+    /// AES key size when `secret` is set; defaults to 256-bit if unset.
+    pub aes_key_bits: Option<AesKeyBits>,
+}
+
+impl Default for Config {
+    /// The libRIST default parameters.
+    fn default() -> Config {
+        Config {
+            profile: Profile::Simple,
+            buffer_min: Duration::from_millis(1000),
+            buffer_max: Duration::from_millis(1000),
+            reorder_buffer: Duration::from_millis(15),
+            rtt_min: Duration::from_millis(5),
+            rtt_max: Duration::from_millis(500),
+            rtt_multiplier: 7,
+            min_retries: 6,
+            max_retries: 20,
+            session_timeout: Duration::from_millis(2000),
+            keepalive_interval: Duration::from_millis(1000),
+            max_bitrate_kbps: 100_000,
+            virt_src_port: 1971,
+            virt_dst_port: 1968,
+            nack_type: NackType::Range,
+            cname: None,
+            secret: None,
+            aes_key_bits: None,
+        }
+    }
+}
+
+impl Config {
+    /// Sets the profile.
+    #[must_use]
+    pub fn with_profile(mut self, profile: Profile) -> Config {
+        self.profile = profile;
+        self
+    }
+
+    /// Sets both the minimum and maximum recovery buffer to `buffer`.
+    #[must_use]
+    pub fn with_buffer(mut self, buffer: Duration) -> Config {
+        self.buffer_min = buffer;
+        self.buffer_max = buffer;
+        self
+    }
+
+    /// Sets the recovery buffer range.
+    #[must_use]
+    pub fn with_buffer_range(mut self, min: Duration, max: Duration) -> Config {
+        self.buffer_min = min;
+        self.buffer_max = max;
+        self
+    }
+
+    /// Sets the RTT clamps.
+    #[must_use]
+    pub fn with_rtt(mut self, min: Duration, max: Duration) -> Config {
+        self.rtt_min = min;
+        self.rtt_max = max;
+        self
+    }
+
+    /// Sets the retry bounds.
+    #[must_use]
+    pub fn with_retries(mut self, min: u32, max: u32) -> Config {
+        self.min_retries = min;
+        self.max_retries = max;
+        self
+    }
+
+    /// Sets the NACK wire encoding.
+    #[must_use]
+    pub fn with_nack_type(mut self, nack_type: NackType) -> Config {
+        self.nack_type = nack_type;
+        self
+    }
+
+    /// Sets the keepalive cadence.
+    #[must_use]
+    pub fn with_keepalive(mut self, interval: Duration) -> Config {
+        self.keepalive_interval = interval;
+        self
+    }
+
+    /// Sets the PSK passphrase (enables encryption on Main/Advanced).
+    #[must_use]
+    pub fn with_secret(mut self, secret: impl Into<String>) -> Config {
+        self.secret = Some(secret.into());
+        self
+    }
+
+    /// Sets the AES key size used with [`Config::with_secret`].
+    #[must_use]
+    pub fn with_aes_key_bits(mut self, bits: AesKeyBits) -> Config {
+        self.aes_key_bits = Some(bits);
+        self
+    }
+
+    /// Sets the canonical name (RTCP SDES CNAME).
+    #[must_use]
+    pub fn with_cname(mut self, cname: impl Into<String>) -> Config {
+        self.cname = Some(cname.into());
+        self
+    }
+
+    /// Validates the configuration against libRIST's accepted ranges.
+    ///
+    /// # Errors
+    /// Returns the [`ConfigError`] describing the first violation found (buffer,
+    /// RTT, retry, keepalive, or bitrate bounds).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let min_ms = self.buffer_min.as_millis();
+        if !(50..=30_000).contains(&min_ms) {
+            return Err(ConfigError::BufferOutOfRange { ms: min_ms });
+        }
+        if self.buffer_max < self.buffer_min {
+            return Err(ConfigError::BufferRangeInverted);
+        }
+        if self.reorder_buffer > self.buffer_min {
+            return Err(ConfigError::ReorderTooLarge);
+        }
+        if !(1..=1000).contains(&self.rtt_min.as_millis()) {
+            return Err(ConfigError::RttOutOfRange);
+        }
+        if self.rtt_max < self.rtt_min || self.rtt_max.as_millis() > 1000 {
+            return Err(ConfigError::RttRangeInverted);
+        }
+        if !(1..=100).contains(&self.rtt_multiplier) {
+            return Err(ConfigError::RttMultiplierOutOfRange {
+                value: self.rtt_multiplier,
+            });
+        }
+        if self.min_retries > 100 || self.max_retries > 100 {
+            return Err(ConfigError::RetriesOutOfRange);
+        }
+        if self.min_retries > self.max_retries {
+            return Err(ConfigError::RetriesInverted);
+        }
+        if self.keepalive_interval.is_zero() {
+            return Err(ConfigError::KeepaliveZero);
+        }
+        if self.session_timeout < self.keepalive_interval {
+            return Err(ConfigError::SessionTimeoutBelowKeepalive);
+        }
+        if self.max_bitrate_kbps == 0 {
+            return Err(ConfigError::MaxBitrateZero);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_librist() {
+        let c = Config::default();
+        assert_eq!(c.profile, Profile::Simple);
+        assert_eq!(c.buffer_min, Duration::from_millis(1000));
+        assert_eq!(c.rtt_min, Duration::from_millis(5));
+        assert_eq!(c.rtt_max, Duration::from_millis(500));
+        assert_eq!(c.rtt_multiplier, 7);
+        assert_eq!(c.min_retries, 6);
+        assert_eq!(c.max_retries, 20);
+        assert_eq!(c.keepalive_interval, Duration::from_millis(1000));
+        assert_eq!(c.session_timeout, Duration::from_millis(2000));
+        assert_eq!(c.max_bitrate_kbps, 100_000);
+        assert_eq!(c.virt_src_port, 1971);
+        assert_eq!(c.virt_dst_port, 1968);
+        assert_eq!(c.nack_type, NackType::Range);
+        c.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn validate_rejects_inverted_buffer_range() {
+        let c = Config::default()
+            .with_buffer_range(Duration::from_millis(1000), Duration::from_millis(500));
+        assert_eq!(c.validate(), Err(ConfigError::BufferRangeInverted));
+    }
+
+    #[test]
+    fn validate_rejects_inverted_retries() {
+        let c = Config::default().with_retries(20, 6);
+        assert_eq!(c.validate(), Err(ConfigError::RetriesInverted));
+    }
+
+    #[test]
+    fn builder_sets_fields() {
+        let c = Config::default()
+            .with_profile(Profile::Main)
+            .with_secret("hunter2")
+            .with_aes_key_bits(AesKeyBits::Aes128)
+            .with_nack_type(NackType::Bitmask);
+        assert_eq!(c.profile, Profile::Main);
+        assert_eq!(c.secret.as_deref(), Some("hunter2"));
+        assert_eq!(c.aes_key_bits, Some(AesKeyBits::Aes128));
+        assert_eq!(c.nack_type, NackType::Bitmask);
+    }
+}

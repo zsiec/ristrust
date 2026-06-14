@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Test (stable)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+
+  lint:
+    name: Clippy + rustfmt + doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustdoc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  import-gate:
+    name: rist-core import gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Assert rist-core depends only on bytes + std
+        run: |
+          leak=$(cargo tree -p rist-core --edges normal --prefix none \
+            | grep -E '^(rist-codec|rist|tokio|socket2|quinn-udp|aes|ctr|aes-gcm|chacha20poly1305|pbkdf2|hmac|sha2) ' || true)
+          if [ -n "$leak" ]; then
+            echo "rist-core import gate VIOLATED — forbidden deps leaked into the core:"
+            echo "$leak"
+            exit 1
+          fi
+          echo "rist-core import gate: OK"
+
+  deny:
+    name: cargo-deny (dependency allowlist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Build on MSRV
+        run: cargo build --workspace

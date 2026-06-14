@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# fuzz corpora/artifacts (keep seeds, not generated state)
+**/fuzz/corpus/
+**/fuzz/artifacts/
+
+# OS noise
+.DS_Store
+
+# Local dev & AI-assist docs (kept on disk, out of the published repo)
+/.claude/
+/CLAUDE.md
+/PLAN.md
+/ORCHESTRATION.md

@@ -1,0 +1,140 @@
+//! The effect and event types the deterministic core emits, plus its `Stats`.
+//!
+//! The core never performs I/O. Instead it pushes [`Output`] effects (drained by
+//! the host and performed on the wire) and [`Event`]s (drained by the host and
+//! surfaced to the application). Timers are *declarative*: the core requests them
+//! by [`TimerId`]; the host owns the wheel and calls
+//! [`Flow::handle_timer`](crate::flow::Flow::handle_timer) when one fires.
+
+use crate::clock::Timestamp;
+use crate::wire::{Feedback, MediaPacket};
+
+/// Identifies one declarative timer the core requests. Re-issuing `SetTimer` for
+/// an armed id replaces its deadline. `Ord`/`Hash` so the host (and the test
+/// timer wheel) can key a map by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TimerId {
+    /// Wakes the receiver when the earliest buffered packet reaches its playout
+    /// deadline so time-driven in-order delivery can proceed.
+    Playout,
+    /// Paces the receiver's NACK processing pass (libRIST bounds the receiver
+    /// loop's jitter at `RIST_MAX_JITTER` = 5 ms).
+    Nack,
+    /// Paces a flow's RTT echo requests (libRIST `RIST_PING_INTERVAL` = 100 ms).
+    /// Both roles originate echo requests; each runs on its own host wheel, so the
+    /// single id never collides.
+    RttEcho,
+}
+
+/// One side effect the core asks the host to perform, drained in FIFO order via
+/// [`Flow::poll_output`](crate::flow::Flow::poll_output).
+///
+/// Exhaustive (not `#[non_exhaustive]`) so hosts `match` over the complete set and
+/// adding a variant is a compile error everywhere it must be handled.
+#[derive(Debug, Clone)]
+pub enum Output {
+    /// Transmit one media packet on the given path. Emitted by the sender half
+    /// (first transmissions and retransmissions); the receiver half never emits
+    /// it.
+    SendMedia {
+        /// The network path index the packet must leave on.
+        path: u8,
+        /// The normalized media packet to encode and send.
+        pkt: MediaPacket,
+    },
+    /// Transmit one control message on the given path. The host's profile strategy
+    /// chooses the wire encoding; the core only speaks normalized [`Feedback`].
+    SendFeedback {
+        /// The network path index the feedback must leave on.
+        path: u8,
+        /// The normalized feedback to encode and send.
+        fb: Feedback,
+    },
+    /// Arm (or re-arm) `id` to fire once `deadline` passes.
+    SetTimer {
+        /// The timer being armed.
+        id: TimerId,
+        /// The absolute instant the timer must fire at.
+        deadline: Timestamp,
+    },
+    /// Cancel `id` if it is armed (a no-op otherwise).
+    ClearTimer {
+        /// The timer being cancelled.
+        id: TimerId,
+    },
+}
+
+/// One application-visible occurrence produced by the core, drained in FIFO order
+/// via [`Flow::poll_event`](crate::flow::Flow::poll_event).
+///
+/// Exhaustive for the same reason as [`Output`].
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// Hands one in-order media payload to the application. The core retains no
+    /// copy; the consumer owns the bytes after delivery.
+    Deliver {
+        /// The 32-bit (widened) sequence number of the delivered packet.
+        seq: u32,
+        /// The delivered media payload.
+        payload: bytes::Bytes,
+        /// Whether one or more sequence numbers immediately before this packet
+        /// were abandoned (never recovered before their playout deadline), so the
+        /// output stream has a gap here.
+        discontinuity: bool,
+    },
+}
+
+/// A snapshot of one flow's counters. Counter semantics mirror libRIST's receiver
+/// and sender flow stats where an analog exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stats {
+    // --- Receiver half ---
+    /// Media packets accepted into the receiver ring (first copies and accepted
+    /// retransmissions; duplicates and too-late drops excluded).
+    pub received: u64,
+    /// Packets dropped by the `(seq, source_time)` duplicate test — ARQ
+    /// duplicates and extra SMPTE 2022-7 path copies alike.
+    pub duplicates: u64,
+    /// Accepted packets that arrived out of order.
+    pub reordered: u64,
+    /// Ring slots overwritten because they held a stale entry (same slot,
+    /// different `(seq, source_time)`).
+    pub overwritten: u64,
+    /// Packets dropped because they could no longer be delivered (older than the
+    /// recovery window, or behind the in-order playout cursor).
+    pub too_late: u64,
+    /// Missing entries created by gap detection (each lost sequence once).
+    pub missing: u64,
+    /// Individual sequence numbers emitted in NACK feedback (retries included).
+    pub nacks_sent: u64,
+    /// Missing entries removed because the packet arrived after at least one NACK.
+    pub recovered: u64,
+    /// Missing entries given up on (after max retries or ageing past the window).
+    pub abandoned: u64,
+    /// Packets handed to the application via [`Event::Deliver`].
+    pub delivered: u64,
+    /// Sequence numbers skipped at playout because they never arrived in time.
+    pub lost: u64,
+    /// Contiguous runs of skipped sequence numbers in the delivered stream.
+    pub discontinuities: u64,
+    /// Inbound feedback the flow had no handler for in its current role/stage
+    /// (counted instead of panicking so additive wire variants can never crash
+    /// the core).
+    pub ignored_feedback: u64,
+
+    // --- Sender half ---
+    /// First-transmission media packets emitted by `push_app`.
+    pub sent: u64,
+    /// Retransmission media packets emitted in response to NACK feedback.
+    pub retransmitted: u64,
+    /// NACKed sequence numbers no longer in the sender history (aged out or never
+    /// sent) and therefore not resendable.
+    pub retransmit_skipped: u64,
+    /// NACKed sequence numbers withheld by the per-packet retransmit gate because
+    /// the previous retransmit was less than one clamped RTT ago.
+    pub retransmit_suppressed: u64,
+    /// NACKed sequence numbers refused because the packet had already been
+    /// retransmitted the maximum number of times.
+    pub retransmit_exhausted: u64,
+}

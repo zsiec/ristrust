@@ -1,0 +1,22 @@
+[package]
+name = "rist-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Sans-I/O deterministic core and narrow-waist types for RIST (Reliable Internet Stream Transport, VSF TR-06)"
+
+[lints]
+workspace = true
+
+# The import gate, expressed as a dependency list: the deterministic core depends
+# on nothing but `bytes`. It physically cannot reach a codec, a socket, a clock,
+# or tokio — keeping the flow core profile-agnostic and deterministic forever.
+[dependencies]
+bytes.workspace = true

@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/rist-core", "crates/rist-codec", "crates/rist"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["Thomas Symborski <thomas.symborski@gmail.com>"]
+repository = "https://github.com/zsiec/ristrust"
+homepage = "https://github.com/zsiec/ristrust"
+keywords = ["rist", "streaming", "video", "networking", "sans-io"]
+categories = ["network-programming", "multimedia"]
+
+# Shared dependency versions. Member crates opt in with `<dep>.workspace = true`,
+# so versions are pinned in exactly one place.
+[workspace.dependencies]
+# --- intra-workspace ---
+rist-core = { path = "crates/rist-core", version = "0.0.0" }
+rist-codec = { path = "crates/rist-codec", version = "0.0.0" }
+# --- shared ---
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", default-features = false }
+# --- crypto (RustCrypto, pure Rust; no OpenSSL/aws-lc/ring FFI) ---
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha2 = "0.10"
+# --- dev ---
+proptest = "1"
+
+# Deny-by-default lints applied to every crate in the workspace — the backbone of
+# "max safety, idiomatic modern Rust". `#![forbid(unsafe_code)]` is also declared
+# per-crate so the guarantee is visible at the crate root.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Promote pedantic to a warning; opt out case-by-case with a justified allow.
+pedantic = { level = "warn", priority = -1 }
+# A few that fire constantly and add little signal for this codebase.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Domain noise for a protocol library: spec terms (EtherType, NTP-64, MPEG-TS)
+# read fine without backticks; the libRIST defaults read clearer in their native
+# millisecond units than as seconds; trait-impl and forward-looking async stubs
+# carry mandated `&self` / `async` signatures that don't yet use them.
+doc_markdown = "allow"
+duration_suboptimal_units = "allow"
+unused_self = "allow"
+unused_async = "allow"
+
+# A faster release profile for benches/interop; keep debug assertions in tests.
+[profile.release]
+lto = "thin"

@@ -1,0 +1,2 @@
+# Stable-only rustfmt options. Defaults otherwise (cargo fmt --check is CI-gated).
+edition = "2024"

@@ -19,6 +19,7 @@ pub use error::{ConfigError, Error};
 pub use receiver::{Receiver, listen};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
 pub use sender::{Sender, dial};
+pub use url::parse_url;
 
 /// The AES key size for PSK encryption, re-exported for use with
 /// [`Config::with_aes_key_bits`].

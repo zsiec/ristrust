@@ -58,10 +58,13 @@ pub enum Error {
     /// An underlying I/O operation failed (socket bind, send, receive).
     #[error("rist: io error: {0}")]
     Io(#[from] std::io::Error),
-    /// The address could not be parsed as `IP:port`. (`rist://` URL parsing lands
-    /// in WP2.)
+    /// The address could not be parsed as `IP:port`.
     #[error("rist: invalid address: {0}")]
     InvalidAddr(String),
+    /// A `rist://` URL was malformed: an unsupported scheme, a missing port, or a
+    /// query parameter that is not a valid integer or is out of range.
+    #[error("rist: invalid url: {0}")]
+    Url(String),
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

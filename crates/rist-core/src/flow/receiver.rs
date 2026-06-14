@@ -342,8 +342,7 @@ impl Flow {
         let last_found = self.receiver.last_found;
         let gap = u64::from(current.wrapping_sub(last_found));
         // Wraparound guard pinned to seq::MAX_GAP_16 (32768) for flows widened
-        // from 16-bit sequences (libRIST `if (missing_count > 32768) return`; see
-        // ORCHESTRATION.md WP1 binding).
+        // from 16-bit sequences (libRIST `if (missing_count > 32768) return`).
         if gap > seq::MAX_GAP_16 {
             return;
         }
@@ -376,6 +375,14 @@ impl Flow {
         let mut count = 1u64;
         let mut m = last_found.wrapping_add(1);
         while m != current {
+            // Buffer-bloat guard: stop queuing new gaps once the missing queue
+            // reaches `missing_counter_max` (derived from the recovery window and
+            // recovery_maxbitrate). Already-queued entries keep being retried; the
+            // unmarked tail is re-detected on the next packet (libRIST
+            // `if (missing_count > missing_counter_max) break`).
+            if self.receiver.missing.len() as u32 > self.missing_counter_max {
+                break;
+            }
             nack_time = nack_time + interpacket;
             self.add_missing(now, path, m, nack_time);
             count += 1;
@@ -911,10 +918,14 @@ mod tests {
 
     #[test]
     fn missing_gap_guards() {
-        // (first, next, want_missing).
+        // (first, next, want_missing). A gap of exactly MaxGap16 is still loss, but
+        // the missing-queue is bounded by `missing_counter_max` (3571 with the
+        // defaults — see `congestion::derived_bounds_match_librist_defaults`), so the
+        // guard stops once the queue exceeds it: 3572 entries, not the full 32767.
+        // The unmarked tail is re-detected on the next packet.
         let cases: &[(u32, u32, u64)] = &[
-            (100, 100 + 32768, 32767), // gap of exactly MaxGap16: still loss
-            (100, 100 + 32769, 0),     // strictly greater: wraparound/reorder
+            (100, 100 + 32768, 3572), // gap of exactly MaxGap16: loss, capped
+            (100, 100 + 32769, 0),    // strictly greater: wraparound/reorder
         ];
         for &(first, next, want) in cases {
             let mut f = recv();

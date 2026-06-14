@@ -2,13 +2,40 @@
 //!
 //! Durations are `std::time::Duration` at the public surface; the session layer
 //! converts them to the core's microsecond domain. Defaults match libRIST exactly
-//! (see the table in `CLAUDE.md`) so a ristrust peer interoperates with libRIST.
+//! so a ristrust peer interoperates with libRIST.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rist_codec::crypto::AesKeyBits;
+use rist_core::flow::CongestionMode;
 
 use crate::error::ConfigError;
+
+/// A source-adaptation rate callback (TR-06-4 Part 1): invoked with the new
+/// encoder bit-rate target, in kbit/s, each time an inbound Link Quality Message
+/// moves it. The application should retune its encoder toward that target. The
+/// callback runs on the session task, so it must not block.
+#[derive(Clone)]
+pub struct RateCallback(Arc<dyn Fn(u32) + Send + Sync>);
+
+impl RateCallback {
+    /// Wraps `f` as a rate callback.
+    pub fn new(f: impl Fn(u32) + Send + Sync + 'static) -> RateCallback {
+        RateCallback(Arc::new(f))
+    }
+
+    /// Invokes the callback with a new target rate in kbit/s.
+    pub(crate) fn call(&self, target_kbps: u32) {
+        (self.0)(target_kbps);
+    }
+}
+
+impl std::fmt::Debug for RateCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RateCallback(..)")
+    }
+}
 
 /// The RIST profile (wire dialect) a session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +85,13 @@ pub struct Config {
     pub session_timeout: Duration,
     /// Keepalive cadence.
     pub keepalive_interval: Duration,
-    /// Recovery bitrate ceiling, in kbps.
+    /// Recovery bitrate ceiling, in kbps. Doubles as `recovery_maxbitrate`: the
+    /// rate the sender paces retransmissions against under
+    /// [`CongestionMode::Normal`] / [`CongestionMode::Aggressive`].
     pub max_bitrate_kbps: u32,
+    /// How the sender paces retransmissions against `max_bitrate_kbps`. Default
+    /// [`CongestionMode::Normal`] (the libRIST default).
+    pub congestion_control: CongestionMode,
     /// Virtual source port advertised on the wire.
     pub virt_src_port: u16,
     /// Virtual destination port advertised on the wire.
@@ -72,6 +104,24 @@ pub struct Config {
     pub secret: Option<String>,
     /// AES key size when `secret` is set; defaults to 256-bit if unset.
     pub aes_key_bits: Option<AesKeyBits>,
+    /// EAP-SRP username (Main profile); enables authentication when set with
+    /// `srp_password`. A sender authenticates as this user; a listener verifies it.
+    pub srp_username: Option<String>,
+    /// EAP-SRP password paired with `srp_username`.
+    pub srp_password: Option<String>,
+    /// Enable LZ4 payload compression on the send path (Advanced profile).
+    pub compression: bool,
+    /// Make a receiver emit periodic Link Quality Messages for source adaptation
+    /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
+    /// or an Advanced control message (index `0x0002`). Default: off.
+    pub source_adaptation: bool,
+    /// The encoder rate floor, in kbit/s, for source-adaptation control (the
+    /// controller's `min_kbps`). `max_bitrate_kbps` is the ceiling.
+    pub min_bitrate_kbps: u32,
+    /// The source-adaptation rate callback. When set on a sender, each inbound
+    /// Link Quality Message drives the AIMD controller and this is invoked with the
+    /// new encoder bit-rate target. `None` (default) disables rate control.
+    pub on_rate_adapt: Option<RateCallback>,
 }
 
 impl Default for Config {
@@ -90,12 +140,19 @@ impl Default for Config {
             session_timeout: Duration::from_millis(2000),
             keepalive_interval: Duration::from_millis(1000),
             max_bitrate_kbps: 100_000,
+            congestion_control: CongestionMode::Normal,
             virt_src_port: 1971,
             virt_dst_port: 1968,
             nack_type: NackType::Range,
             cname: None,
             secret: None,
             aes_key_bits: None,
+            srp_username: None,
+            srp_password: None,
+            compression: false,
+            source_adaptation: false,
+            min_bitrate_kbps: 500,
+            on_rate_adapt: None,
         }
     }
 }
@@ -168,6 +225,58 @@ impl Config {
         self
     }
 
+    /// Sets the EAP-SRP credentials (Main profile). A sender authenticates as this
+    /// user; a listener verifies a connecting peer against it.
+    #[must_use]
+    pub fn with_srp_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Config {
+        self.srp_username = Some(username.into());
+        self.srp_password = Some(password.into());
+        self
+    }
+
+    /// Enables LZ4 payload compression on the send path (Advanced profile).
+    #[must_use]
+    pub fn with_compression(mut self, on: bool) -> Config {
+        self.compression = on;
+        self
+    }
+
+    /// Makes a receiver emit periodic Link Quality Messages for source adaptation
+    /// (TR-06-4 Part 1).
+    #[must_use]
+    pub fn with_source_adaptation(mut self, on: bool) -> Config {
+        self.source_adaptation = on;
+        self
+    }
+
+    /// Sets the encoder rate floor, in kbit/s, for source-adaptation control.
+    #[must_use]
+    pub fn with_min_bitrate(mut self, kbps: u32) -> Config {
+        self.min_bitrate_kbps = kbps;
+        self
+    }
+
+    /// Selects how the sender paces retransmissions against `max_bitrate_kbps`
+    /// (default [`CongestionMode::Normal`]).
+    #[must_use]
+    pub fn with_congestion_control(mut self, mode: CongestionMode) -> Config {
+        self.congestion_control = mode;
+        self
+    }
+
+    /// Sets the source-adaptation rate callback on a sender: each inbound Link
+    /// Quality Message drives the AIMD controller and calls `f` with the new
+    /// encoder bit-rate target (kbit/s).
+    #[must_use]
+    pub fn with_rate_callback(mut self, f: impl Fn(u32) + Send + Sync + 'static) -> Config {
+        self.on_rate_adapt = Some(RateCallback::new(f));
+        self
+    }
+
     /// Sets the canonical name (RTCP SDES CNAME).
     #[must_use]
     pub fn with_cname(mut self, cname: impl Into<String>) -> Config {
@@ -217,6 +326,29 @@ impl Config {
         if self.max_bitrate_kbps == 0 {
             return Err(ConfigError::MaxBitrateZero);
         }
+        // Fail closed: reject features a profile would silently ignore.
+        let unsupported =
+            |feature, profile| ConfigError::ProfileFeatureUnsupported { feature, profile };
+        match self.profile {
+            Profile::Simple => {
+                if self.secret.is_some() {
+                    return Err(unsupported("PSK encryption (secret)", "Simple"));
+                }
+                if self.srp_username.is_some() || self.srp_password.is_some() {
+                    return Err(unsupported("EAP-SRP authentication", "Simple"));
+                }
+                if self.compression {
+                    return Err(unsupported("LZ4 compression", "Simple"));
+                }
+            }
+            Profile::Main => {
+                if self.compression {
+                    // LZ4 compression is an Advanced-profile feature only.
+                    return Err(unsupported("LZ4 compression", "Main"));
+                }
+            }
+            Profile::Advanced => {}
+        }
         Ok(())
     }
 }
@@ -238,6 +370,7 @@ mod tests {
         assert_eq!(c.keepalive_interval, Duration::from_millis(1000));
         assert_eq!(c.session_timeout, Duration::from_millis(2000));
         assert_eq!(c.max_bitrate_kbps, 100_000);
+        assert_eq!(c.congestion_control, CongestionMode::Normal);
         assert_eq!(c.virt_src_port, 1971);
         assert_eq!(c.virt_dst_port, 1968);
         assert_eq!(c.nack_type, NackType::Range);
@@ -245,10 +378,52 @@ mod tests {
     }
 
     #[test]
+    fn with_congestion_control_overrides_the_default() {
+        let c = Config::default().with_congestion_control(CongestionMode::Aggressive);
+        assert_eq!(c.congestion_control, CongestionMode::Aggressive);
+    }
+
+    #[test]
     fn validate_rejects_inverted_buffer_range() {
         let c = Config::default()
             .with_buffer_range(Duration::from_millis(1000), Duration::from_millis(500));
         assert_eq!(c.validate(), Err(ConfigError::BufferRangeInverted));
+    }
+
+    #[test]
+    fn validate_fails_closed_on_unsupported_profile_features() {
+        // Encryption/auth/compression on Simple, and compression on Main, are
+        // rejected rather than silently ignored.
+        assert!(matches!(
+            Config::default().with_secret("x").validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            Config::default().with_srp_credentials("u", "p").validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_compression(true)
+                .validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        // The supported combinations still validate.
+        assert!(
+            Config::default()
+                .with_profile(Profile::Advanced)
+                .with_compression(true)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_secret("x")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

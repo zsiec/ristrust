@@ -31,7 +31,24 @@ tokio = { version = "1", default-features = false }
 # --- crypto (RustCrypto, pure Rust; no OpenSSL/aws-lc/ring FFI) ---
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
-sha2 = "0.10"
+# `oid` exposes the SHA-256 algorithm OID needed when signing X.509 certificates
+# in the DTLS ECDHE-ECDSA path.
+sha2 = { version = "0.10", features = ["oid"] }
+aes = "0.8"
+ctr = "0.9"
+# DTLS 1.2 (optional, `--features dtls`): AES-128-GCM AEAD record protection,
+# P-256 ECDHE/ECDSA for the ECDHE_ECDSA suite, and X.509 cert gen/parse for its
+# certificate handling. Pure RustCrypto, no FFI.
+aes-gcm = "0.10"
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "alloc", "pem"] }
+rand_core = "0.6"
+x509-cert = { version = "0.2", default-features = false, features = ["builder"] }
+# OS CSPRNG for the PSK nonce (the only non-determinism in the crypto layer).
+getrandom = "0.3"
+# SRP-6a (Main-profile EAP auth): big-integer modular exponentiation over the
+# 2048-bit RFC 5054 group, and constant-time proof comparison. Pure Rust.
+num-bigint = "0.4"
+subtle = "2"
 # --- dev ---
 proptest = "1"
 

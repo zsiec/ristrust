@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use rist_codec::crypto::AesKeyBits;
 
+use crate::CongestionMode;
 use crate::config::{Config, Profile};
 use crate::error::Error;
 
@@ -221,6 +222,32 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
                 .map_err(|_| Error::Url(format!("{key}={v:?} is not a valid port")))?;
         }
     }
+    apply_enum_params(cfg, q)?;
+    if let Some(v) = q.get("cname") {
+        cfg.cname = Some(v.clone());
+    }
+    if let Some(v) = q.get("secret") {
+        cfg.secret = Some(v.clone());
+    }
+    // `weight`, `key-rotation`, `username`, `password`, `compression` are known to
+    // libRIST but have no Config home until bonding (WP5) / Main (WP3) / Advanced
+    // (WP4); they are accepted and ignored for now.
+    Ok(())
+}
+
+/// Folds the enum-valued query parameters (`aes-type`, `profile`,
+/// `congestion-control`) into `cfg`, each on libRIST's numbering. Split out of
+/// [`apply_query`] to keep that function under the line cap.
+fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Error> {
+    let int = |key: &str| -> Result<Option<i64>, Error> {
+        match q.get(key) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| Error::Url(format!("{key}={v:?} is not an integer"))),
+        }
+    };
     if let Some(n) = int("aes-type")? {
         cfg.aes_key_bits = Some(match n {
             128 => AesKeyBits::Aes128,
@@ -236,15 +263,20 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
             other => return Err(Error::Url(format!("profile={other} must be 0, 1, or 2"))),
         };
     }
-    if let Some(v) = q.get("cname") {
-        cfg.cname = Some(v.clone());
+    // libRIST's numbering: 0=off, 1=normal, 2=aggressive (matches `congestion_control`
+    // in `parse_url_options`).
+    if let Some(n) = int("congestion-control")? {
+        cfg.congestion_control = match n {
+            0 => CongestionMode::Off,
+            1 => CongestionMode::Normal,
+            2 => CongestionMode::Aggressive,
+            other => {
+                return Err(Error::Url(format!(
+                    "congestion-control={other} must be 0 (off), 1 (normal), or 2 (aggressive)"
+                )));
+            }
+        };
     }
-    if let Some(v) = q.get("secret") {
-        cfg.secret = Some(v.clone());
-    }
-    // `weight`, `key-rotation`, `username`, `password`, `compression` are known to
-    // libRIST but have no Config home until bonding (WP5) / Main (WP3) / Advanced
-    // (WP4); they are accepted and ignored for now.
     Ok(())
 }
 
@@ -285,6 +317,21 @@ mod tests {
         assert_eq!(cfg.keepalive_interval, ms(250));
         assert_eq!(cfg.max_bitrate_kbps, 8000);
         cfg.validate().expect("parsed config must validate");
+    }
+
+    #[test]
+    fn congestion_control_uses_librist_numbering() {
+        for (n, want) in [
+            (0, CongestionMode::Off),
+            (1, CongestionMode::Normal),
+            (2, CongestionMode::Aggressive),
+        ] {
+            let raw = format!("rist://h:5000?congestion-control={n}");
+            let (_, cfg) = parse_url(&raw, Config::default()).unwrap();
+            assert_eq!(cfg.congestion_control, want, "congestion-control={n}");
+        }
+        // Out-of-range value is rejected, not silently clamped.
+        assert!(parse_url("rist://h:5000?congestion-control=3", Config::default()).is_err());
     }
 
     #[test]

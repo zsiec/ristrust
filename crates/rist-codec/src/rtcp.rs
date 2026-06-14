@@ -463,9 +463,15 @@ impl RangeNack {
 impl NackPair {
     /// Appends the up-to-17 sequence numbers this pair requests (PID first, then
     /// each set BLP bit) to `dst`.
-    fn append_seqs(self, dst: &mut Vec<u32>) {
+    fn append_seqs(self, dst: &mut Vec<u32>, cap: usize) {
+        if dst.len() >= cap {
+            return;
+        }
         dst.push(u32::from(self.pid));
         for i in 0..16u16 {
+            if dst.len() >= cap {
+                return; // cap reached mid-FCI: never overshoot the expansion bound
+            }
             if self.blp & (1 << i) != 0 {
                 dst.push(u32::from(self.pid.wrapping_add(i + 1)));
             }
@@ -495,9 +501,9 @@ impl BitmaskNack {
         let mut dst = Vec::new();
         for f in &self.fcis {
             if dst.len() >= MAX_NACK_EXPAND {
-                return dst;
+                break;
             }
-            f.append_seqs(&mut dst);
+            f.append_seqs(&mut dst, MAX_NACK_EXPAND);
         }
         dst
     }

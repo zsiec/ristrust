@@ -8,15 +8,14 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::error::Error;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::socket::SimpleSocket;
 
 /// An io-native RIST media sender. Created with [`dial`]; reliably transmits
-/// application payloads as Simple-profile RTP, recovering loss via ARQ driven by
-/// a background session task.
+/// application payloads (Simple-profile RTP or Main-profile GRE), recovering loss
+/// via ARQ driven by a background session task.
 #[derive(Debug)]
 pub struct Sender {
     cfg: Config,
-    socket: SimpleSocket,
+    local: SocketAddr,
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
     task: tokio::task::JoinHandle<()>,
@@ -32,9 +31,9 @@ impl Sender {
     /// The bound local media address.
     ///
     /// # Errors
-    /// Returns the underlying socket error if the address cannot be read.
+    /// Never; the result is for API symmetry (the address is resolved at dial).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.media_local()
+        Ok(self.local)
     }
 
     /// The remote receiver's media address.
@@ -92,7 +91,9 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
     };
     cfg.validate()?;
     let remote: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
-    if !remote.port().is_multiple_of(2) {
+    // The Simple profile binds an even/odd pair, so its media port must be even;
+    // the Main profile multiplexes onto a single port and accepts any.
+    if cfg.profile == crate::config::Profile::Simple && !remote.port().is_multiple_of(2) {
         return Err(Error::InvalidAddr(format!(
             "media port {} must be even",
             remote.port()
@@ -102,11 +103,69 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
     tracing::debug!(%remote, "rist: sender dialed");
     Ok(Sender {
         cfg,
-        socket: spawned.socket,
+        local: spawned.local,
         remote,
         app_in: spawned.app_in,
         task: spawned.task,
     })
+}
+
+/// Connects a SMPTE 2022-7 bonded sender to every address in `addrs`, transmitting
+/// the identical media (same sequence and source time) on all of them for full
+/// redundancy. Each address is one Main-profile GRE path; a receiver merges the
+/// copies. Bonding requires the Main profile (`cfg.profile == Profile::Main`).
+///
+/// # Errors
+/// Returns [`Error::InvalidAddr`] if `addrs` is empty or an entry is not a valid
+/// `IP:port` (a `rist://` URL's address part is accepted), [`Error::Config`] for an
+/// invalid configuration, or [`Error::Io`] (which wraps the non-Main rejection) if
+/// the sockets cannot be bound.
+pub async fn dial_bonded(addrs: &[&str], cfg: Config) -> Result<Sender, Error> {
+    dial_bonded_with(addrs, cfg, &TokioRuntime).await
+}
+
+/// Like [`dial_bonded`], but binds every path's transport socket through `rt`.
+///
+/// # Errors
+/// As [`dial_bonded`].
+pub async fn dial_bonded_with(
+    addrs: &[&str],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Sender, Error> {
+    if addrs.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded sender needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let remotes = resolve_bonded_addrs(addrs)?;
+    let spawned = crate::session::build_bonded_sender(rt, &cfg, &remotes)?;
+    tracing::debug!(paths = remotes.len(), "rist: bonded sender dialed");
+    Ok(Sender {
+        cfg,
+        local: spawned.local,
+        remote: remotes[0],
+        app_in: spawned.app_in,
+        task: spawned.task,
+    })
+}
+
+/// Resolves each bonded address (a bare `IP:port` or a `rist://` URL whose address
+/// part is taken; per-path query refinement is not applied — the shared `cfg`
+/// governs every path) into a [`SocketAddr`].
+pub(crate) fn resolve_bonded_addrs(addrs: &[&str]) -> Result<Vec<SocketAddr>, Error> {
+    addrs
+        .iter()
+        .map(|a| {
+            let addr = if a.contains("://") {
+                crate::url::parse_url(a, Config::default())?.0
+            } else {
+                (*a).to_string()
+            };
+            addr.parse().map_err(|_| Error::InvalidAddr(addr))
+        })
+        .collect()
 }
 
 #[cfg(test)]

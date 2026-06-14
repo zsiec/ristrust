@@ -46,6 +46,16 @@ pub enum ConfigError {
     /// The maximum bitrate is zero.
     #[error("rist: max_bitrate_kbps must be positive")]
     MaxBitrateZero,
+    /// A feature was configured on a profile that does not support it (e.g. a PSK
+    /// secret on the Simple profile, or LZ4 compression outside Advanced). The
+    /// configuration is rejected rather than silently ignoring the feature.
+    #[error("rist: {feature} is not supported on the {profile} profile")]
+    ProfileFeatureUnsupported {
+        /// The unsupported feature.
+        feature: &'static str,
+        /// The profile that does not support it.
+        profile: &'static str,
+    },
 }
 
 /// The top-level error type for the host crate.

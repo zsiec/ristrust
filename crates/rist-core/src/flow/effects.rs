@@ -137,4 +137,8 @@ pub struct Stats {
     /// NACKed sequence numbers refused because the packet had already been
     /// retransmitted the maximum number of times.
     pub retransmit_exhausted: u64,
+    /// NACKed sequence numbers refused because emitting the retransmit would have
+    /// exceeded `recovery_maxbitrate` under the active congestion-control mode
+    /// (libRIST `bandwidth_skip`); the entry stays resendable and is re-NACKed.
+    pub bandwidth_skipped: u64,
 }

@@ -8,14 +8,13 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::error::Error;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::socket::SimpleSocket;
 
 /// An io-native RIST media receiver. Created with [`listen`]; yields in-order,
 /// ARQ-recovered media payloads from a background session task.
 #[derive(Debug)]
 pub struct Receiver {
     cfg: Config,
-    socket: SimpleSocket,
+    local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -30,9 +29,9 @@ impl Receiver {
     /// The bound local media address.
     ///
     /// # Errors
-    /// Returns the underlying socket error if the address cannot be read.
+    /// Never; the result is for API symmetry (the address is resolved at listen).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.media_local()
+        Ok(self.local)
     }
 
     /// Reads the next in-order, ARQ-recovered media payload.
@@ -84,7 +83,47 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
     tracing::debug!(%local, "rist: receiver listening");
     Ok(Receiver {
         cfg,
-        socket: spawned.socket,
+        local: spawned.local,
+        data_out: spawned.data_out,
+        task: spawned.task,
+    })
+}
+
+/// Binds a SMPTE 2022-7 bonded receiver to every address in `addrs`, merging the
+/// media that arrives on each into one in-order, ARQ-recovered stream (the
+/// `(seq, source_time)` dedup is the merge). Each address is one Main-profile GRE
+/// path; `local_addr` reports the first. Bonding requires the Main profile.
+///
+/// # Errors
+/// Returns [`Error::InvalidAddr`] if `addrs` is empty or an entry is not a valid
+/// `IP:port`, [`Error::Config`] for an invalid configuration, or [`Error::Io`]
+/// (which wraps the non-Main rejection) if a port is invalid or the sockets cannot
+/// be bound.
+pub async fn listen_bonded(addrs: &[&str], cfg: Config) -> Result<Receiver, Error> {
+    listen_bonded_with(addrs, cfg, &TokioRuntime).await
+}
+
+/// Like [`listen_bonded`], but binds every path's transport socket through `rt`.
+///
+/// # Errors
+/// As [`listen_bonded`].
+pub async fn listen_bonded_with(
+    addrs: &[&str],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Receiver, Error> {
+    if addrs.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded receiver needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let locals = crate::sender::resolve_bonded_addrs(addrs)?;
+    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals)?;
+    tracing::debug!(paths = locals.len(), "rist: bonded receiver listening");
+    Ok(Receiver {
+        cfg,
+        local: spawned.local,
         data_out: spawned.data_out,
         task: spawned.task,
     })

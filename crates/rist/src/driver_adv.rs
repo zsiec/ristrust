@@ -1,0 +1,532 @@
+//! The async driver for the Advanced profile (VSF TR-06-3): the `select!` pump for
+//! the GRE-substrate hybrid.
+//!
+//! libRIST `-p 2` mixes two framings on one UDP port: raw Main-profile GRE packets
+//! (the RTCP-SDES handshake + keepalives that authenticate and keep the control
+//! plane alive) and Advanced-framed packets (RTP PT=127: Type=5 media, Type=4
+//! control, Type=8 GRE-wrapped). This driver therefore owns BOTH a [`MainCodec`]
+//! (the GRE substrate) and an [`AdvCodec`] (media + control), and demultiplexes
+//! inbound datagrams by their first byte: V=2/PT in {127, ≥96} is Advanced framing,
+//! anything else is raw GRE. It mirrors the Main driver's timer wheel, peer
+//! learning, EAP-SRP handshake, and thin-dumb-pump discipline.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+
+use rist_codec::adv;
+use rist_codec::rtcp::{EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
+use rist_core::clock::Timestamp;
+use rist_core::flow::{Event, Flow, Output, TimerId};
+use rist_core::seq::Seq32;
+use rist_core::wire::Feedback;
+
+use crate::adapt::{LqmEmitter, RateControl};
+use crate::codec_adv::AdvCodec;
+use crate::codec_main::{ControlKind, Decoded, MainCodec};
+use crate::driver::{COMMAND_CAPACITY, DATA_CAPACITY};
+use crate::driver_main::EapRole;
+use crate::peer::Peer;
+use crate::socket::MainSocket;
+
+/// The largest datagram the driver will receive.
+const RECV_BUF: usize = 65_536;
+
+/// The EAP identifier ristrust stamps on its unsolicited passphrase push.
+const PASSPHRASE_PUSH_ID: u8 = 0x40;
+
+/// Whether `data` is Advanced framing (RTP V=2, PT 127 or a dynamic type ≥ 96)
+/// rather than a raw Main-profile GRE packet.
+fn is_adv_framed(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] & 0xC0 == 0x80 && {
+        let pt = data[1] & 0x7F;
+        pt == adv::PAYLOAD_TYPE || pt >= 96
+    }
+}
+
+/// The Advanced control/media RTP timestamp for a session instant (the effective
+/// 2^16 MHz rate: `micros << 16`).
+#[allow(clippy::cast_possible_truncation)]
+fn adv_ctrl_ts(now: Timestamp) -> u32 {
+    (now.as_micros() << 16) as u32
+}
+
+/// The Advanced-profile session driver, run as one detached task per flow.
+// Justification: the bool fields are independent per-flow flags, not a state enum.
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct AdvDriver {
+    sender: bool,
+    flow: Flow,
+    socket: MainSocket,
+    peer: Peer,
+    epoch: Instant,
+    timers: HashMap<TimerId, Timestamp>,
+    keepalive: Duration,
+    /// The raw Main-profile GRE substrate codec (handshake + keepalive + EAPOL).
+    main: MainCodec,
+    /// The Advanced media + control codec (Type=5 / Type=4).
+    adv: AdvCodec,
+    bitmask: bool,
+
+    // --- sender half ---
+    app_in: Option<mpsc::Receiver<Bytes>>,
+    highest_sent: u32,
+    ssrc: u32,
+
+    // --- receiver half ---
+    data_out: Option<mpsc::Sender<Bytes>>,
+    learned_ssrc: Option<u32>,
+    greeted: bool,
+
+    // --- EAP-SRP authentication ---
+    eap: Option<EapRole>,
+    authed: bool,
+
+    // --- source adaptation (TR-06-4 Part 1) ---
+    /// The receiver's Link Quality Message emitter, when source adaptation is on.
+    lqm: Option<LqmEmitter>,
+    /// The sender's rate controller, when a rate callback is configured.
+    rate: Option<RateControl>,
+}
+
+impl AdvDriver {
+    /// Builds and spawns an Advanced-profile sender driver.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_sender(
+        flow: Flow,
+        socket: MainSocket,
+        peer: Peer,
+        main: MainCodec,
+        adv: AdvCodec,
+        ssrc: u32,
+        bitmask: bool,
+        keepalive: Duration,
+        start_seq: u32,
+        eap: Option<EapRole>,
+        rate: Option<RateControl>,
+    ) -> (mpsc::Sender<Bytes>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let authed = eap.is_none();
+        let driver = AdvDriver {
+            sender: true,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            main,
+            adv,
+            bitmask,
+            app_in: Some(rx),
+            highest_sent: start_seq,
+            ssrc,
+            data_out: None,
+            learned_ssrc: None,
+            greeted: false,
+            eap,
+            authed,
+            lqm: None,
+            rate,
+        };
+        (tx, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns an Advanced-profile receiver driver.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_receiver(
+        flow: Flow,
+        socket: MainSocket,
+        peer: Peer,
+        main: MainCodec,
+        adv: AdvCodec,
+        ssrc: u32,
+        bitmask: bool,
+        keepalive: Duration,
+        eap: Option<EapRole>,
+        lqm: Option<LqmEmitter>,
+    ) -> (mpsc::Receiver<Bytes>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let authed = eap.is_none();
+        let driver = AdvDriver {
+            sender: false,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            main,
+            adv,
+            bitmask,
+            app_in: None,
+            highest_sent: 0,
+            ssrc,
+            data_out: Some(tx),
+            learned_ssrc: None,
+            greeted: false,
+            eap,
+            authed,
+            lqm,
+            rate: None,
+        };
+        (rx, tokio::spawn(driver.run()))
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // session durations fit u64 micros
+    fn now(&self) -> Timestamp {
+        Timestamp::from_micros(self.epoch.elapsed().as_micros() as u64)
+    }
+
+    fn deadline(&self, ts: Timestamp) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.epoch + Duration::from_micros(ts.as_micros()))
+    }
+
+    async fn run(mut self) {
+        let sock = self.socket.clone();
+        let mut buf = vec![0u8; RECV_BUF];
+
+        if self.sender {
+            let now = self.now();
+            self.greet(now).await;
+            self.send_eap_start().await;
+        }
+
+        let mut keepalive = tokio::time::interval(self.keepalive);
+        keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        keepalive.tick().await;
+
+        loop {
+            let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
+            tokio::select! {
+                r = sock.recv(&mut buf) => match r {
+                    Ok((n, src)) => self.on_recv(src, &buf[..n]).await,
+                    Err(_) => break,
+                },
+                payload = recv_app_gated(&mut self.app_in, self.authed) => match payload {
+                    Some(p) => {
+                        let now = self.now();
+                        self.flow.push_app(now, p);
+                        self.drain(now).await;
+                    }
+                    None => break,
+                },
+                () = sleep_until_opt(timer_at) => {
+                    let now = self.now();
+                    self.fire_timers(now);
+                    self.drain(now).await;
+                },
+                _ = keepalive.tick() => {
+                    let now = self.now();
+                    if self.peer.expired(now) {
+                        break;
+                    }
+                    if self.peer.media().is_some() {
+                        self.send_handshake(now).await;
+                        self.send_keepalive(now).await;
+                        // Source adaptation: emit a Link Quality Message when a
+                        // reporting period has elapsed (receiver only).
+                        self.maybe_emit_lqm(now).await;
+                    }
+                },
+            }
+        }
+    }
+
+    async fn on_recv(&mut self, src: SocketAddr, data: &[u8]) {
+        let now = self.now();
+        self.peer.learn_media(src);
+        self.peer.observe(now);
+        if !self.greeted && self.peer.media().is_some() {
+            self.greet(now).await;
+        }
+
+        if is_adv_framed(data) {
+            // Advanced-framed media/control reaches the flow only after the EAP-SRP
+            // handshake authenticates the peer; drop it otherwise. A no-op when
+            // authentication is disabled (`authed` is then true from the start).
+            if self.authed {
+                self.on_adv(now, data);
+            }
+        } else {
+            // Raw Main-profile GRE substrate: EAPOL auth, keepalive, or the RTCP
+            // handshake (no flow feedback rides the substrate on this path).
+            if let Some(eap_payload) = self.main.peek_eapol(data).map(<[u8]>::to_vec) {
+                self.handle_eap(&eap_payload).await;
+            } else {
+                let (kind, _ka, _ver) = self.main.peek_control(data);
+                if kind != ControlKind::Keepalive {
+                    // SR/RR/SDES handshake carry no flow input; ignore decode errors.
+                    let _ = self.main.decode(data, self.highest_sent);
+                }
+            }
+        }
+        self.drain(now).await;
+    }
+
+    /// Routes one Advanced-framed datagram: Type=8 unwraps an inner GRE substrate
+    /// packet; Type=5/4 decode to media/feedback.
+    fn on_adv(&mut self, now: Timestamp, data: &[u8]) {
+        let buf = Bytes::copy_from_slice(data);
+        let Ok(parsed) = adv::parse(&buf) else { return };
+        if parsed.enc_type == adv::TYPE_GRE_MAIN {
+            // The inner payload is a Main-profile GRE packet (handshake/keepalive).
+            let inner = parsed.payload.clone();
+            let (kind, _ka, _ver) = self.main.peek_control(&inner);
+            if kind != ControlKind::Keepalive {
+                let _ = self.main.decode(&inner, self.highest_sent);
+            }
+            return;
+        }
+        match self.adv.decode_parsed(&parsed) {
+            Ok(Decoded::Media(pkt)) => {
+                if self.learned_ssrc.is_none() {
+                    self.learned_ssrc = Some(pkt.ssrc);
+                }
+                if let Some(e) = &mut self.lqm {
+                    e.meter(pkt.payload.len(), pkt.retransmit);
+                }
+                self.flow.feed(now, 0, pkt);
+            }
+            Ok(Decoded::Feedback(fbs)) => {
+                for fb in fbs {
+                    // A Link Quality Message is a host-level source-adaptation
+                    // signal: drive the rate controller, never the flow core.
+                    if let Feedback::LinkQuality { lqm } = fb {
+                        if let Some(r) = &mut self.rate {
+                            r.handle(&lqm);
+                        }
+                    } else {
+                        self.flow.feed_feedback(now, fb);
+                    }
+                }
+            }
+            Ok(Decoded::Ignored) => {}
+            Err(e) => tracing::debug!("rist: adv decode failed: {e}"),
+        }
+    }
+
+    async fn drain(&mut self, now: Timestamp) {
+        let sock = self.socket.clone();
+        let mut fbs = Vec::new();
+        while let Some(out) = self.flow.poll_output() {
+            match out {
+                Output::SendMedia { pkt, .. } => {
+                    if !pkt.retransmit && seq_after(pkt.seq, self.highest_sent) {
+                        self.highest_sent = pkt.seq;
+                    }
+                    let Some(dst) = self.peer.media() else {
+                        continue;
+                    };
+                    match self.adv.encode_media(&pkt) {
+                        Ok(bytes) => {
+                            if let Err(e) = sock.send(&bytes, dst).await {
+                                tracing::debug!(seq = pkt.seq, "rist: adv send media failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(seq = pkt.seq, "rist: adv encode media failed: {e}");
+                        }
+                    }
+                }
+                Output::SendFeedback { fb, .. } => fbs.push(fb),
+                Output::SetTimer { id, deadline } => {
+                    self.timers.insert(id, deadline);
+                }
+                Output::ClearTimer { id } => {
+                    self.timers.remove(&id);
+                }
+            }
+        }
+        if !fbs.is_empty() {
+            self.send_feedback(&fbs, now).await;
+        }
+        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
+            if let Some(out) = &self.data_out
+                && out.send(payload).await.is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Sends each drained feedback effect as an Advanced Type=4 control datagram.
+    async fn send_feedback(&mut self, fbs: &[Feedback], now: Timestamp) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        match self
+            .adv
+            .encode_feedback(fbs, self.bitmask, adv_ctrl_ts(now))
+        {
+            Ok(dgs) => {
+                for dg in dgs {
+                    if let Err(e) = sock.send(&dg, dst).await {
+                        tracing::debug!("rist: adv send feedback failed: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("rist: adv encode feedback failed: {e}"),
+        }
+    }
+
+    /// Emits one Link Quality Message (TR-06-4 Part 1) when a reporting period has
+    /// elapsed: snapshots the flow stats into an LQM and sends it as a native
+    /// Advanced Type=Control message (control index `0x0002`). A no-op when source
+    /// adaptation is off or no reporting period has passed.
+    async fn maybe_emit_lqm(&mut self, now: Timestamp) {
+        if self.lqm.as_ref().is_none_or(|e| !e.due(now)) {
+            return;
+        }
+        let Some(dst) = self.peer.media() else {
+            return;
+        };
+        let stats = self.flow.stats();
+        let lqm = self
+            .lqm
+            .as_mut()
+            .expect("emitter present (checked above)")
+            .build(now, &stats);
+        let sock = self.socket.clone();
+        match self.adv.lqm_datagram(&lqm.encode(), adv_ctrl_ts(now)) {
+            Ok(bytes) => {
+                let _ = sock.send(&bytes, dst).await;
+            }
+            Err(e) => tracing::debug!("rist: adv lqm encode failed: {e}"),
+        }
+    }
+
+    /// Sends the raw Main GRE RTCP (SR/RR + SDES) handshake — the substrate that
+    /// authenticates this peer to libRIST and ungates its media.
+    async fn send_handshake(&mut self, now: Timestamp) {
+        let Some(dst) = self.peer.media() else { return };
+        let lead = self.feedback_lead(now);
+        let sock = self.socket.clone();
+        if let Ok(bytes) = self.main.encode_feedback(lead, &[], self.bitmask) {
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Sends the Advanced keep-alive (Type=4, I-bit), the capability/liveness beacon.
+    async fn send_keepalive(&mut self, now: Timestamp) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        if let Ok(bytes) = self.adv.keepalive_datagram(adv_ctrl_ts(now)) {
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Sends the GRE RTCP handshake + the Advanced keepalive, marking greeted.
+    async fn greet(&mut self, now: Timestamp) {
+        self.send_handshake(now).await;
+        self.send_keepalive(now).await;
+        self.greeted = true;
+    }
+
+    async fn send_eap_start(&mut self) {
+        let start = match self.eap.as_mut() {
+            Some(EapRole::Authenticatee(a)) => {
+                let mut w = Vec::new();
+                a.start().append_to(&mut w);
+                w
+            }
+            _ => return,
+        };
+        self.send_eapol(&start).await;
+    }
+
+    async fn handle_eap(&mut self, payload: &[u8]) {
+        let was_authed = self.authed;
+        let Some(role) = self.eap.as_mut() else {
+            return;
+        };
+        let reply = role.recv(payload);
+        self.authed = self.eap.as_ref().is_some_and(EapRole::authenticated);
+        if let Some(wire) = reply {
+            self.send_eapol(&wire).await;
+        }
+        if self.authed && !was_authed && !self.main.has_psk() {
+            self.on_authenticated().await;
+        }
+    }
+
+    /// On reaching authentication with no configured PSK, re-keys both the GRE
+    /// substrate and the Advanced data channel to the SRP session key K and pushes
+    /// "use K" to the peer.
+    async fn on_authenticated(&mut self) {
+        let Some(key) = self.eap.as_ref().and_then(EapRole::session_key) else {
+            return;
+        };
+        let _ = self.main.set_psk(&key);
+        let _ = self.adv.set_psk(&key);
+        let mut wire = Vec::new();
+        rist_codec::eap::passphrase_push(PASSPHRASE_PUSH_ID).append_to(&mut wire);
+        self.send_eapol(&wire).await;
+    }
+
+    /// Frames an EAP payload in a GRE EAPOL datagram (the substrate carries auth).
+    async fn send_eapol(&mut self, eap: &[u8]) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        if let Ok(bytes) = self.main.encode_eapol(eap) {
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // RTP timestamp wraps by design
+    fn feedback_lead(&self, now: Timestamp) -> RtcpPacket {
+        if self.sender {
+            RtcpPacket::SenderReport(SenderReport {
+                ssrc: self.ssrc,
+                ntp: crate::driver::wall_clock_ntp(),
+                rtp_time: (now.as_micros() * 9 / 100) as u32,
+                packet_count: 0,
+                octet_count: 0,
+            })
+        } else {
+            RtcpPacket::EmptyReceiverReport(EmptyReceiverReport {
+                ssrc: self.learned_ssrc.unwrap_or(self.ssrc),
+            })
+        }
+    }
+
+    fn earliest_timer(&self) -> Option<Timestamp> {
+        self.timers.values().copied().min()
+    }
+
+    fn fire_timers(&mut self, now: Timestamp) {
+        while let Some((&id, &deadline)) = self.timers.iter().min_by_key(|&(_, d)| *d) {
+            if deadline > now {
+                break;
+            }
+            self.timers.remove(&id);
+            self.flow.handle_timer(now, id);
+        }
+    }
+}
+
+/// Awaits the next application payload when authenticated; never resolves while
+/// gated or when there is no application input channel.
+async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, authed: bool) -> Option<Bytes> {
+    if !authed {
+        return std::future::pending().await;
+    }
+    match app_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn seq_after(a: u32, b: u32) -> bool {
+    Seq32::new(b).less(Seq32::new(a))
+}

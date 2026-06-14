@@ -18,6 +18,17 @@
 
 use crate::clock::Micros;
 
+/// libRIST's hard RTT floor (`RIST_RTT_MIN`, 3 ms): the effective minimum RTT is
+/// never below this even if the configured `rtt_min` is lower, so NACK-retry and
+/// retransmit timing cannot collapse toward zero. Applied wherever the RTT bounds a
+/// value (clamp + cold-start seed).
+const RTT_MIN_FLOOR: Micros = Micros::from_millis(3);
+
+/// The configured `rtt_min` raised to the hard 3 ms floor.
+fn effective_min(rtt_min: Micros) -> Micros {
+    rtt_min.max(RTT_MIN_FLOOR)
+}
+
 /// An immutable RTT estimator. Value type: each [`Estimator::observe`] returns an
 /// updated estimator rather than mutating in place, keeping it trivially
 /// deterministic and `Copy`.
@@ -35,7 +46,7 @@ impl Estimator {
     #[must_use]
     pub fn new(rtt_min: Micros) -> Estimator {
         Estimator {
-            eight_times_rtt: rtt_min.as_micros().saturating_mul(8).max(0),
+            eight_times_rtt: effective_min(rtt_min).as_micros().saturating_mul(8).max(0),
             last_sample: 0,
         }
     }
@@ -63,7 +74,7 @@ impl Estimator {
     /// retry basis.
     #[must_use]
     pub fn clamped(self, rtt_min: Micros, rtt_max: Micros) -> Micros {
-        self.smoothed().clamp_range(rtt_min, rtt_max)
+        self.smoothed().clamp_range(effective_min(rtt_min), rtt_max)
     }
 
     /// The most recent raw RTT sample (zero before the first observe).
@@ -76,7 +87,7 @@ impl Estimator {
     /// per-packet retransmit gate uses this (deliberately fresh, not smoothed).
     #[must_use]
     pub fn last_clamped(self, rtt_min: Micros, rtt_max: Micros) -> Micros {
-        self.last().clamp_range(rtt_min, rtt_max)
+        self.last().clamp_range(effective_min(rtt_min), rtt_max)
     }
 
     /// The NACK retry spacing: `clamp(rtt, rtt_min, rtt_max) * 1.1`, reproducing
@@ -122,6 +133,17 @@ mod tests {
             e.retry_interval(RTT_MIN, RTT_MAX),
             Micros::from_micros(5_500)
         );
+    }
+
+    #[test]
+    fn rtt_min_is_floored_at_three_millis() {
+        // A configured rtt_min below the 3 ms hard floor is raised to it.
+        let tiny = Micros::from_micros(500); // 0.5 ms
+        let e = Estimator::new(tiny);
+        assert_eq!(e.clamped(tiny, RTT_MAX), Micros::from_millis(3));
+        assert_eq!(e.last_clamped(tiny, RTT_MAX), Micros::from_millis(3));
+        // A configured rtt_min above the floor is untouched.
+        assert_eq!(Estimator::new(RTT_MIN).clamped(RTT_MIN, RTT_MAX), RTT_MIN);
     }
 
     #[test]

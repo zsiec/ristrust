@@ -1,8 +1,8 @@
 //! Differential tests: ristrust against the ristgo example sender/receiver — the
 //! same-author, libRIST-interop-proven Go reference (the project's second
 //! oracle). Behind the `differential` feature; needs the Go toolchain and the
-//! ristgo source (`RISTGO_DIR`, else `~/dev/ristgo`), and skips gracefully when
-//! either is absent.
+//! ristgo source (located via `$RISTGO_DIR`), and skips gracefully when either is
+//! absent.
 //!
 //! ```text
 //! cargo test -p rist --features differential -- --nocapture
@@ -26,14 +26,11 @@ use tokio::time::{Instant, timeout};
 const CHUNK: usize = 1316;
 const N: usize = 150;
 
-/// The ristgo source directory, or `None` (skip): `RISTGO_DIR`, else `~/dev/ristgo`.
+/// The ristgo source directory from `$RISTGO_DIR`, or `None` (skip) when it is
+/// unset or does not point at a ristgo checkout.
 fn ristgo_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("RISTGO_DIR") {
-        let p = PathBuf::from(d);
-        return p.join("go.mod").is_file().then_some(p);
-    }
-    let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home).join("dev/ristgo");
+    let d = std::env::var("RISTGO_DIR").ok()?;
+    let p = PathBuf::from(d);
     p.join("go.mod").is_file().then_some(p)
 }
 

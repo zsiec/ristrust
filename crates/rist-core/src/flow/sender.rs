@@ -13,6 +13,7 @@
 // index (`usize`) is bounded by the ring size by construction.
 #![allow(clippy::cast_possible_truncation)]
 
+use super::congestion::{BitrateEwma, CongestionMode, over_budget, wire_bytes};
 use super::{Flow, Output, RTT_ECHO_INTERVAL, TimerId};
 use crate::clock::{Ntp64, Timestamp};
 use crate::wire::{Feedback, MediaPacket};
@@ -74,6 +75,10 @@ pub(super) struct SenderState {
     /// The network path first transmissions and retransmissions leave on (always
     /// 0 this stage; multi-path transmission is bonding's job).
     pub(super) tx_path: u8,
+    /// The `recovery_maxbitrate` pacing EWMAs (libRIST `cli_bw` / `retry_bw`):
+    /// `data_bw` is fed every first transmission, `retry_bw` every retransmission.
+    data_bw: BitrateEwma,
+    retry_bw: BitrateEwma,
 }
 
 impl SenderState {
@@ -86,6 +91,8 @@ impl SenderState {
             ssrc,
             next_seq: start_seq,
             tx_path: 0,
+            data_bw: BitrateEwma::default(),
+            retry_bw: BitrateEwma::default(),
         }
     }
 
@@ -130,6 +137,7 @@ impl Flow {
         let seqn = self.sender.next_seq;
         self.sender.next_seq = self.sender.next_seq.wrapping_add(1);
         let source_time = Ntp64::from_timestamp(now).bits();
+        let wire_n = wire_bytes(payload.len());
 
         let idx = (seqn & self.sender.mask) as usize;
         {
@@ -160,6 +168,7 @@ impl Flow {
                 path_id: tx_path,
             },
         });
+        self.sender.data_bw.feed(now, wire_n); // recovery_maxbitrate data-rate EWMA
         self.stats.sent += 1;
     }
 
@@ -175,13 +184,26 @@ impl Flow {
     ///
     /// The gate clamps the most recent **raw** RTT sample (libRIST
     /// `peer->last_rtt`), deliberately fresher than the EWMA the receiver uses
-    /// for its retry interval (see [`rtt`](crate::rtt); ORCHESTRATION.md WP1
-    /// binding). The requested SSRC is ignored: the host demuxes feedback to this
-    /// flow before it arrives.
+    /// for its retry interval (see [`rtt`](crate::rtt)). The requested SSRC is
+    /// ignored: the host demuxes feedback to this flow before it arrives.
     pub(crate) fn service_nack(&mut self, now: Timestamp, missing: Vec<u32>) {
-        let rtt = self.est.last_clamped(self.cfg.rtt_min, self.cfg.rtt_max);
+        let mut rtt = self.est.last_clamped(self.cfg.rtt_min, self.cfg.rtt_max);
+        // Aggressive congestion control spaces retransmits at 2×RTT (libRIST doubles
+        // the suppression spacing under AGGRESSIVE); NORMAL keeps the 1×RTT gate.
+        if self.cfg.congestion_control == CongestionMode::Aggressive {
+            rtt = rtt + rtt;
+        }
         let tx_path = self.sender.tx_path;
         let base_ssrc = self.sender.ssrc;
+        let mode = self.cfg.congestion_control;
+        let max_kbps = self.cfg.recovery_maxbitrate;
+        let max_nacks = self.max_nacks_per_loop;
+        // Decay the bitrate windows so a stale-but-high estimate falls even when no
+        // new bytes have flowed since the last pass (libRIST refreshes with len 0 at
+        // the top of rist_retry_dequeue).
+        self.sender.data_bw.feed(now, 0);
+        self.sender.retry_bw.feed(now, 0);
+        let mut emitted = 0u32;
         for m in missing {
             let idx = (m & self.sender.mask) as usize;
             let (filled, slot_seq, retried, last_retry, transmit_count) = {
@@ -200,6 +222,11 @@ impl Flow {
                 self.stats.retransmit_suppressed += 1;
             } else if transmit_count >= self.cfg.max_retries {
                 self.stats.retransmit_exhausted += 1;
+            } else if over_budget(mode, &self.sender.data_bw, &self.sender.retry_bw, max_kbps) {
+                // Over the recovery_maxbitrate ceiling: refuse WITHOUT advancing the
+                // retry state, so the receiver re-NACKs and we accept it once the
+                // rate decays (libRIST returns before touching transmit_count).
+                self.stats.bandwidth_skipped += 1;
             } else {
                 let (source_time, payload) = {
                     let sl = &mut self.sender.ring[idx];
@@ -208,6 +235,7 @@ impl Flow {
                     sl.transmit_count += 1;
                     (sl.source_time, sl.payload.clone())
                 };
+                let retry_n = wire_bytes(payload.len());
                 self.outputs.push_back(Output::SendMedia {
                     path: tx_path,
                     pkt: MediaPacket {
@@ -219,7 +247,12 @@ impl Flow {
                         path_id: tx_path,
                     },
                 });
+                self.sender.retry_bw.feed(now, retry_n);
                 self.stats.retransmitted += 1;
+                emitted += 1;
+                if emitted >= max_nacks {
+                    return; // per-pass retransmit budget exhausted; receiver re-NACKs the rest
+                }
             }
         }
     }
@@ -252,7 +285,7 @@ mod tests {
     use super::SlotState;
     use crate::clock::Timestamp;
     use crate::flow::testutil::{TEST_SSRC, drain_outputs, src_ntp};
-    use crate::flow::{Config, Flow, Output, Role};
+    use crate::flow::{Config, CongestionMode, Flow, Output, Role};
     use crate::wire::{Feedback, MediaPacket};
     use bytes::Bytes;
 
@@ -370,6 +403,74 @@ mod tests {
             (sl.transmit_count, sl.retried, sl.last_retry),
             (1, true, ts(20_000))
         );
+    }
+
+    fn sender_with(mode: CongestionMode, max_kbps: u32) -> Flow {
+        let mut c = sender_config();
+        c.congestion_control = mode;
+        c.recovery_maxbitrate = max_kbps;
+        Flow::new(Role::Sender, c)
+    }
+
+    #[test]
+    fn service_nack_bandwidth_gate_skips_when_over_budget() {
+        // Normal mode with a 1 kbps ceiling: a modest data rate puts the slow EWMA
+        // far over budget, so the NACK is refused with `bandwidth_skipped` and the
+        // slot's retry state is left untouched (the receiver re-NACKs once the rate
+        // decays).
+        let mut f = sender_with(CongestionMode::Normal, 1);
+        let big = Bytes::from(vec![0u8; 1000]);
+        f.push_app(ts(10_000), big.clone()); // seq 100, seeds the EWMA
+        f.push_app(ts(20_000), big.clone()); // seq 101
+        f.push_app(ts(1_020_000), big.clone()); // seq 102: crosses the 1 s slow window
+        drain_outputs(&mut f);
+
+        f.feed_feedback(ts(1_030_000), nack(vec![100]));
+        let outs = drain_outputs(&mut f);
+        assert!(
+            media_outputs(&outs).is_empty(),
+            "retransmit refused while over budget"
+        );
+        let st = f.stats();
+        assert_eq!((st.retransmitted, st.bandwidth_skipped), (0, 1));
+        let sl = slot_of(&f, 100);
+        assert_eq!((sl.transmit_count, sl.retried), (0, false));
+    }
+
+    #[test]
+    fn service_nack_off_mode_ignores_the_budget() {
+        // The same over-budget scenario under congestion_control=Off retransmits.
+        let mut f = sender_with(CongestionMode::Off, 1);
+        let big = Bytes::from(vec![0u8; 1000]);
+        f.push_app(ts(10_000), big.clone());
+        f.push_app(ts(20_000), big.clone());
+        f.push_app(ts(1_020_000), big.clone());
+        drain_outputs(&mut f);
+
+        f.feed_feedback(ts(1_030_000), nack(vec![100]));
+        let outs = drain_outputs(&mut f);
+        assert_eq!(media_outputs(&outs).len(), 1);
+        let st = f.stats();
+        assert_eq!((st.retransmitted, st.bandwidth_skipped), (1, 0));
+    }
+
+    #[test]
+    fn service_nack_caps_retransmits_per_pass() {
+        // recovery_maxbitrate=1 derives max_nacks_per_loop=2; Off keeps the budget
+        // gate out of the way, so a five-seq NACK emits exactly two retransmits in one
+        // pass and the receiver re-NACKs the rest.
+        let mut f = sender_with(CongestionMode::Off, 1);
+        f.push_app(ts(10_000), Bytes::from_static(b"x")); // 100
+        f.push_app(ts(11_000), Bytes::from_static(b"x")); // 101
+        f.push_app(ts(12_000), Bytes::from_static(b"x")); // 102
+        f.push_app(ts(13_000), Bytes::from_static(b"x")); // 103
+        f.push_app(ts(14_000), Bytes::from_static(b"x")); // 104
+        drain_outputs(&mut f);
+
+        f.feed_feedback(ts(20_000), nack(vec![100, 101, 102, 103, 104]));
+        let outs = drain_outputs(&mut f);
+        assert_eq!(media_outputs(&outs).len(), 2, "per-pass NACK budget");
+        assert_eq!(f.stats().retransmitted, 2);
     }
 
     #[test]

@@ -18,11 +18,13 @@
 use bytes::Bytes;
 
 use rist_codec::rtcp::{self, Packet as RtcpPacket};
-use rist_codec::rtp;
+use rist_codec::{adv, crypto, gre, lpc, npd, rtp};
 use rist_core::clock::{Ntp64, Timestamp};
 use rist_core::wire::{Feedback, MediaPacket};
 
-/// A failure translating between the wire and the narrow waist.
+/// A failure translating between the wire and the narrow waist. Shared by the
+/// Simple [`codec`](crate::codec) and Main [`codec_main`](crate::codec_main)
+/// strategies; the GRE/crypto/NPD variants only arise on the Main path.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum CodecError {
@@ -35,6 +37,28 @@ pub(crate) enum CodecError {
     /// An RTP packet carried a version other than 2.
     #[error("rist: rtp version {0}, want 2")]
     BadVersion(u8),
+    /// A Main-profile GRE header failed to parse or encode.
+    #[error("rist: {0}")]
+    Gre(#[from] gre::GreError),
+    /// A Main-profile PSK crypto operation failed.
+    #[error("rist: {0}")]
+    Crypto(#[from] crypto::CryptoError),
+    /// A Main-profile NPD suppress/expand operation failed.
+    #[error("rist: {0}")]
+    Npd(#[from] npd::NpdError),
+    /// A Main-profile framing invariant was violated (e.g. an encrypted datagram
+    /// arrived with no decryptor configured, or the GRE protocol type was wrong).
+    #[error("rist: main: {0}")]
+    Main(&'static str),
+    /// An Advanced-profile header or control message failed to parse or encode.
+    #[error("rist: {0}")]
+    Adv(#[from] adv::AdvError),
+    /// An Advanced-profile LZ4 compression operation failed.
+    #[error("rist: {0}")]
+    Lpc(#[from] lpc::LpcError),
+    /// An Advanced-profile framing invariant was violated.
+    #[error("rist: adv: {0}")]
+    AdvProfile(&'static str),
 }
 
 /// Converts microseconds to 90 kHz RTP ticks. `90000/1e6 = 9/100`; the `9/100`
@@ -55,7 +79,7 @@ fn micros_from_rtp_ticks(ticks: i64) -> i64 {
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-fn rtp_ts_from_source(src: u64) -> u32 {
+pub(crate) fn rtp_ts_from_source(src: u64) -> u32 {
     let us = Ntp64::from_bits(src).to_timestamp().as_micros() as i64;
     rtp_ticks_from_micros(us) as u32
 }
@@ -112,36 +136,43 @@ impl MediaDecoder {
 
     /// Parses one RTP datagram into the normalized [`MediaPacket`] fed to the
     /// flow core. `payload` is sliced zero-copy from `buf` (the core retains it).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub(crate) fn decode(&mut self, buf: &Bytes) -> Result<MediaPacket, CodecError> {
         let p = rtp::Packet::decode(buf)?;
         if p.header.version != rtp::VERSION {
             return Err(CodecError::BadVersion(p.header.version));
         }
-        let (seq32, ticks) = if self.started {
-            (
-                widen_seq(p.header.sequence_number, self.ref_seq),
-                widen_ticks(p.header.timestamp, self.ref_ticks),
-            )
-        } else {
-            self.started = true;
-            (
-                u32::from(p.header.sequence_number),
-                i64::from(p.header.timestamp),
-            )
-        };
-        self.ref_seq = seq32;
-        self.ref_ticks = ticks;
-        let micros = micros_from_rtp_ticks(ticks).max(0) as u64;
-        let src = Ntp64::from_timestamp(Timestamp::from_micros(micros)).bits();
+        let (seq, source_time) = self.widen(p.header.sequence_number, p.header.timestamp);
         Ok(MediaPacket {
-            seq: seq32,
-            source_time: src,
+            seq,
+            source_time,
             ssrc: rtp::normalize_ssrc(p.header.ssrc),
             payload: p.payload,
             retransmit: rtp::is_retransmit(p.header.ssrc),
             path_id: 0,
         })
+    }
+
+    /// Widens a 16-bit RTP sequence and 32-bit timestamp to the flow core's 32-bit
+    /// sequence and NTP-64 source time, advancing the decoder's reference state.
+    /// Anchored at the first call, resolved nearest the previous value thereafter.
+    /// Shared by the Simple [`MediaDecoder::decode`] and the Main strategy (which
+    /// applies NPD expansion to the payload before calling this).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(crate) fn widen(&mut self, seq16: u16, ts32: u32) -> (u32, u64) {
+        let (seq32, ticks) = if self.started {
+            (
+                widen_seq(seq16, self.ref_seq),
+                widen_ticks(ts32, self.ref_ticks),
+            )
+        } else {
+            self.started = true;
+            (u32::from(seq16), i64::from(ts32))
+        };
+        self.ref_seq = seq32;
+        self.ref_ticks = ticks;
+        let micros = micros_from_rtp_ticks(ticks).max(0) as u64;
+        let src = Ntp64::from_timestamp(Timestamp::from_micros(micros)).bits();
+        (seq32, src)
     }
 }
 
@@ -161,7 +192,8 @@ fn widen_seq(wire16: u16, reference: u32) -> u32 {
 
 /// Reconstructs a 64-bit RTP tick count from a 32-bit wire timestamp, choosing
 /// the interpretation nearest `reference` (the previous reconstructed value).
-fn widen_ticks(wire32: u32, reference: i64) -> i64 {
+/// Shared with the Advanced strategy, whose 2^16 MHz timestamp wraps every ~65 ms.
+pub(crate) fn widen_ticks(wire32: u32, reference: i64) -> i64 {
     let cand = (reference & !0xFFFF_FFFF_i64) | i64::from(wire32);
     let diff = cand - reference;
     if diff > (1 << 31) {
@@ -299,7 +331,7 @@ fn nack_to_wire(ssrc: u32, narrow: &[u32], nack_ref: u32) -> Feedback {
 /// Reconstructs the 32-bit sequence with low 16 bits `wire16` that is greatest
 /// while still `<= reference`. Used for NACK sequences, never in the future
 /// relative to the sender's send position.
-fn widen_seq_at_most(wire16: u16, reference: u32) -> u32 {
+pub(crate) fn widen_seq_at_most(wire16: u16, reference: u32) -> u32 {
     let cand = (reference & 0xFFFF_0000) | u32::from(wire16);
     if cand > reference {
         cand.wrapping_sub(1 << 16)
@@ -364,6 +396,36 @@ mod tests {
             }
             last = Some(got.seq);
         }
+    }
+
+    #[test]
+    fn ticks_widening_across_the_32_bit_wrap() {
+        // The 32-bit RTP timestamp wraps (~13 h at 90 kHz). The codec reconstructs
+        // a MONOTONIC 64-bit tick count across the wrap, so the flow's source-time→
+        // local-time offset (locked once at the first packet) stays valid for the
+        // life of the stream — ristrust handles the source-clock wrap at the codec
+        // waist, not via a flow re-anchor. A contiguous stream crossing
+        // 0xFFFF_FFFF -> 0x0000_0000 must never step backward.
+        let mut reference: i64 = 0xFFFF_FFF0;
+        let mut prev = reference;
+        let start = reference;
+        for i in 0..32u32 {
+            let wire = 0xFFFF_FFF0u32.wrapping_add(i); // 0xFFFF_FFF0 .. 0x0000_000F
+            let widened = widen_ticks(wire, reference);
+            assert!(
+                widened >= prev,
+                "ticks must be monotonic across the wrap: {prev} -> {widened}"
+            );
+            prev = widened;
+            reference = widened;
+        }
+        // The reconstruction crossed 2^32 exactly once (no false extra wrap).
+        assert_eq!(
+            prev - start,
+            31,
+            "exactly the 31 contiguous steps, wrap absorbed"
+        );
+        assert!(prev >= (1i64 << 32), "the 64-bit value carried past 2^32");
     }
 
     #[test]

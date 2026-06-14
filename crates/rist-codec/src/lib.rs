@@ -4,6 +4,8 @@
 pub mod adapt;
 pub mod adv;
 pub mod crypto;
+#[cfg(feature = "dtls")]
+pub mod dtls;
 pub mod eap;
 pub mod gre;
 pub mod lpc;

@@ -22,6 +22,26 @@ rist-core.workspace = true
 # Zero-copy buffers (shared with the core's wire types) and error enums.
 bytes.workspace = true
 thiserror.workspace = true
-# Crypto (RustCrypto, pure Rust). PSK key derivation is PBKDF2-HMAC-SHA256.
+# Crypto (RustCrypto, pure Rust). PSK key derivation is PBKDF2-HMAC-SHA256;
+# the payload cipher is AES-CTR; the nonce draws from the OS CSPRNG.
 pbkdf2.workspace = true
 sha2.workspace = true
+aes.workspace = true
+ctr.workspace = true
+getrandom.workspace = true
+# SRP-6a big-integer math + constant-time proof comparison (Main-profile EAP).
+num-bigint.workspace = true
+subtle.workspace = true
+# DTLS 1.2 (optional, `--features dtls`): HMAC for the TLS 1.2 PRF, AES-128-GCM
+# AEAD record protection, and P-256 ECDHE/ECDSA for the ECDHE_ECDSA suite. Pure
+# RustCrypto, no FFI; deferred + feature-gated (libRIST has no DTLS).
+hmac = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
+
+[features]
+# Pure-Rust DTLS 1.2 (PSK + ECDHE-ECDSA-AES-128-GCM). Off by default; not an
+# interop gate (the bar is OpenSSL `s_server`/`s_client -dtls1_2`).
+dtls = ["dep:hmac", "dep:aes-gcm", "dep:p256", "dep:rand_core", "dep:x509-cert"]

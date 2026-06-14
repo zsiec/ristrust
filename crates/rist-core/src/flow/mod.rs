@@ -26,10 +26,12 @@
 //! and is overwritten. The receiver half owns that machinery; the sender half
 //! owns the retransmit history and the per-packet RTT gate.
 
+mod congestion;
 mod effects;
 mod receiver;
 mod sender;
 
+pub use congestion::CongestionMode;
 pub use effects::{Event, Output, Stats, TimerId};
 
 use std::collections::VecDeque;
@@ -85,9 +87,17 @@ pub struct Config {
     pub min_retries: u32,
     /// Maximum number of retransmission requests before giving up.
     pub max_retries: u32,
-    /// Ring capacity in slots; `0` selects [`DEFAULT_RING_SIZE`], other values
-    /// round up to the next power of two.
+    /// Ring capacity in slots; `0` derives it from the recovery window and
+    /// `recovery_maxbitrate` (floored at [`DEFAULT_RING_SIZE`]), other values round
+    /// up to the next power of two.
     pub ring_size: usize,
+    /// `recovery_maxbitrate` in kbps (libRIST default 100000): the ceiling the
+    /// sender paces retransmissions against under [`CongestionMode::Normal`] /
+    /// [`CongestionMode::Aggressive`], and the basis for the derived ring size,
+    /// missing-queue, and per-pass NACK bounds.
+    pub recovery_maxbitrate: u32,
+    /// The sender's congestion-control / NACK-pacing mode.
+    pub congestion_control: CongestionMode,
     /// The base flow SSRC. Must be even; the low bit is reserved for the
     /// retransmit marker.
     pub ssrc: u32,
@@ -96,7 +106,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// The libRIST default parameters (see the table in `CLAUDE.md`/`PLAN.md`).
+    /// The libRIST default parameters — the authoritative values a ristrust peer
+    /// must match to interoperate with libRIST.
     #[must_use]
     pub fn librist_defaults() -> Config {
         Config {
@@ -108,6 +119,8 @@ impl Config {
             min_retries: 6,
             max_retries: 20,
             ring_size: DEFAULT_RING_SIZE,
+            recovery_maxbitrate: 100_000,
+            congestion_control: CongestionMode::Normal,
             ssrc: 0,
             start_seq: 0,
         }
@@ -122,11 +135,13 @@ impl Config {
         Micros::from_micros(span.as_micros() / 2) + self.recovery_buffer_min
     }
 
-    /// The effective ring capacity (power of two).
+    /// The effective ring capacity (power of two). `ring_size == 0` derives it from
+    /// the recovery window and `recovery_maxbitrate` (then rounds up to a power of
+    /// two); an explicit value is rounded up directly.
     #[must_use]
     fn effective_ring_size(&self) -> usize {
         if self.ring_size == 0 {
-            DEFAULT_RING_SIZE
+            congestion::derive_ring_size(self).next_power_of_two()
         } else {
             self.ring_size.next_power_of_two()
         }
@@ -157,6 +172,14 @@ pub struct Flow {
     /// per-path attribution lands with bonding.
     est: Estimator,
 
+    /// Bounds how many missing entries the receiver queues before it stops marking
+    /// new gaps (the buffer-bloat guard), derived from the recovery window and
+    /// `recovery_maxbitrate`.
+    missing_counter_max: u32,
+    /// Caps the retransmissions the sender emits per service pass (the rest are
+    /// re-NACKed), derived likewise.
+    max_nacks_per_loop: u32,
+
     outputs: VecDeque<Output>,
     events: VecDeque<Event>,
     stats: Stats,
@@ -183,12 +206,16 @@ impl Flow {
                 SenderState::new(size, cfg.ssrc, cfg.start_seq),
             ),
         };
+        let missing_counter_max = congestion::derive_missing_counter_max(&cfg);
+        let max_nacks_per_loop = congestion::derive_max_nacks_per_loop(&cfg);
         Flow {
             role,
             cfg,
             recovery_buffer,
             recovery_buffer_110,
             est,
+            missing_counter_max,
+            max_nacks_per_loop,
             outputs: VecDeque::new(),
             events: VecDeque::new(),
             stats: Stats::default(),

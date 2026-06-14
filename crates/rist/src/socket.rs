@@ -108,6 +108,70 @@ impl SimpleSocket {
     }
 }
 
+/// A RIST Main-profile (VSF TR-06-2) UDP transport: a single unconnected UDP
+/// socket carrying both GRE-tunnelled media and compound RTCP on one port. Clones
+/// share the underlying socket (`Arc`), so the driver can send while awaiting
+/// receives on the same socket.
+#[derive(Debug, Clone)]
+pub(crate) struct MainSocket {
+    sock: Arc<dyn AsyncUdpSocket>,
+}
+
+impl MainSocket {
+    /// Binds the single socket to `addr` (the receiver-side constructor). Unlike the
+    /// Simple profile, the Main profile multiplexes everything onto one port, so any
+    /// positive port is accepted.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the port is zero or the socket cannot be bound.
+    pub(crate) fn listen(rt: &dyn Runtime, addr: SocketAddr) -> io::Result<MainSocket> {
+        if addr.port() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rist: socket: main-profile port must be non-zero",
+            ));
+        }
+        Ok(MainSocket {
+            sock: rt.bind(addr)?,
+        })
+    }
+
+    /// Binds the socket to an OS-chosen port on the unspecified address of the given
+    /// family (the sender-side constructor). The receiver learns the local port from
+    /// inbound datagrams.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the socket cannot be bound.
+    pub(crate) fn dial_ephemeral(rt: &dyn Runtime, ipv6: bool) -> io::Result<MainSocket> {
+        let unspecified = if ipv6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+        Ok(MainSocket {
+            sock: rt.bind(SocketAddr::new(unspecified, 0))?,
+        })
+    }
+
+    /// The local address the transport is bound to.
+    ///
+    /// # Errors
+    /// Returns the underlying socket error if the address cannot be read.
+    pub(crate) fn local(&self) -> io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// Receives one datagram, returning its length and source.
+    pub(crate) async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        poll_fn(|cx| self.sock.poll_recv(cx, buf)).await
+    }
+
+    /// Sends one datagram to `dst`.
+    pub(crate) async fn send(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        poll_fn(|cx| self.sock.poll_send(cx, buf, dst)).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +215,23 @@ mod tests {
         assert_eq!(&buf[..n], b"media");
         let (n, _src) = recv.recv_rtcp(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"rtcp!");
+    }
+
+    #[tokio::test]
+    async fn main_socket_rejects_zero_port_and_round_trips() {
+        let rt = TokioRuntime;
+        let zero = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        assert!(MainSocket::listen(&rt, zero).is_err());
+
+        let recv = MainSocket::dial_ephemeral(&rt, false).unwrap();
+        let send = MainSocket::dial_ephemeral(&rt, false).unwrap();
+        let dst = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            recv.local().unwrap().port(),
+        );
+        send.send(b"gre-frame", dst).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _src) = recv.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"gre-frame");
     }
 }

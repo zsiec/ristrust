@@ -18,12 +18,13 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use rist_codec::rtcp::{EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
+use rist_codec::rtcp::{self, EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
 use rist_core::clock::{Ntp64, Timestamp};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
 use rist_core::wire::{Feedback, MediaPacket};
 
+use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self, MediaDecoder};
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
@@ -67,31 +68,18 @@ pub(crate) struct Driver {
     /// The media SSRC learned from the first inbound packet (the receiver's
     /// reporter SSRC until then).
     learned_ssrc: Option<u32>,
-}
 
-/// The application-facing handles of a spawned sender driver.
-pub(crate) struct SenderSpawned {
-    /// The bound transport (for `local_addr`).
-    pub(crate) socket: SimpleSocket,
-    /// Sends application payloads into the driver.
-    pub(crate) app_in: mpsc::Sender<Bytes>,
-    /// The driver task handle (aborted on close).
-    pub(crate) task: tokio::task::JoinHandle<()>,
-}
-
-/// The application-facing handles of a spawned receiver driver.
-pub(crate) struct ReceiverSpawned {
-    /// The bound transport (for `local_addr`).
-    pub(crate) socket: SimpleSocket,
-    /// Receives delivered payloads from the driver.
-    pub(crate) data_out: mpsc::Receiver<Bytes>,
-    /// The driver task handle (aborted on close).
-    pub(crate) task: tokio::task::JoinHandle<()>,
+    // --- source adaptation (TR-06-4 Part 1) ---
+    /// The receiver's Link Quality Message emitter, when source adaptation is on.
+    lqm: Option<LqmEmitter>,
+    /// The sender's rate controller, when a rate callback is configured.
+    rate: Option<RateControl>,
 }
 
 impl Driver {
     /// Builds and spawns a sender driver transmitting to the peer's media/RTCP
-    /// (the receiver's even/odd addresses).
+    /// (the receiver's even/odd addresses), returning the application payload
+    /// channel and the driver task handle.
     #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
     pub(crate) fn spawn_sender(
         flow: Flow,
@@ -102,12 +90,13 @@ impl Driver {
         bitmask: bool,
         keepalive: Duration,
         start_seq: u32,
-    ) -> SenderSpawned {
+        rate: Option<RateControl>,
+    ) -> (mpsc::Sender<Bytes>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let driver = Driver {
             sender: true,
             flow,
-            socket: socket.clone(),
+            socket,
             peer,
             epoch: Instant::now(),
             timers: HashMap::new(),
@@ -120,17 +109,16 @@ impl Driver {
             data_out: None,
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
+            lqm: None,
+            rate,
         };
-        let task = tokio::spawn(driver.run());
-        SenderSpawned {
-            socket,
-            app_in: tx,
-            task,
-        }
+        (tx, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns a receiver driver that learns the sender's return
-    /// addresses from inbound traffic.
+    /// addresses from inbound traffic, returning the delivered-data channel and the
+    /// driver task handle.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
     pub(crate) fn spawn_receiver(
         flow: Flow,
         socket: SimpleSocket,
@@ -139,12 +127,13 @@ impl Driver {
         cname: String,
         bitmask: bool,
         keepalive: Duration,
-    ) -> ReceiverSpawned {
+        lqm: Option<LqmEmitter>,
+    ) -> (mpsc::Receiver<Bytes>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let driver = Driver {
             sender: false,
             flow,
-            socket: socket.clone(),
+            socket,
             peer,
             epoch: Instant::now(),
             timers: HashMap::new(),
@@ -157,13 +146,10 @@ impl Driver {
             data_out: Some(tx),
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
+            lqm,
+            rate: None,
         };
-        let task = tokio::spawn(driver.run());
-        ReceiverSpawned {
-            socket,
-            data_out: rx,
-            task,
-        }
+        (rx, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -229,6 +215,9 @@ impl Driver {
                     // the wire is not doubled.
                     if self.peer.rtcp().is_some() {
                         self.send_keepalive(now).await;
+                        // Source adaptation: emit a Link Quality Message when a
+                        // reporting period has elapsed (receiver only).
+                        self.maybe_emit_lqm(now).await;
                     }
                 },
             }
@@ -245,6 +234,9 @@ impl Driver {
             if self.learned_ssrc.is_none() {
                 self.learned_ssrc = Some(pkt.ssrc);
             }
+            if let Some(e) = &mut self.lqm {
+                e.meter(pkt.payload.len(), pkt.retransmit);
+            }
             self.flow.feed(now, 0, pkt);
         }
         self.drain(now).await;
@@ -257,7 +249,15 @@ impl Driver {
         self.peer.observe(now);
         if let Ok(fbs) = codec::decode_feedback(data, self.highest_sent) {
             for fb in fbs {
-                self.flow.feed_feedback(now, fb);
+                // A Link Quality Message is a host-level source-adaptation signal:
+                // drive the rate controller, never the flow core.
+                if let Feedback::LinkQuality { lqm } = fb {
+                    if let Some(r) = &mut self.rate {
+                        r.handle(&lqm);
+                    }
+                } else {
+                    self.flow.feed_feedback(now, fb);
+                }
             }
         }
         self.drain(now).await;
@@ -327,6 +327,33 @@ impl Driver {
         }
     }
 
+    /// Emits one Link Quality Message (TR-06-4 Part 1) when a reporting period has
+    /// elapsed: snapshots the flow stats into an LQM and sends it to the peer's RTCP
+    /// address as an empty-RR profile-specific extension. A no-op when source
+    /// adaptation is off or no reporting period has passed.
+    async fn maybe_emit_lqm(&mut self, now: Timestamp) {
+        if self.lqm.as_ref().is_none_or(|e| !e.due(now)) {
+            return;
+        }
+        let Some(dst) = self.peer.rtcp() else {
+            return;
+        };
+        let ssrc = self.local_ssrc();
+        let stats = self.flow.stats();
+        let lqm = self
+            .lqm
+            .as_mut()
+            .expect("emitter present (checked above)")
+            .build(now, &stats);
+        let lqr = RtcpPacket::LinkQualityReport(rtcp::LinkQualityReport {
+            ssrc,
+            lqm: lqm.encode(),
+        });
+        if let Ok(bytes) = codec::encode_feedback(lqr, ssrc, &self.cname, &[], self.bitmask) {
+            let _ = self.socket.send_rtcp(&bytes, dst).await;
+        }
+    }
+
     /// Sends a bare lead + SDES compound to keep NAT state alive and advertise the
     /// return address; the receiver learns the sender's RTCP source from it.
     async fn send_keepalive(&self, now: Timestamp) {
@@ -346,10 +373,11 @@ impl Driver {
         if self.sender {
             RtcpPacket::SenderReport(SenderReport {
                 ssrc: self.ssrc,
-                // Session-relative NTP: the receiver ignores SR contents at this
-                // stage and echo timestamps cancel the epoch (wall-clock SR is a
-                // WP-later refinement).
-                ntp: Ntp64::from_timestamp(now).bits(),
+                // Absolute wall-clock NTP (RFC 3550 §6.4.1) paired with the RTP
+                // timestamp at the same instant, so a receiver can map RTP time to
+                // wall-clock. RTT echoes use their own session-relative timestamps,
+                // which cancel the epoch independently.
+                ntp: wall_clock_ntp(),
                 rtp_time: (now.as_micros() * 9 / 100) as u32,
                 packet_count: 0,
                 octet_count: 0,
@@ -409,4 +437,21 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 /// Whether sequence `a` is circularly after `b` (wrap-aware).
 fn seq_after(a: u32, b: u32) -> bool {
     Seq32::new(b).less(Seq32::new(a))
+}
+
+/// The current absolute wall-clock time as NTP-64 (seconds since 1900-01-01, RFC
+/// 3550) for the RTCP Sender Report's NTP field, so a receiver can map RTP
+/// timestamps to wall-clock time (RTC/arrival playout, synchronized multi-stream,
+/// logging). The sans-I/O core never reads a wall clock — this is a host-only read,
+/// stamped when the SR is built. Seconds beyond 2^32 wrap (the NTP era, ~2036),
+/// matching libRIST and every other RTCP sender.
+pub(crate) fn wall_clock_ntp() -> u64 {
+    /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+    const UNIX_TO_NTP_SECS: u128 = 2_208_988_800;
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let micros_since_ntp_epoch = since_unix.as_micros() + UNIX_TO_NTP_SECS * 1_000_000;
+    let micros = u64::try_from(micros_since_ntp_epoch).unwrap_or(u64::MAX);
+    Ntp64::from_timestamp(Timestamp::from_micros(micros)).bits()
 }

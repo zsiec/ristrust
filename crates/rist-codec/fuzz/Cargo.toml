@@ -36,4 +36,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "lqm_roundtrip"
+path = "fuzz_targets/lqm_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

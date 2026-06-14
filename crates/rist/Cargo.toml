@@ -22,7 +22,7 @@ workspace = true
 interop = []
 # The differential suite (tests/differential.rs) builds and drives the ristgo
 # example sender/receiver against ristrust — the same-author Go reference. Needs
-# the Go toolchain and the ristgo source (RISTGO_DIR or ~/dev/ristgo); skips
+# the Go toolchain and the ristgo source (via the RISTGO_DIR env var); skips
 # gracefully otherwise. Run with: `cargo test -p rist --features differential`.
 differential = []
 
@@ -35,6 +35,8 @@ bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+# OS CSPRNG for the Main-profile EAP-SRP authenticator's per-session salt.
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

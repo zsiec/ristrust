@@ -20,3 +20,9 @@ workspace = true
 # or tokio — keeping the flow core profile-agnostic and deterministic forever.
 [dependencies]
 bytes.workspace = true
+
+# Dev-only: property tests for the wrap-aware seq arithmetic invariants. A
+# dev-dependency never counts against the import gate (`cargo tree -p rist-core`
+# without `--all-targets` shows only `bytes`).
+[dev-dependencies]
+proptest.workspace = true

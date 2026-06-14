@@ -1,16 +1,17 @@
-//! The deterministic N-path network simulator (scaffolding).
+//! The deterministic N-path network simulator.
 //!
-//! A seeded fake-clock simulator that drives two real [`Flow`]s through impaired
-//! links. It is the testing centerpiece: every flow/bonding test runs here and
-//! asserts the four invariants (no duplicate delivered, in-order output, nothing
-//! past deadline, completeness under recoverable loss), reproducible by seed.
+//! A seeded fake-clock simulator that drives a real sender [`Flow`] and receiver
+//! [`Flow`] through impaired links. It is the testing centerpiece: every
+//! flow/bonding test runs here and asserts the four invariants (no duplicate
+//! delivered, in-order output, nothing past deadline, completeness under
+//! recoverable loss), reproducible by seed.
 //!
 //! This is the Rust port of ristgo's `internal/simtest` (itself a generalization
 //! of srtrust's two-link `Pair`). It is already N-path so SMPTE 2022-7 bonding
-//! drops in. The structure is complete; the four-invariant sweeps and the latency
-//! invariant land in Phase 1 (WP1) once the flow core delivers packets.
+//! drops in: forward links carry the sender's media, back links carry the
+//! receiver's feedback, one [`Link`] per path.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use bytes::Bytes;
 use rist_core::clock::{Micros, Timestamp};
@@ -68,6 +69,16 @@ impl LinkConfig {
             dup_prob: 0.0,
         }
     }
+
+    /// A link with the given base delay and otherwise no impairment.
+    pub fn with_delay(delay: Micros) -> LinkConfig {
+        LinkConfig {
+            delay,
+            jitter: Micros::ZERO,
+            loss: 0.0,
+            dup_prob: 0.0,
+        }
+    }
 }
 
 struct Pending<T> {
@@ -76,15 +87,23 @@ struct Pending<T> {
     payload: T,
 }
 
+/// A deterministic per-datagram drop predicate (`true` drops), consulted before
+/// the probabilistic loss roll so a test can target a specific packet ("the
+/// first transmission of seq N") without hunting for a seed. A filter drop
+/// consumes no RNG draw.
+type DropFilter<T> = Box<dyn FnMut(&T) -> bool>;
+
 /// One directional link carrying datagrams of type `T` with delay, jitter, loss,
 /// and duplication, all decided deterministically from the seed. Fate is decided
-/// in a fixed order (loss, then duplication, then jitter) so a seed reproduces.
+/// in a fixed order — drop filter, then loss, then duplication, then jitter — so
+/// a seed reproduces a pattern stable as unrelated knobs change.
 pub struct Link<T> {
     cfg: LinkConfig,
     rng: Rng,
     pending: Vec<Pending<T>>,
     next_insert: u64,
     dropped: u64,
+    drop_filter: Option<DropFilter<T>>,
 }
 
 impl<T: Clone> Link<T> {
@@ -95,12 +114,24 @@ impl<T: Clone> Link<T> {
             pending: Vec::new(),
             next_insert: 0,
             dropped: 0,
+            drop_filter: None,
         }
     }
 
-    /// Offers a datagram at instant `now`. It may be dropped, delayed, and/or
-    /// duplicated according to the link config and seed.
+    /// Installs a deterministic drop predicate, consulted before the loss roll.
+    pub fn set_drop_filter(&mut self, filter: DropFilter<T>) {
+        self.drop_filter = Some(filter);
+    }
+
+    /// Offers a datagram at instant `now`. It may be dropped (by the filter or the
+    /// loss roll), delayed, and/or duplicated according to the config and seed.
     pub fn send(&mut self, now: Timestamp, payload: T) {
+        if let Some(filter) = &mut self.drop_filter
+            && filter(&payload)
+        {
+            self.dropped += 1;
+            return;
+        }
         if self.cfg.loss > 0.0 && self.rng.unit() < self.cfg.loss {
             self.dropped += 1;
             return;
@@ -149,7 +180,7 @@ impl<T: Clone> Link<T> {
         due.into_iter().map(|p| p.payload).collect()
     }
 
-    /// The count of datagrams dropped by loss so far.
+    /// The count of datagrams dropped by the filter or loss so far.
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -205,10 +236,16 @@ pub enum Datagram {
 #[derive(Default)]
 pub struct InvariantOpts {
     /// Assert the delivered run has no internal gaps (completeness under
-    /// recoverable loss).
+    /// recoverable loss). Leave false where abandoned holes are expected.
     pub require_contiguous: bool,
-    /// When set, assert no packet's end-to-end latency exceeds this bound. The
-    /// latency invariant lands in WP1 with deterministic seq assignment.
+    /// Bounds the allowed spread (max − min) in per-packet delivery latency.
+    /// Under the deterministic core latency is constant (a packet is delivered at
+    /// `source_time + offset + recovery_buffer` regardless of retransmits), so
+    /// `0` is the strict value.
+    pub latency_tolerance: Micros,
+    /// When set, assert no delivered packet's latency (deliver instant minus
+    /// first-transmission instant) exceeds this — the literal "nothing past
+    /// deadline" check.
     pub max_latency: Option<Micros>,
 }
 
@@ -226,19 +263,60 @@ pub struct Fabric {
     source: VecDeque<(Timestamp, Bytes)>,
     delivered: Vec<Bytes>,
     delivered_seqs: Vec<u32>,
+    /// Per-seq first-transmission and delivery instants, for the latency
+    /// invariant.
+    send_time: HashMap<u32, Timestamp>,
+    deliver_instant: HashMap<u32, Timestamp>,
+    discontinuities: usize,
+    /// When set, every media datagram the (single-path) sender emits is
+    /// duplicated across every forward path (the SMPTE 2022-7 full-redundancy
+    /// sender); the receiver's dedup merges the copies.
+    dup_tx: bool,
 }
 
 impl Fabric {
-    /// Builds an `num_paths`-path fabric. Forward links carry the sender's media,
-    /// back links carry the receiver's feedback; each path's two links are seeded
-    /// independently from `seed`.
+    /// Builds a fabric from explicit sender/receiver flows and pre-seeded link
+    /// vectors (one [`Link`] per path; `fwd` and `back` must be the same length).
+    /// The caller installs drop filters before the run. This is the primitive the
+    /// flow and bonding sims build on.
+    pub fn from_links(
+        sender: Flow,
+        receiver: Flow,
+        fwd: Vec<Link<Datagram>>,
+        back: Vec<Link<Datagram>>,
+    ) -> Fabric {
+        assert_eq!(
+            fwd.len(),
+            back.len(),
+            "fabric requires len(fwd) == len(back)"
+        );
+        Fabric {
+            now: Timestamp::ZERO,
+            sender,
+            receiver,
+            fwd,
+            back,
+            sender_timers: TimerWheel::new(),
+            receiver_timers: TimerWheel::new(),
+            source: VecDeque::new(),
+            delivered: Vec::new(),
+            delivered_seqs: Vec::new(),
+            send_time: HashMap::new(),
+            deliver_instant: HashMap::new(),
+            discontinuities: 0,
+            dup_tx: false,
+        }
+    }
+
+    /// Builds an `num_paths`-path fabric with default-config flows and uniformly
+    /// impaired links, each seeded independently from `seed`. A convenience over
+    /// [`Fabric::from_links`] for tests that need no per-link drop filter.
     pub fn new(num_paths: usize, fwd: LinkConfig, back: LinkConfig, seed: u64) -> Fabric {
         let sender = Flow::new(Role::Sender, Config::librist_defaults());
         let receiver = Flow::new(Role::Receiver, Config::librist_defaults());
         let mut fwd_links = Vec::with_capacity(num_paths);
         let mut back_links = Vec::with_capacity(num_paths);
-        for i in 0..num_paths {
-            let i = i as u64;
+        for i in 0..num_paths as u64 {
             fwd_links.push(Link::new(
                 fwd,
                 seed ^ (0xF0F0_0000 ^ i.wrapping_mul(0x1111)),
@@ -248,18 +326,7 @@ impl Fabric {
                 seed ^ (0x0F0F_0000 ^ i.wrapping_mul(0x2222)),
             ));
         }
-        Fabric {
-            now: Timestamp::ZERO,
-            sender,
-            receiver,
-            fwd: fwd_links,
-            back: back_links,
-            sender_timers: TimerWheel::new(),
-            receiver_timers: TimerWheel::new(),
-            source: VecDeque::new(),
-            delivered: Vec::new(),
-            delivered_seqs: Vec::new(),
-        }
+        Fabric::from_links(sender, receiver, fwd_links, back_links)
     }
 
     /// Schedules one application payload to be pushed into the sender at `at`.
@@ -268,9 +335,51 @@ impl Fabric {
         self.source.push_back((at, payload));
     }
 
+    /// Schedules `n` payloads at a constant `interval` starting at `start`:
+    /// `payload_fn(i)` supplies the i-th payload (a constant-bitrate source).
+    pub fn enqueue_cbr(
+        &mut self,
+        start: Timestamp,
+        interval: Micros,
+        n: usize,
+        mut payload_fn: impl FnMut(usize) -> Bytes,
+    ) {
+        let mut at = start;
+        for i in 0..n {
+            self.enqueue_source(at, payload_fn(i));
+            at = at + interval;
+        }
+    }
+
+    /// Enables bonded duplicate transmission: every media datagram the sender
+    /// emits is sent on all forward paths (the SMPTE 2022-7 full-redundancy
+    /// sender); the receiver's `(seq, source_time)` dedup merges the copies.
+    pub fn set_duplicate_tx(&mut self, on: bool) {
+        self.dup_tx = on;
+    }
+
+    /// Replaces path `i`'s forward and back links with freshly seeded links —
+    /// modeling a path going down (`loss: 1.0`), recovering, or changing
+    /// characteristics mid-run. In-flight datagrams on the old links are dropped.
+    pub fn degrade_path(&mut self, i: usize, fwd: LinkConfig, back: LinkConfig, seed: u64) {
+        assert!(i < self.fwd.len(), "degrade_path index out of range");
+        self.fwd[i] = Link::new(fwd, seed);
+        self.back[i] = Link::new(back, seed ^ 0x5555_5555_5555_5555);
+    }
+
     /// The current fake-clock instant.
     pub fn now(&self) -> Timestamp {
         self.now
+    }
+
+    /// A snapshot of the receiver flow's counters.
+    pub fn receiver_stats(&self) -> rist_core::flow::Stats {
+        self.receiver.stats()
+    }
+
+    /// A snapshot of the sender flow's counters.
+    pub fn sender_stats(&self) -> rist_core::flow::Stats {
+        self.sender.stats()
     }
 
     /// The payloads delivered out of the receiver so far, in delivery order.
@@ -283,10 +392,15 @@ impl Fabric {
         &self.delivered_seqs
     }
 
+    /// The number of delivered packets that carried a discontinuity flag.
+    pub fn discontinuities(&self) -> usize {
+        self.discontinuities
+    }
+
     /// Advances the fake clock to the next pending event and processes everything
     /// due: pushes due source payloads, delivers due datagrams into the flows,
     /// fires due timers, and drains the resulting effects back onto the links and
-    /// wheels. Returns `false` when the network is quiescent (nothing left to do).
+    /// wheels. Returns `false` when the network is quiescent.
     pub fn step(&mut self) -> bool {
         let mut next: Option<Timestamp> = None;
         let mut consider = |t: Option<Timestamp>| {
@@ -354,26 +468,12 @@ impl Fabric {
 
         // 5. Drain effects. The sender's outputs leave on forward links; the
         //    receiver's on back links. Only the receiver produces Deliver events.
-        drain_flow(
-            &mut self.sender,
-            &mut self.fwd,
-            &mut self.sender_timers,
-            now,
-            &mut self.delivered,
-            &mut self.delivered_seqs,
-        );
-        drain_flow(
-            &mut self.receiver,
-            &mut self.back,
-            &mut self.receiver_timers,
-            now,
-            &mut self.delivered,
-            &mut self.delivered_seqs,
-        );
+        self.drain_sender(now);
+        self.drain_receiver(now);
         true
     }
 
-    /// Steps until `pred` holds or `max_steps` is reached or the network goes
+    /// Steps until `pred` holds, `max_steps` is reached, or the network goes
     /// quiescent. Returns whether `pred` held at the end.
     pub fn run_until(&mut self, mut pred: impl FnMut(&Fabric) -> bool, max_steps: usize) -> bool {
         for _ in 0..max_steps {
@@ -387,33 +487,131 @@ impl Fabric {
         pred(self)
     }
 
-    /// Validates the delivered stream against the flow invariants, returning a
-    /// list of human-readable violations (empty when all hold).
+    /// Drains the sender's effects: media (and its first-transmission instant) and
+    /// feedback onto the forward links, timer requests onto the sender's wheel.
+    fn drain_sender(&mut self, now: Timestamp) {
+        while let Some(out) = self.sender.poll_output() {
+            match out {
+                Output::SendMedia { path, pkt } => {
+                    if !pkt.retransmit {
+                        self.send_time.entry(pkt.seq).or_insert(now);
+                    }
+                    if self.dup_tx {
+                        for l in &mut self.fwd {
+                            l.send(now, Datagram::Media(pkt.clone()));
+                        }
+                    } else if let Some(l) = self.fwd.get_mut(path as usize) {
+                        l.send(now, Datagram::Media(pkt));
+                    }
+                }
+                Output::SendFeedback { path, fb } => {
+                    if let Some(l) = self.fwd.get_mut(path as usize) {
+                        l.send(now, Datagram::Feedback(fb));
+                    }
+                }
+                Output::SetTimer { id, deadline } => self.sender_timers.set(id, deadline),
+                Output::ClearTimer { id } => self.sender_timers.clear(id),
+            }
+        }
+    }
+
+    /// Drains the receiver's effects: feedback onto the back links, timer requests
+    /// onto the receiver's wheel, and records delivered packets and their instants.
+    fn drain_receiver(&mut self, now: Timestamp) {
+        while let Some(out) = self.receiver.poll_output() {
+            match out {
+                Output::SendFeedback { path, fb } => {
+                    if let Some(l) = self.back.get_mut(path as usize) {
+                        l.send(now, Datagram::Feedback(fb));
+                    }
+                }
+                // A receiver never originates media; ignore defensively.
+                Output::SendMedia { .. } => {}
+                Output::SetTimer { id, deadline } => self.receiver_timers.set(id, deadline),
+                Output::ClearTimer { id } => self.receiver_timers.clear(id),
+            }
+        }
+        while let Some(Event::Deliver {
+            seq,
+            payload,
+            discontinuity,
+        }) = self.receiver.poll_event()
+        {
+            self.delivered_seqs.push(seq);
+            self.delivered.push(payload);
+            self.deliver_instant.insert(seq, now);
+            if discontinuity {
+                self.discontinuities += 1;
+            }
+        }
+    }
+
+    /// Validates the delivered stream against the four flow invariants, returning
+    /// a list of human-readable violations (empty when all hold):
+    ///
+    /// 1. No duplicate delivered — each seq at most once.
+    /// 2. In order — strictly increasing under wrap-aware compare.
+    /// 3. Nothing past deadline — uniform delivery latency within
+    ///    `latency_tolerance`, and (when set) no greater than `max_latency`.
+    /// 4. Completeness under recoverable loss — no internal gaps (when
+    ///    `require_contiguous`).
     pub fn check_invariants(&self, opts: &InvariantOpts) -> Vec<String> {
         let mut violations = Vec::new();
         let seqs = &self.delivered_seqs;
+
+        // (1) + (2): strictly increasing under wrap-aware compare.
         for i in 1..seqs.len() {
             let (prev, cur) = (seqs[i - 1], seqs[i]);
-            // (1) No duplicate delivered.
             if prev == cur {
                 violations.push(format!("duplicate delivery of seq {cur} at index {i}"));
-            // (2) In order under wrap-aware compare.
             } else if !Seq32::new(prev).less(Seq32::new(cur)) {
                 violations.push(format!(
                     "out-of-order delivery: seq {cur} after {prev} at index {i}"
                 ));
             }
-            // (4) Completeness under recoverable loss (no internal gaps).
+            // (4) completeness: no internal gaps.
             if opts.require_contiguous && cur != prev.wrapping_add(1) {
                 violations.push(format!(
                     "internal gap: seq jumps {prev} -> {cur} at index {i}"
                 ));
             }
         }
-        // (3) The end-to-end latency bound is asserted in WP1, once the sender
-        // assigns sequence numbers deterministically and per-seq send/deliver
-        // instants can be correlated. Acknowledged here so the option is honored.
-        let _ = opts.max_latency;
+
+        // (3) nothing past deadline: uniform delivery latency, and within the
+        // absolute playout deadline when MaxLatency is set.
+        let mut min_lat: Option<Micros> = None;
+        let mut max_lat: Option<Micros> = None;
+        for &s in seqs {
+            match (self.send_time.get(&s), self.deliver_instant.get(&s)) {
+                (Some(&st), Some(&dt)) => {
+                    let lat = dt - st;
+                    if let Some(bound) = opts.max_latency
+                        && lat > bound
+                    {
+                        violations.push(format!(
+                            "seq {s} delivered late: latency {} us > max {}",
+                            lat.as_micros(),
+                            bound.as_micros()
+                        ));
+                    }
+                    min_lat = Some(min_lat.map_or(lat, |m| m.min(lat)));
+                    max_lat = Some(max_lat.map_or(lat, |m| m.max(lat)));
+                }
+                _ => violations.push(format!("missing send/deliver timestamp for seq {s}")),
+            }
+        }
+        if let (Some(mn), Some(mx)) = (min_lat, max_lat)
+            && (mx - mn) > opts.latency_tolerance
+        {
+            violations.push(format!(
+                "delivery latency varied by {} us (min {}, max {}) > tolerance {}",
+                (mx - mn).as_micros(),
+                mn.as_micros(),
+                mx.as_micros(),
+                opts.latency_tolerance.as_micros()
+            ));
+        }
+
         violations
     }
 }
@@ -422,35 +620,5 @@ fn feed_datagram(flow: &mut Flow, now: Timestamp, path: u8, d: Datagram) {
     match d {
         Datagram::Media(pkt) => flow.feed(now, path, pkt),
         Datagram::Feedback(fb) => flow.feed_feedback(now, fb),
-    }
-}
-
-fn drain_flow(
-    flow: &mut Flow,
-    out_links: &mut [Link<Datagram>],
-    timers: &mut TimerWheel,
-    now: Timestamp,
-    delivered: &mut Vec<Bytes>,
-    delivered_seqs: &mut Vec<u32>,
-) {
-    while let Some(out) = flow.poll_output() {
-        match out {
-            Output::SendMedia { path, pkt } => {
-                out_links[path as usize].send(now, Datagram::Media(pkt));
-            }
-            Output::SendFeedback { path, fb } => {
-                out_links[path as usize].send(now, Datagram::Feedback(fb));
-            }
-            Output::SetTimer { id, deadline } => timers.set(id, deadline),
-            Output::ClearTimer { id } => timers.clear(id),
-        }
-    }
-    while let Some(ev) = flow.poll_event() {
-        match ev {
-            Event::Deliver { seq, payload, .. } => {
-                delivered_seqs.push(seq);
-                delivered.push(payload);
-            }
-        }
     }
 }

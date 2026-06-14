@@ -15,11 +15,16 @@
 //! Declarative timers: the core *requests* timers by [`TimerId`]; the host owns
 //! the wheel.
 //!
-//! # Status
+//! # The one ring (the 2022-7 merge)
 //!
-//! Scaffolding. The seam, [`Config`], and [`Stats`] are in place; the ARQ ring,
-//! dedup, missing-detection, playout, and NACK servicing land in Phase 1 (WP1),
-//! built against the N-path simulator and the four invariants (see `PLAN.md`).
+//! Every inbound media packet — first transmission, ARQ retransmit, or a
+//! duplicate copy from another 2022-7 path — lands in **one** power-of-two ring
+//! indexed by `seq & mask` and validated by `(seq, source_time)`, exactly as
+//! libRIST does in `receiver_enqueue`. A filled slot with the same `(seq,
+//! source_time)` is a duplicate and is dropped; that single test is the entire
+//! multipath merge. A filled slot with a different `(seq, source_time)` is stale
+//! and is overwritten. The receiver half owns that machinery; the sender half
+//! owns the retransmit history and the per-packet RTT gate.
 
 mod effects;
 mod receiver;
@@ -31,12 +36,24 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use crate::clock::{Micros, Timestamp};
+use crate::clock::{Micros, Ntp64, Timestamp};
+use crate::rtt::Estimator;
 use crate::wire::{Feedback, MediaPacket};
 
-/// The default receiver ring capacity, in slots (power of two). libRIST uses a
-/// 2^16-slot ring indexed by `seq & mask`.
+use receiver::ReceiverState;
+use sender::SenderState;
+
+/// The default receiver ring capacity, in slots. libRIST uses a 2^16-slot ring
+/// indexed by `seq & mask` (`receiver_queue_max`).
 pub const DEFAULT_RING_SIZE: usize = 1 << 16;
+
+/// The receiver NACK cadence: libRIST's `RIST_MAX_JITTER` = 5 ms receiver-loop
+/// bound, the longest the NACK pass may lag.
+const NACK_CADENCE: Micros = Micros::from_millis(5);
+
+/// The RTT-echo origination interval: libRIST's `RIST_PING_INTERVAL` = 100 ms.
+/// Both roles originate echoes to measure their own RTT.
+const RTT_ECHO_INTERVAL: Micros = Micros::from_millis(100);
 
 /// Which half of a RIST flow this instance is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,32 +137,63 @@ impl Config {
 ///
 /// Construct with [`Flow::new`], drive with the input methods, and drain effects
 /// with [`Flow::poll_output`] / [`Flow::poll_event`]. The same type serves both
-/// roles; [`Flow::role`] selects the behavior.
+/// roles; [`Flow::role`] selects the behavior. Not safe for concurrent use; the
+/// host serializes all calls.
+// Fields are module-private to `flow`; the `receiver` / `sender` submodules and
+// the white-box test modules are descendants and so may access them, while
+// nothing outside the flow core can (the host drives it only through methods).
 #[derive(Debug)]
 pub struct Flow {
     role: Role,
     cfg: Config,
-    #[allow(dead_code)] // consumed once the WP1 ring/history machinery lands
-    ring_size: usize,
+
+    /// The derived playout budget (`Config::recovery_buffer`).
+    recovery_buffer: Micros,
+    /// `recovery_buffer * 1.1`, computed with the same double multiply-and-
+    /// truncate libRIST uses for its too-late and NACK-abandon thresholds.
+    recovery_buffer_110: Micros,
+
+    /// The libRIST `eight_times_rtt` estimator. One per flow this stage;
+    /// per-path attribution lands with bonding.
+    est: Estimator,
+
     outputs: VecDeque<Output>,
     events: VecDeque<Event>,
     stats: Stats,
+
+    receiver: ReceiverState,
+    sender: SenderState,
 }
 
 impl Flow {
-    /// Constructs a flow for `role` with `cfg`. Pre-sizes internal queues; the
-    /// receiver ring (WP1) will be fully pre-allocated so steady-state in-order
-    /// receive allocates nothing.
+    /// Constructs a flow for `role` with `cfg`. `ring_size` is normalized
+    /// (`0` → [`DEFAULT_RING_SIZE`], else rounded up to a power of two); range
+    /// validation is the caller's job. The ring of the matching half is fully
+    /// pre-allocated so steady-state in-order receive allocates nothing.
     #[must_use]
     pub fn new(role: Role, cfg: Config) -> Flow {
-        let ring_size = cfg.effective_ring_size();
+        let size = cfg.effective_ring_size();
+        let recovery_buffer = cfg.recovery_buffer();
+        let recovery_buffer_110 = mul_1_1(recovery_buffer);
+        let est = Estimator::new(cfg.rtt_min);
+        let (receiver, sender) = match role {
+            Role::Receiver => (ReceiverState::new(size), SenderState::empty()),
+            Role::Sender => (
+                ReceiverState::empty(),
+                SenderState::new(size, cfg.ssrc, cfg.start_seq),
+            ),
+        };
         Flow {
             role,
             cfg,
-            ring_size,
+            recovery_buffer,
+            recovery_buffer_110,
+            est,
             outputs: VecDeque::new(),
             events: VecDeque::new(),
             stats: Stats::default(),
+            receiver,
+            sender,
         }
     }
 
@@ -169,42 +217,126 @@ impl Flow {
 
     /// Feeds one inbound media packet that arrived on `path` at `now`. Only the
     /// receiver half acts on it; the sender half ignores media.
+    ///
+    /// Retains `pkt.payload` by reference (zero-copy) until the packet is
+    /// delivered, overwritten, or abandoned; producers must not mutate it after.
     pub fn feed(&mut self, now: Timestamp, path: u8, pkt: MediaPacket) {
-        match self.role {
-            Role::Receiver => self.recv_feed(now, path, pkt),
-            Role::Sender => {}
+        if self.role == Role::Receiver {
+            self.recv_feed(now, path, pkt);
         }
     }
 
     /// Feeds one inbound control message decoded into normalized [`Feedback`].
+    ///
+    /// Both roles answer an [`Feedback::RttEchoRequest`] immediately (zero
+    /// processing delay, since the core responds within the same step) and fold
+    /// an [`Feedback::RttEchoResponse`] into the RTT estimator. A
+    /// [`Feedback::Nack`] is serviced from the retransmit history on a sender and
+    /// ignored on a receiver; every variant without a handler is counted in
+    /// [`Stats::ignored_feedback`] rather than crashing — additive wire variants
+    /// must never break the core. The match is exhaustive so a *new* variant is a
+    /// compile error here, forcing a deliberate handle-or-ignore decision.
     pub fn feed_feedback(&mut self, now: Timestamp, fb: Feedback) {
+        match fb {
+            Feedback::RttEchoRequest { timestamp } => {
+                let path = self.feedback_path();
+                self.outputs.push_back(Output::SendFeedback {
+                    path,
+                    fb: Feedback::RttEchoResponse {
+                        timestamp,
+                        processing_delay: 0,
+                    },
+                });
+            }
+            Feedback::RttEchoResponse {
+                timestamp,
+                processing_delay,
+            } => {
+                // sample = (now - echoed timestamp) - processing delay. A negative
+                // sample is pinned to zero by the estimator (libRIST
+                // calculate_rtt_delay).
+                let sent = Ntp64::from_bits(timestamp).to_timestamp();
+                let sample = (now - sent) - Micros::from_micros(i64::from(processing_delay));
+                self.est = self.est.observe(sample);
+            }
+            Feedback::Nack { missing, .. } => {
+                if self.role == Role::Sender {
+                    self.service_nack(now, missing);
+                } else {
+                    // A receiver does not originate retransmissions.
+                    self.stats.ignored_feedback += 1;
+                }
+            }
+            // SenderReport (WP4 offset refinement), Keepalive (host liveness),
+            // ExtSeq / LinkQuality (codec / host concerns): no core handler.
+            Feedback::SenderReport { .. }
+            | Feedback::Keepalive
+            | Feedback::ExtSeq { .. }
+            | Feedback::LinkQuality { .. } => {
+                self.stats.ignored_feedback += 1;
+            }
+        }
+    }
+
+    /// The path control messages leave on: the sender's fixed transmit path, or
+    /// the receiver's most-recent media path (feedback follows the media back).
+    fn feedback_path(&self) -> u8 {
         match self.role {
-            Role::Sender => self.send_handle_feedback(now, fb),
-            Role::Receiver => self.recv_handle_feedback(now, fb),
+            Role::Sender => self.sender.tx_path,
+            Role::Receiver => self.receiver.last_path,
         }
     }
 
     /// Submits one application payload for transmission. Only the sender half acts
-    /// on it.
+    /// on it; it retains `payload` by reference so it can be re-sent on NACK.
     pub fn push_app(&mut self, now: Timestamp, payload: Bytes) {
-        match self.role {
-            Role::Sender => self.send_push_app(now, payload),
-            Role::Receiver => {}
+        if self.role == Role::Sender {
+            self.send_push_app(now, payload);
         }
     }
 
-    /// Fires a previously requested declarative timer.
+    /// Fires a previously requested declarative timer; `now` is the instant it
+    /// fired. Stale or no-longer-relevant IDs are ignored.
     pub fn handle_timer(&mut self, now: Timestamp, id: TimerId) {
         match self.role {
-            Role::Receiver => self.recv_handle_timer(now, id),
-            Role::Sender => self.send_handle_timer(now, id),
+            Role::Sender => self.sender_handle_timer(now, id),
+            Role::Receiver => match id {
+                TimerId::Playout => {
+                    self.receiver.playout_armed = false;
+                    self.deliver_due(now);
+                }
+                TimerId::Nack => {
+                    self.receiver.nack_armed = false;
+                    self.process_nacks(now);
+                    self.schedule_nack(now);
+                }
+                TimerId::RttEcho => {
+                    if self.receiver.started {
+                        let path = self.receiver.last_path;
+                        self.outputs.push_back(Output::SendFeedback {
+                            path,
+                            fb: Feedback::RttEchoRequest {
+                                timestamp: Ntp64::from_timestamp(now).bits(),
+                            },
+                        });
+                        self.outputs.push_back(Output::SetTimer {
+                            id: TimerId::RttEcho,
+                            deadline: now + RTT_ECHO_INTERVAL,
+                        });
+                    }
+                }
+            },
         }
     }
 
-    /// Advances time without any external input — lets the core shed too-late
-    /// packets and re-arm cadence timers. A no-op until the WP1 machinery lands.
-    pub fn tick(&mut self, _now: Timestamp) {
-        // TODO(WP1): age the ring / re-evaluate playout and NACK cadence.
+    /// Advances time without external input: lets the receiver perform due
+    /// in-order delivery and a NACK pass. A host honoring `SetTimer` effects need
+    /// not call this, but it is always safe to. A no-op on a sender.
+    pub fn tick(&mut self, now: Timestamp) {
+        if self.role == Role::Receiver {
+            self.deliver_due(now);
+            self.process_nacks(now);
+        }
     }
 
     /// Drains the next queued effect, or `None` when the effect queue is empty.
@@ -215,5 +347,69 @@ impl Flow {
     /// Drains the next queued application event, or `None` when none remain.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+}
+
+/// `d * 1.1` via the same `f64` multiply-and-truncate libRIST uses for its
+/// recovery-buffer-derived thresholds.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn mul_1_1(d: Micros) -> Micros {
+    Micros::from_micros((d.as_micros() as f64 * 1.1) as i64)
+}
+
+/// White-box test helpers shared by the receiver and sender test modules. These
+/// build packets and drain effect/event queues; they never touch ring internals
+/// (those assertions live in the per-half test modules, next to the state).
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::{Event, Flow, MediaPacket, Output};
+    use crate::clock::{Ntp64, Timestamp};
+    use bytes::Bytes;
+
+    /// The SSRC every test packet carries (even base; LSB reserved for retransmit).
+    pub(crate) const TEST_SSRC: u32 = 0x1234_5678;
+
+    /// The NTP-64 source-time wire value for `us` microseconds.
+    pub(crate) fn src_ntp(us: u64) -> u64 {
+        Ntp64::from_timestamp(Timestamp::from_micros(us)).bits()
+    }
+
+    /// A first-transmission media packet at source instant `src_us`.
+    pub(crate) fn mk_pkt(seq: u32, src_us: u64, payload: &'static [u8]) -> MediaPacket {
+        MediaPacket {
+            seq,
+            source_time: src_ntp(src_us),
+            ssrc: TEST_SSRC,
+            payload: Bytes::from_static(payload),
+            retransmit: false,
+            path_id: 0,
+        }
+    }
+
+    /// Empties the output queue into a vector.
+    pub(crate) fn drain_outputs(f: &mut Flow) -> Vec<Output> {
+        let mut out = Vec::new();
+        while let Some(o) = f.poll_output() {
+            out.push(o);
+        }
+        out
+    }
+
+    /// Empties the event queue into a vector.
+    pub(crate) fn drain_events(f: &mut Flow) -> Vec<Event> {
+        let mut evs = Vec::new();
+        while let Some(e) = f.poll_event() {
+            evs.push(e);
+        }
+        evs
+    }
+
+    /// The delivered sequence numbers of a slice of events.
+    pub(crate) fn delivered_seqs(evs: &[Event]) -> Vec<u32> {
+        evs.iter().map(|Event::Deliver { seq, .. }| *seq).collect()
     }
 }

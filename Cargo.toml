@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/rist-core", "crates/rist-codec", "crates/rist"]
+# cargo-fuzz harnesses are their own detached workspace (own `[workspace]`),
+# excluded here too so `cargo build --workspace --all-targets` never reaches
+# them — they need nightly + libFuzzer and live outside the unsafe-free gate.
+exclude = ["crates/rist-core/fuzz"]
 
 [workspace.package]
 version = "0.0.0"

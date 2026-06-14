@@ -31,7 +31,7 @@ pub enum TimerId {
 ///
 /// Exhaustive (not `#[non_exhaustive]`) so hosts `match` over the complete set and
 /// adding a variant is a compile error everywhere it must be handled.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     /// Transmit one media packet on the given path. Emitted by the sender half
     /// (first transmissions and retransmissions); the receiver half never emits
@@ -68,7 +68,7 @@ pub enum Output {
 /// via [`Flow::poll_event`](crate::flow::Flow::poll_event).
 ///
 /// Exhaustive for the same reason as [`Output`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// Hands one in-order media payload to the application. The core retains no
     /// copy; the consumer owns the bytes after delivery.

@@ -29,7 +29,7 @@ use bytes::Bytes;
 /// Codecs produce it on receive and consume it on send; `flow` stores it in the
 /// seq-indexed ring and deduplicates it by the `(seq, source_time)` pair — the
 /// single test that implements the SMPTE 2022-7 multipath merge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPacket {
     /// The media sequence number, **always 32-bit at this layer**. Simple and
     /// Main codecs widen the 16-bit RTP sequence number by rollover counting (the
@@ -75,7 +75,7 @@ pub struct MediaPacket {
 /// NACK vs an Advanced control message) — `flow` never knows which was used.
 ///
 /// Intentionally exhaustive (not `#[non_exhaustive]`): see the module docs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Feedback {
     /// Asks the sender to retransmit missing media packets. Emitted by the
     /// receiving side; `missing` is in the 32-bit widened sequence space and the

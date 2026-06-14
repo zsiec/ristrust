@@ -1,0 +1,49 @@
+# cargo-fuzz harness for rist-core. This is a SEPARATE workspace (note the empty
+# `[workspace]` table at the bottom): it is excluded from the main build/test
+# gauntlet and from the rist-core import gate, and is exercised only via
+# `cargo +nightly fuzz run <target>` from this directory. libFuzzer harnesses
+# require `unsafe` glue, so this crate is intentionally outside the workspace's
+# `#![forbid(unsafe_code)]` lint scope.
+
+[package]
+name = "rist-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+[dependencies.rist-core]
+path = ".."
+
+# The seq invariant fuzzers mirror ristgo internal/seq/fuzz_test.go: a malformed
+# or adversarial pair of sequence numbers can never violate the wrap-aware
+# arithmetic invariants or panic.
+[[bin]]
+name = "seq_distance"
+path = "fuzz_targets/seq_distance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seq_compare"
+path = "fuzz_targets/seq_compare.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seq_add_sub"
+path = "fuzz_targets/seq_add_sub.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

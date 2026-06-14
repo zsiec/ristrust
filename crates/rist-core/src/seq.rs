@@ -214,4 +214,521 @@ mod tests {
         assert_eq!(Seq16::MAX_GAP, MAX_GAP_16);
         assert_eq!(Seq32::MAX_GAP, MAX_GAP_32);
     }
+
+    // ---- cppcompat golden vectors (ported verbatim from ristgo internal/seq) ----
+    //
+    // These tables are language-agnostic data validated against libRIST's
+    // behavior in the Go sibling; porting them keeps ristrust's wrap-aware
+    // arithmetic bit-identical to ristgo's, which is the precondition for the
+    // differential and interop gates in later workpackages.
+
+    const MAX16: u16 = 0xFFFF;
+    const MAX32: u32 = 0xFFFF_FFFF;
+    const HALF16: u16 = Seq16::HALF;
+    const HALF32: u32 = Seq32::HALF;
+
+    /// Interesting 16-bit values for boundary scans.
+    const B16: [u16; 9] = [
+        0,
+        1,
+        2,
+        100,
+        HALF16 - 1,
+        HALF16,
+        HALF16 + 1,
+        MAX16 - 1,
+        MAX16,
+    ];
+    /// Interesting 32-bit values for boundary scans.
+    const B32: [u32; 9] = [
+        0,
+        1,
+        2,
+        100,
+        HALF32 - 1,
+        HALF32,
+        HALF32 + 1,
+        MAX32 - 1,
+        MAX32,
+    ];
+
+    /// Wrap-aware compare mapped to the -1/0/+1 convention of ristgo's `Compare`.
+    fn cmp16(a: u16, b: u16) -> i32 {
+        match Seq16::new(a).wrapping_cmp(Seq16::new(b)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }
+    }
+
+    fn cmp32(a: u32, b: u32) -> i32 {
+        match Seq32::new(a).wrapping_cmp(Seq32::new(b)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }
+    }
+
+    #[test]
+    fn inc_golden() {
+        let c16: &[(u16, u16)] = &[
+            (0, 1),
+            (1, 2),
+            (100, 101),
+            (HALF16 - 1, HALF16),
+            (HALF16, HALF16 + 1),
+            (MAX16 - 1, MAX16),
+            (MAX16, 0),
+        ];
+        for &(input, want) in c16 {
+            assert_eq!(Seq16::new(input).inc(), Seq16::new(want), "inc16({input})");
+        }
+        let c32: &[(u32, u32)] = &[
+            (0, 1),
+            (HALF32 - 1, HALF32),
+            (HALF32, HALF32 + 1),
+            (MAX32 - 1, MAX32),
+            (MAX32, 0),
+        ];
+        for &(input, want) in c32 {
+            assert_eq!(Seq32::new(input).inc(), Seq32::new(want), "inc32({input})");
+        }
+    }
+
+    #[test]
+    fn dec_golden() {
+        let c16: &[(u16, u16)] = &[
+            (1, 0),
+            (2, 1),
+            (HALF16, HALF16 - 1),
+            (MAX16, MAX16 - 1),
+            (0, MAX16),
+        ];
+        for &(input, want) in c16 {
+            assert_eq!(Seq16::new(input).dec(), Seq16::new(want), "dec16({input})");
+        }
+        let c32: &[(u32, u32)] = &[(1, 0), (HALF32, HALF32 - 1), (MAX32, MAX32 - 1), (0, MAX32)];
+        for &(input, want) in c32 {
+            assert_eq!(Seq32::new(input).dec(), Seq32::new(want), "dec32({input})");
+        }
+    }
+
+    #[test]
+    fn add_golden() {
+        let c16: &[(u16, i64, u16)] = &[
+            (0, 0, 0),
+            (0, 1, 1),
+            (0, 100, 100),
+            (MAX16 - 1, 1, MAX16),
+            (MAX16, 1, 0),
+            (MAX16 - 5, 10, 4),
+            (0, i64::from(MAX16), MAX16),
+            (1, i64::from(MAX16), 0),
+            (0, 1 << 16, 0),
+            (5, 3 << 16, 5),
+            (0, -1, MAX16),
+            (10, -10, 0),
+            (0, -i64::from(HALF16), HALF16),
+            (100, -(1 << 16), 100),
+        ];
+        for &(a, n, want) in c16 {
+            assert_eq!(Seq16::new(a).add(n), Seq16::new(want), "add16({a},{n})");
+        }
+        let c32: &[(u32, i64, u32)] = &[
+            (0, 0, 0),
+            (0, 1, 1),
+            (MAX32 - 1, 1, MAX32),
+            (MAX32, 1, 0),
+            (MAX32 - 5, 10, 4),
+            (0, i64::from(MAX32), MAX32),
+            (1, i64::from(MAX32), 0),
+            (0, 1 << 32, 0),
+            (5, 3 << 32, 5),
+            (0, -1, MAX32),
+            (10, -10, 0),
+            (0, -i64::from(HALF32), HALF32),
+            (100, -(1 << 32), 100),
+        ];
+        for &(a, n, want) in c32 {
+            assert_eq!(Seq32::new(a).add(n), Seq32::new(want), "add32({a},{n})");
+        }
+    }
+
+    #[test]
+    fn sub_golden() {
+        let c16: &[(u16, i64, u16)] = &[
+            (0, 0, 0),
+            (1, 1, 0),
+            (100, 50, 50),
+            (0, 1, MAX16),
+            (5, 10, MAX16 - 4),
+            (MAX16, i64::from(MAX16), 0),
+            (0, 1 << 16, 0),
+            (0, -1, 1),
+            (MAX16, -1, 0),
+        ];
+        for &(a, n, want) in c16 {
+            assert_eq!(Seq16::new(a).sub(n), Seq16::new(want), "sub16({a},{n})");
+        }
+        let c32: &[(u32, i64, u32)] = &[
+            (0, 0, 0),
+            (1, 1, 0),
+            (100, 50, 50),
+            (0, 1, MAX32),
+            (5, 10, MAX32 - 4),
+            (MAX32, i64::from(MAX32), 0),
+            (0, 1 << 32, 0),
+            (0, -1, 1),
+            (MAX32, -1, 0),
+        ];
+        for &(a, n, want) in c32 {
+            assert_eq!(Seq32::new(a).sub(n), Seq32::new(want), "sub32({a},{n})");
+        }
+    }
+
+    #[test]
+    fn distance_golden() {
+        let c16: &[(u16, u16, i64)] = &[
+            (0, 0, 0),
+            (100, 100, 0),
+            (MAX16, MAX16, 0),
+            (0, 1, 1),
+            (0, 100, 100),
+            (100, 200, 100),
+            (1, 0, -1),
+            (200, 100, -100),
+            (0, HALF16 - 1, 32767),
+            (HALF16 - 1, 0, -32767),
+            (0, HALF16, 32768),
+            (HALF16, 0, 32768),
+            (0, HALF16 + 1, -32767),
+            (HALF16 + 1, 0, 32767),
+            (MAX16, 0, 1),
+            (0, MAX16, -1),
+            (MAX16 - 5, 5, 11),
+            (5, MAX16 - 5, -11),
+            (65530, 10, 16),
+            (10, 65530, -16),
+            (100, 100u16.wrapping_add(HALF16), 32768),
+            (100u16.wrapping_add(HALF16), 100, 32768),
+        ];
+        for &(a, b, want) in c16 {
+            assert_eq!(
+                Seq16::new(a).distance(Seq16::new(b)),
+                want,
+                "dist16({a},{b})"
+            );
+        }
+        let c32: &[(u32, u32, i64)] = &[
+            (0, 0, 0),
+            (MAX32, MAX32, 0),
+            (0, 1, 1),
+            (1, 0, -1),
+            (200, 100, -100),
+            (0, HALF32 - 1, 2_147_483_647),
+            (HALF32 - 1, 0, -2_147_483_647),
+            (0, HALF32, 2_147_483_648),
+            (HALF32, 0, 2_147_483_648),
+            (0, HALF32 + 1, -2_147_483_647),
+            (HALF32 + 1, 0, 2_147_483_647),
+            (MAX32, 0, 1),
+            (0, MAX32, -1),
+            (MAX32 - 5, 5, 11),
+            (5, MAX32 - 5, -11),
+            (100, 100u32.wrapping_add(HALF32), 2_147_483_648),
+        ];
+        for &(a, b, want) in c32 {
+            assert_eq!(
+                Seq32::new(a).distance(Seq32::new(b)),
+                want,
+                "dist32({a},{b})"
+            );
+        }
+    }
+
+    #[test]
+    fn less_golden() {
+        let c16: &[(u16, u16, bool)] = &[
+            (0, 0, false),
+            (100, 100, false),
+            (0, 1, true),
+            (1, 0, false),
+            (100, 200, true),
+            (200, 100, false),
+            (MAX16, 0, true),
+            (0, MAX16, false),
+            (MAX16 - 5, 5, true),
+            (5, MAX16 - 5, false),
+            (0, HALF16 - 1, true),
+            (HALF16 - 1, 0, false),
+            (0, HALF16, true),
+            (HALF16, 0, true),
+            (0, HALF16 + 1, false),
+            (HALF16 + 1, 0, true),
+        ];
+        for &(a, b, want) in c16 {
+            assert_eq!(Seq16::new(a).less(Seq16::new(b)), want, "less16({a},{b})");
+        }
+        let c32: &[(u32, u32, bool)] = &[
+            (0, 1, true),
+            (1, 0, false),
+            (MAX32, 0, true),
+            (0, MAX32, false),
+            (0, HALF32, true),
+            (HALF32, 0, true),
+            (0, HALF32 + 1, false),
+            (HALF32 + 1, 0, true),
+        ];
+        for &(a, b, want) in c32 {
+            assert_eq!(Seq32::new(a).less(Seq32::new(b)), want, "less32({a},{b})");
+        }
+    }
+
+    #[test]
+    fn compare_golden() {
+        let c16: &[(u16, u16, i32)] = &[
+            (0, 0, 0),
+            (MAX16, MAX16, 0),
+            (0, 1, -1),
+            (1, 0, 1),
+            (MAX16, 0, -1),
+            (0, MAX16, 1),
+            (0, HALF16 - 1, -1),
+            (HALF16 - 1, 0, 1),
+            (0, HALF16, -1),
+            (HALF16, 0, -1),
+            (0, HALF16 + 1, 1),
+            (HALF16 + 1, 0, -1),
+        ];
+        for &(a, b, want) in c16 {
+            assert_eq!(cmp16(a, b), want, "cmp16({a},{b})");
+        }
+        let c32: &[(u32, u32, i32)] = &[
+            (0, 0, 0),
+            (0, 1, -1),
+            (1, 0, 1),
+            (MAX32, 0, -1),
+            (0, MAX32, 1),
+            (0, HALF32, -1),
+            (HALF32, 0, -1),
+            (0, HALF32 + 1, 1),
+            (HALF32 + 1, 0, -1),
+        ];
+        for &(a, b, want) in c32 {
+            assert_eq!(cmp32(a, b), want, "cmp32({a},{b})");
+        }
+    }
+
+    #[test]
+    fn forward_gap_golden() {
+        // (last, current, gap, forward).
+        let c16: &[(u16, u16, u64, bool)] = &[
+            (0, 0, 0, true),
+            (0, 1, 1, true),
+            (0, 5, 5, true),
+            (100, 99, 65535, false),
+            (100, 90, 65526, false),
+            (MAX16, 0, 1, true),
+            (MAX16 - 1, 3, 5, true),
+            (0, HALF16, u64::from(HALF16), true),
+            (0, HALF16 + 1, u64::from(HALF16) + 1, false),
+            (0, MAX16, 65535, false),
+            (12345, 12345u16.wrapping_add(HALF16), 32768, true),
+        ];
+        for &(last, current, gap, forward) in c16 {
+            assert_eq!(
+                Seq16::new(last).forward_gap(Seq16::new(current)),
+                (gap, forward),
+                "fwd_gap16({last},{current})"
+            );
+        }
+        let c32: &[(u32, u32, u64, bool)] = &[
+            (0, 0, 0, true),
+            (0, 1, 1, true),
+            (100, 99, 4_294_967_295, false),
+            (MAX32, 0, 1, true),
+            (MAX32 - 1, 3, 5, true),
+            (0, HALF32, u64::from(HALF32), true),
+            (0, HALF32 + 1, u64::from(HALF32) + 1, false),
+            (0, MAX32, 4_294_967_295, false),
+            (12345, 12345u32.wrapping_add(HALF32), 1 << 31, true),
+        ];
+        for &(last, current, gap, forward) in c32 {
+            assert_eq!(
+                Seq32::new(last).forward_gap(Seq32::new(current)),
+                (gap, forward),
+                "fwd_gap32({last},{current})"
+            );
+        }
+    }
+
+    #[test]
+    fn max_gap_constants_pinned_to_librist() {
+        assert_eq!(MAX_GAP_16, 32768);
+        assert_eq!(MAX_GAP_32, 2_147_483_648);
+        assert_eq!(u64::from(HALF16), MAX_GAP_16);
+        assert_eq!(u64::from(HALF32), MAX_GAP_32);
+    }
+
+    #[test]
+    fn add_sub_round_trip_table() {
+        let offsets: [i64; 12] = [
+            0,
+            1,
+            100,
+            -1,
+            -100,
+            32768,
+            -32768,
+            65535,
+            1 << 16,
+            1 << 31,
+            1 << 32,
+            -(1 << 32),
+        ];
+        for a in B16 {
+            for n in offsets {
+                assert_eq!(Seq16::new(a).add(n).sub(n), Seq16::new(a), "rt16({a},{n})");
+            }
+        }
+        for a in B32 {
+            for n in offsets {
+                assert_eq!(Seq32::new(a).add(n).sub(n), Seq32::new(a), "rt32({a},{n})");
+            }
+        }
+    }
+
+    #[test]
+    fn sixteen_bit_wrap_sequence_is_monotonic() {
+        let mut last = Seq16::new(65530);
+        for _ in 0..20 {
+            let cur = last.inc();
+            assert!(last.less(cur), "stream not monotonic at {}", last.value());
+            assert_eq!(last.distance(cur), 1);
+            assert_eq!(last.forward_gap(cur), (1, true));
+            last = cur;
+        }
+        assert_eq!(last.value(), 65550u32.wrapping_sub(65536) as u16);
+    }
+
+    #[test]
+    fn thirty_two_bit_wrap_sequence_is_monotonic() {
+        let mut last = Seq32::new(MAX32 - 5);
+        for _ in 0..20 {
+            let cur = last.inc();
+            assert!(last.less(cur));
+            assert_eq!(last.distance(cur), 1);
+            last = cur;
+        }
+        assert_eq!(last.value(), 14);
+    }
+
+    /// Per-pair distance/compare/forward_gap consistency check (ristgo's
+    /// `checkDistance`/`checkCompare`), including the exact-antipode pin.
+    fn check_pair16(a: u16, b: u16) {
+        let (sa, sb) = (Seq16::new(a), Seq16::new(b));
+        assert_eq!(sa.distance(sa), 0);
+        let (dab, dba) = (sa.distance(sb), sb.distance(sa));
+        if b.wrapping_sub(a) == HALF16 {
+            assert_eq!((dab, dba), (i64::from(HALF16), i64::from(HALF16)));
+            assert!(sa.less(sb) && sb.less(sa));
+            assert_eq!((cmp16(a, b), cmp16(b, a)), (-1, -1));
+        } else {
+            assert_eq!(dab, -dba, "distance not antisymmetric ({a},{b})");
+            if a != b {
+                assert_ne!(sa.less(sb), sb.less(sa), "less not antisymmetric ({a},{b})");
+                assert_eq!(cmp16(a, b), -cmp16(b, a));
+            }
+        }
+        assert!(dab <= i64::from(HALF16) && dab > -i64::from(HALF16));
+        assert_eq!(sa.add(dab), sb, "add(distance) must recover b ({a},{b})");
+        assert_eq!(dab > 0, sa.less(sb));
+        let (gap, forward) = sa.forward_gap(sb);
+        assert_eq!(gap, u64::from(b.wrapping_sub(a)));
+        assert_eq!(forward, dab >= 0);
+    }
+
+    fn check_pair32(a: u32, b: u32) {
+        let (sa, sb) = (Seq32::new(a), Seq32::new(b));
+        let (dab, dba) = (sa.distance(sb), sb.distance(sa));
+        if b.wrapping_sub(a) == HALF32 {
+            assert_eq!((dab, dba), (i64::from(HALF32), i64::from(HALF32)));
+            assert!(sa.less(sb) && sb.less(sa));
+        } else {
+            assert_eq!(dab, -dba);
+            if a != b {
+                assert_ne!(sa.less(sb), sb.less(sa));
+            }
+        }
+        assert_eq!(sa.add(dab), sb);
+        assert_eq!(dab > 0, sa.less(sb));
+        let (gap, forward) = sa.forward_gap(sb);
+        assert_eq!(gap, u64::from(b.wrapping_sub(a)));
+        assert_eq!(forward, dab >= 0);
+    }
+
+    #[test]
+    fn distance_less_consistency_16_exhaustive() {
+        let offsets: [u16; 8] = [0, 1, 2, HALF16 - 1, HALF16, HALF16 + 1, MAX16 - 1, MAX16];
+        for a in 0..=MAX16 {
+            for off in offsets {
+                check_pair16(a, a.wrapping_add(off));
+            }
+        }
+    }
+
+    #[test]
+    fn distance_less_consistency_32_boundary_grid() {
+        for a in B32 {
+            for off in B32 {
+                check_pair32(a, a.wrapping_add(off));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Distance is antisymmetric (modulo the antipode pin), recovers `b`
+        /// through `add`, and agrees in sign with `less` — for every 16-bit pair.
+        #[test]
+        fn distance16_invariants(a in any::<u16>(), b in any::<u16>()) {
+            let (sa, sb) = (Seq16::new(a), Seq16::new(b));
+            let dab = sa.distance(sb);
+            prop_assert!(dab <= i64::from(Seq16::HALF));
+            prop_assert!(dab > -i64::from(Seq16::HALF));
+            prop_assert_eq!(sa.add(dab), sb);
+            prop_assert_eq!(dab > 0, sa.less(sb));
+            if b.wrapping_sub(a) != Seq16::HALF {
+                prop_assert_eq!(dab, -sb.distance(sa));
+            }
+        }
+
+        /// The same invariants for every 32-bit pair.
+        #[test]
+        fn distance32_invariants(a in any::<u32>(), b in any::<u32>()) {
+            let (sa, sb) = (Seq32::new(a), Seq32::new(b));
+            let dab = sa.distance(sb);
+            prop_assert!(dab <= i64::from(Seq32::HALF));
+            prop_assert!(dab > -i64::from(Seq32::HALF));
+            prop_assert_eq!(sa.add(dab), sb);
+            prop_assert_eq!(dab > 0, sa.less(sb));
+            if b.wrapping_sub(a) != Seq32::HALF {
+                prop_assert_eq!(dab, -sb.distance(sa));
+            }
+        }
+
+        /// `add` then `sub` of any signed offset is the identity, both widths.
+        #[test]
+        fn add_sub_round_trips(base in any::<u32>(), n in any::<i64>()) {
+            let a16 = Seq16::new(base as u16);
+            prop_assert_eq!(a16.add(n).sub(n), a16);
+            let a32 = Seq32::new(base);
+            prop_assert_eq!(a32.add(n).sub(n), a32);
+        }
+    }
 }

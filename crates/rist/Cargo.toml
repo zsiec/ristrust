@@ -15,6 +15,12 @@ description = "Tokio I/O host and public Sender/Receiver API for RIST (Reliable 
 [lints]
 workspace = true
 
+[features]
+# The interop test suite (tests/interop.rs) drives the libRIST reference CLI
+# tools against ristrust. Off by default; the suite skips gracefully when the
+# tools are absent. Run with: `cargo test -p rist --features interop`.
+interop = []
+
 [dependencies]
 # The deterministic core (driven by the host) and the profile codecs (run by the
 # host's per-profile strategy). The host is the only crate that touches I/O.

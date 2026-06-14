@@ -17,9 +17,9 @@ mod socket;
 
 pub use config::{Config, NackType, Profile};
 pub use error::{ConfigError, Error};
-pub use receiver::{Receiver, listen};
+pub use receiver::{Receiver, listen, listen_with};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
-pub use sender::{Sender, dial};
+pub use sender::{Sender, dial, dial_with};
 pub use url::parse_url;
 
 /// The AES key size for PSK encryption, re-exported for use with

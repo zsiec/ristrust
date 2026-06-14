@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::runtime::TokioRuntime;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::socket::SimpleSocket;
 
 /// An io-native RIST media receiver. Created with [`listen`]; yields in-order,
@@ -64,6 +64,15 @@ impl Receiver {
 /// [`Error::Io`] if the port is not a positive even number or the sockets cannot
 /// be bound.
 pub async fn listen(addr: &str, cfg: Config) -> Result<Receiver, Error> {
+    listen_with(addr, cfg, &TokioRuntime).await
+}
+
+/// Like [`listen`], but binds the transport sockets through `rt`. Lets a custom
+/// [`Runtime`] provide the UDP sockets the session drives.
+///
+/// # Errors
+/// As [`listen`].
+pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Receiver, Error> {
     let (addr, cfg) = if addr.contains("://") {
         crate::url::parse_url(addr, cfg)?
     } else {
@@ -71,7 +80,7 @@ pub async fn listen(addr: &str, cfg: Config) -> Result<Receiver, Error> {
     };
     cfg.validate()?;
     let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
-    let spawned = crate::session::build_receiver(&TokioRuntime, &cfg, local)?;
+    let spawned = crate::session::build_receiver(rt, &cfg, local)?;
     tracing::debug!(%local, "rist: receiver listening");
     Ok(Receiver {
         cfg,

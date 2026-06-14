@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::runtime::TokioRuntime;
+use crate::runtime::{Runtime, TokioRuntime};
 use crate::socket::SimpleSocket;
 
 /// An io-native RIST media sender. Created with [`dial`]; reliably transmits
@@ -75,6 +75,16 @@ impl Sender {
 /// configuration, [`Error::InvalidAddr`] if `addr` is not an `IP:port` or its
 /// media port is not even, or [`Error::Io`] if the sockets cannot be bound.
 pub async fn dial(addr: &str, cfg: Config) -> Result<Sender, Error> {
+    dial_with(addr, cfg, &TokioRuntime).await
+}
+
+/// Like [`dial`], but binds the transport sockets through `rt`. Lets a custom
+/// [`Runtime`] (e.g. a loss-injecting one in tests, or an alternative async
+/// runtime) provide the UDP sockets the session drives.
+///
+/// # Errors
+/// As [`dial`].
+pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Sender, Error> {
     let (addr, cfg) = if addr.contains("://") {
         crate::url::parse_url(addr, cfg)?
     } else {
@@ -88,7 +98,7 @@ pub async fn dial(addr: &str, cfg: Config) -> Result<Sender, Error> {
             remote.port()
         )));
     }
-    let spawned = crate::session::build_sender(&TokioRuntime, &cfg, remote)?;
+    let spawned = crate::session::build_sender(rt, &cfg, remote)?;
     tracing::debug!(%remote, "rist: sender dialed");
     Ok(Sender {
         cfg,

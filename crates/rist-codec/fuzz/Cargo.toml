@@ -1,0 +1,39 @@
+# cargo-fuzz harness for rist-codec. A SEPARATE workspace (empty `[workspace]`
+# below): excluded from the main gauntlet, exercised via `cargo +nightly fuzz
+# run <target>` from this directory. libFuzzer glue needs `unsafe`, so this crate
+# is intentionally outside the workspace's `#![forbid(unsafe_code)]` scope.
+
+[package]
+name = "rist-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.rist-codec]
+path = ".."
+
+# Round-trip + no-panic on arbitrary bytes for each wire codec, mirroring ristgo
+# internal/rtp and internal/rtcp fuzz_test.go.
+[[bin]]
+name = "rtp_roundtrip"
+path = "fuzz_targets/rtp_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtcp_roundtrip"
+path = "fuzz_targets/rtcp_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

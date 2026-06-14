@@ -19,6 +19,9 @@ workspace = true
 # The narrow waist this crate decodes into / encodes from. The dependency arrow
 # points one way: codecs depend on the core, never the reverse.
 rist-core.workspace = true
+# Zero-copy buffers (shared with the core's wire types) and error enums.
+bytes.workspace = true
+thiserror.workspace = true
 # Crypto (RustCrypto, pure Rust). PSK key derivation is PBKDF2-HMAC-SHA256.
 pbkdf2.workspace = true
 sha2.workspace = true

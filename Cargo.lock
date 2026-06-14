@@ -456,9 +456,11 @@ dependencies = [
 name = "rist-codec"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "pbkdf2",
  "rist-core",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]

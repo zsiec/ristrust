@@ -1,23 +1,23 @@
 //! The public media receiver and the [`listen`] constructor.
-//!
-//! Scaffolding: [`listen`] validates the config and binds the local UDP socket;
-//! the in-order, ARQ-recovered read path ([`Receiver::recv`]) is wired in Phase 2
-//! (WP2).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
+use crate::runtime::TokioRuntime;
+use crate::socket::SimpleSocket;
 
-/// An io-native RIST media receiver. Created with [`listen`].
+/// An io-native RIST media receiver. Created with [`listen`]; yields in-order,
+/// ARQ-recovered media payloads from a background session task.
 #[derive(Debug)]
 pub struct Receiver {
     cfg: Config,
-    socket: Arc<dyn AsyncUdpSocket>,
+    socket: SimpleSocket,
+    data_out: mpsc::Receiver<Bytes>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Receiver {
@@ -27,50 +27,58 @@ impl Receiver {
         &self.cfg
     }
 
-    /// The bound local address.
+    /// The bound local media address.
     ///
     /// # Errors
     /// Returns the underlying socket error if the address cannot be read.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.socket.media_local()
     }
 
     /// Reads the next in-order, ARQ-recovered media payload.
     ///
     /// # Errors
-    /// Currently always returns [`Error::Unimplemented`] — the read path lands in
-    /// Phase 2 (WP2).
-    pub async fn recv(&self) -> Result<Bytes, Error> {
-        Err(Error::Unimplemented(
-            "Receiver::recv (read path lands in WP2)",
-        ))
+    /// Returns [`Error::Closed`] when the session has shut down (peer timeout or
+    /// the driver exiting) and no further data will arrive.
+    pub async fn recv(&mut self) -> Result<Bytes, Error> {
+        self.data_out.recv().await.ok_or(Error::Closed)
     }
 
-    /// Closes the receiver, releasing its socket and tasks.
+    /// Closes the receiver, stopping its background task and releasing its sockets.
     ///
     /// # Errors
-    /// Never, in the current scaffold.
+    /// Never; the result is for API symmetry and forward compatibility.
     pub async fn close(self) -> Result<(), Error> {
+        self.task.abort();
         Ok(())
     }
 }
 
-/// Binds a RIST receiver to `addr` (an `IP:port`).
-///
-/// Validates `cfg` and binds the local UDP socket. `rist://` URL parsing and the
-/// read path land in Phase 2 (WP2).
+/// Binds a RIST receiver to `addr`. `addr` may be a bare `IP:port` (an even media
+/// port; RTCP binds the adjacent odd port) or a `rist://` URL whose query
+/// parameters refine `cfg`.
 ///
 /// # Errors
-/// Returns [`Error::Config`] if the configuration is invalid, [`Error::InvalidAddr`]
-/// if `addr` is not an `IP:port`, or [`Error::Io`] if the socket cannot be bound.
+/// Returns [`Error::Url`] for a malformed URL, [`Error::Config`] for an invalid
+/// configuration, [`Error::InvalidAddr`] if `addr` is not an `IP:port`, or
+/// [`Error::Io`] if the port is not a positive even number or the sockets cannot
+/// be bound.
 pub async fn listen(addr: &str, cfg: Config) -> Result<Receiver, Error> {
+    let (addr, cfg) = if addr.contains("://") {
+        crate::url::parse_url(addr, cfg)?
+    } else {
+        (addr.to_string(), cfg)
+    };
     cfg.validate()?;
-    let local: SocketAddr = addr
-        .parse()
-        .map_err(|_| Error::InvalidAddr(addr.to_owned()))?;
-    let socket = TokioRuntime.bind(local)?;
-    tracing::debug!(%local, "rist: receiver socket bound (scaffold: read path is WP2)");
-    Ok(Receiver { cfg, socket })
+    let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
+    let spawned = crate::session::build_receiver(&TokioRuntime, &cfg, local)?;
+    tracing::debug!(%local, "rist: receiver listening");
+    Ok(Receiver {
+        cfg,
+        socket: spawned.socket,
+        data_out: spawned.data_out,
+        task: spawned.task,
+    })
 }
 
 #[cfg(test)]
@@ -78,19 +86,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn listen_binds_the_requested_port() {
-        let receiver = listen("127.0.0.1:0", Config::default())
+    async fn listen_binds_an_even_port_pair() {
+        let receiver = listen("127.0.0.1:5002", Config::default())
             .await
             .expect("listen loopback");
-        assert_ne!(receiver.local_addr().expect("local").port(), 0);
+        assert_eq!(receiver.local_addr().expect("local").port(), 5002);
+        receiver.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn recv_is_unimplemented_for_now() {
-        let receiver = listen("127.0.0.1:0", Config::default()).await.unwrap();
-        assert!(matches!(
-            receiver.recv().await,
-            Err(Error::Unimplemented(_))
-        ));
+    async fn listen_rejects_odd_port() {
+        let err = listen("127.0.0.1:5003", Config::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
     }
 }

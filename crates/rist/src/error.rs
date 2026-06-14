@@ -65,6 +65,11 @@ pub enum Error {
     /// query parameter that is not a valid integer or is out of range.
     #[error("rist: invalid url: {0}")]
     Url(String),
+    /// The session has closed: its driver task exited (peer timeout, the peer
+    /// half was dropped, or an unrecoverable socket error), so no further data
+    /// can be sent or received.
+    #[error("rist: session closed")]
+    Closed,
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

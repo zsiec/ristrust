@@ -4,9 +4,11 @@ A pure-Rust implementation of **RIST** (Reliable Internet Stream Transport — t
 VSF **TR-06** family), the broadcast industry's open standard for reliable
 low-latency video over lossy IP.
 
-> **Status: early scaffolding (WIP).** The architecture, crate layout, and
-> tooling are in place; the protocol is being built out phase by phase against
-> two references. Not yet usable. See the roadmap below.
+> **Status: feature-complete.** All three RIST profiles (Simple / Main /
+> Advanced), SMPTE 2022-7 bonding, and source adaptation are implemented and
+> interoperate with libRIST byte-for-byte — 20 sender/receiver combinations
+> across the profiles, clean and lossy. DTLS 1.2 is optional and feature-gated.
+> See the feature table below.
 
 ## Why
 
@@ -42,18 +44,19 @@ guarantee**, not a lint:
 never leak into the core. New profile behavior is a new enum variant at the
 waist, caught everywhere it must be handled by an exhaustive `match`.
 
-## Roadmap
+## What's implemented
 
-| Phase | Scope |
+| Area | Status |
 |---|---|
-| 0 | Scaffolding — workspace, waist types, tooling, CI *(current)* |
-| 1 | `rist-core` — wrap-aware seq, RTT, the flow core, the N-path simulator + four invariants |
-| 2 | Simple Profile (RTP/RTCP) + host → libRIST interop |
-| 3 | Main Profile — GRE tunnel, PSK AES-CTR, EAP-SRP auth |
-| 4 | Advanced Profile (TR-06-3) — compact header, LZ4, control messages |
-| 5 | Bonding / SMPTE 2022-7 multipath |
-| 6 | Source adaptation (TR-06-4 Part 1) |
-| — | DTLS 1.2 transport security *(deferred, optional, feature-gated)* |
+| `rist-core` — wrap-aware seq, RTT EWMA, the flow core, the N-path simulator + four invariants | ✅ |
+| Simple Profile (RTP/RTCP) + tokio host | ✅ |
+| Main Profile — GRE tunnel, PSK AES-CTR (128/256-bit), EAP-SRP auth | ✅ |
+| Advanced Profile (TR-06-3) — compact header, LZ4, control messages | ✅ |
+| Bonding / SMPTE 2022-7 multipath | ✅ |
+| Source adaptation (TR-06-4 Part 1) — Link Quality Messages + AIMD rate control | ✅ |
+| Congestion control — `recovery_maxbitrate` retransmit pacing (off / normal / aggressive) | ✅ |
+| libRIST interop (20 combinations) + ristgo differential, both byte-exact | ✅ |
+| DTLS 1.2 transport security (PSK + ECDHE-ECDSA) | ✅ optional, `--features dtls` |
 
 ## Design principles
 

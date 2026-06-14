@@ -8,12 +8,12 @@ this repository. (Pure-Rust crate dependencies — RustCrypto, tokio, bytes, etc
 are used unmodified through Cargo and are not reproduced here; their licenses are
 permissive and are vetted by `cargo deny`.)
 
-Attributions below land as the corresponding modules are implemented; the ports
-mirror those in the sibling Go project `ristgo` and carry the same provenance.
+The ports below mirror those in the sibling Go project `ristgo` and carry the
+same provenance.
 
 ## RTP / RTCP (pion)
 
-`rist-codec::rtp` will port (trimmed and adapted) the RTP `Header`/`Packet`
+`rist-codec::rtp` ports (trimmed and adapted) the RTP `Header`/`Packet`
 marshalling logic from [pion/rtp](https://github.com/pion/rtp), and
 `rist-codec::rtcp` the Generic NACK FCI packing from [pion/rtcp]'s
 `TransportLayerNack` (RFC 4585 Generic NACK, RTCP PT=205/FMT=1). pion is licensed
@@ -43,7 +43,7 @@ under the MIT License, Copyright (c) The Pion community (<https://pion.ly>):
 
 ## LZ4 (lz4/lz4)
 
-`rist-codec::lpc` will be a pure-Rust reimplementation of the LZ4 *block* format
+`rist-codec::lpc` is a pure-Rust reimplementation of the LZ4 *block* format
 compressor/decompressor (no C copied), ported from the published LZ4 block-format
 specification and the algorithm of the reference implementation,
 [lz4/lz4](https://github.com/lz4/lz4) (Yann Collet). It is used by the RIST
@@ -77,7 +77,9 @@ vendored-LZ4 blocks. lz4 is licensed under the BSD 2-Clause License, Copyright
 > ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 > POSSIBILITY OF SUCH DAMAGE.
 
-## Future attributions
+## DTLS (optional `dtls` feature)
 
-Additional ports planned for later phases will be attributed here when the code
-arrives.
+The optional DTLS 1.2 stack (`rist-codec::dtls`) is an original pure-Rust
+implementation built on the RustCrypto primitives (`p256`, `aes-gcm`, `sha2`,
+`hmac`, `x509-cert`); it copies no third-party source. It interoperates with
+OpenSSL's DTLS, but vendors none of its code.

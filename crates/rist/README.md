@@ -14,12 +14,12 @@ all protocol logic lives in the core.
 use rist::{dial, Config, Profile};
 
 let cfg = Config::default().with_profile(Profile::Simple);
-let _sender = dial("127.0.0.1:5000", cfg).await?;
-// sender.send(&payload).await?;   // media path lands in WP2
+let sender = dial("127.0.0.1:5000", cfg).await?;
+sender.send(b"media payload").await?;
 # Ok(()) }
 ```
 
-> **Status: early scaffolding.** `Config`, validation, the `Runtime` abstraction,
-> and connection setup (socket binding) are in place; the media/control event
-> loop and the `Sender`/`Receiver` data paths land in Phase 2 (WP2). See the
-> workspace `PLAN.md`.
+The crate exposes `dial` / `listen` (and the bonded `dial_bonded` / `listen_bonded`)
+constructors returning a `Sender` / `Receiver`, plus `parse_url` for `rist://`
+URLs. All three profiles, 2022-7 bonding, and source adaptation are supported;
+DTLS 1.2 is available behind the `dtls` feature.

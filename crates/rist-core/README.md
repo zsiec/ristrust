@@ -18,6 +18,9 @@ in a downstream crate.
 - `seq` — wrap-aware 16- and 32-bit sequence-number arithmetic.
 - `rtt` — the `eight_times_rtt` EWMA estimator.
 - `wire` — the narrow waist: `MediaPacket` and the `Feedback` enum.
-- `flow` — the deterministic ARQ + reorder + dedup + SMPTE 2022-7 merge core.
+- `flow` — the deterministic ARQ + reorder + dedup + SMPTE 2022-7 merge core,
+  including `recovery_maxbitrate` congestion-control pacing.
 
-See the workspace `PLAN.md` for the full architecture.
+Every flow and bonding simulation asserts four invariants — no duplicate
+delivered, in-order output, nothing delivered past deadline, and completeness
+under recoverable loss — over a seeded seed sweep reproducible by seed.

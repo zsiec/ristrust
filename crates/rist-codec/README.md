@@ -16,7 +16,8 @@ stays profile-agnostic. It performs no I/O and reads no clock.
 - `lpc` — LZ4 block compression (Advanced LPC).
 - `srp` / `eap` — EAP-SRP authentication (Main profile).
 - `adapt` — TR-06-4 Link Quality Message + rate controller.
+- `dtls` — optional DTLS 1.2 (PSK + ECDHE-ECDSA), behind the `dtls` feature.
 
-Most modules are scaffolding today; see the workspace `PLAN.md` roadmap. `crypto`
-ships the PSK key-derivation primitive (PBKDF2-HMAC-SHA256) used by the Main and
-Advanced profiles.
+All modules are implemented; the `crypto` PSK key-derivation primitive
+(PBKDF2-HMAC-SHA256) feeds the Main and Advanced profile ciphers. Every codec is
+fuzzed for round-trip stability and no-panic on arbitrary input.

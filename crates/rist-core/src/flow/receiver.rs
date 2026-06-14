@@ -389,14 +389,19 @@ impl Flow {
 
     /// Appends one missing entry (libRIST `rist_receiver_missing`): the insertion
     /// time is the interpolated nack time clamped into `[now-recoveryBuffer,
-    /// now]` — out-of-range becomes `now`. The first NACK is scheduled at
-    /// `insertion + smoothedRTT` (ORCHESTRATION.md WP1 binding).
+    /// now]` — out-of-range becomes `now` — and is retained only for the
+    /// abandon-age check. The first NACK is scheduled at
+    /// `now + max(clamp(smoothed_rtt, rtt_min, rtt_max)/2, reorder_buffer)`,
+    /// matching libRIST's `rist_receiver_missing` (cold start: `clamp/2` = 2.5 ms
+    /// < the 15 ms reorder floor, so the first NACK is `now + reorder_buffer`).
     fn add_missing(&mut self, now: Timestamp, path: u8, missing_seq: u32, nack_time: Timestamp) {
         let mut insertion = nack_time;
         if insertion > now || insertion < now - self.recovery_buffer {
             insertion = now;
         }
-        let next_nack = insertion + self.est.smoothed();
+        let clamped = self.est.clamped(self.cfg.rtt_min, self.cfg.rtt_max);
+        let first_delay = Micros::from_micros(clamped.as_micros() / 2).max(self.cfg.reorder_buffer);
+        let next_nack = now + first_delay;
         self.receiver.missing.push_back(MissingEntry {
             seq: missing_seq,
             path,
@@ -867,13 +872,16 @@ mod tests {
                 )
             })
             .collect();
-        // first_nack = insertion + smoothedRTT (cold start = rtt_min = 5 ms).
+        // first_nack = now + max(clamp(rtt)/2, reorder_buffer), anchored to
+        // now = 45000 (libRIST rist_receiver_missing). Cold start: clamp/2 =
+        // 2.5 ms < the 15 ms reorder floor, so every entry is 45000 + 15000 =
+        // 60000 regardless of its interpolated insertion time.
         assert_eq!(
             got,
             vec![
-                (102, 3, 22_600, 27_600, 0),
-                (103, 3, 28_200, 33_200, 0),
-                (104, 3, 33_800, 38_800, 0),
+                (102, 3, 22_600, 60_000, 0),
+                (103, 3, 28_200, 60_000, 0),
+                (104, 3, 33_800, 60_000, 0),
             ]
         );
         assert_eq!(f.stats().missing, 3);
@@ -897,7 +905,8 @@ mod tests {
         let e = f.receiver.missing.front().expect("missing 101");
         assert_eq!(e.seq, 101);
         assert_eq!(e.insertion_time, ts(2_010_000));
-        assert_eq!(e.next_nack, ts(2_015_000));
+        // first_nack = now + max(clamp(rtt)/2, reorder_buffer) = 2010000 + 15000.
+        assert_eq!(e.next_nack, ts(2_025_000));
     }
 
     #[test]
@@ -944,9 +953,34 @@ mod tests {
         f.feed(ts(45_000), 0, mk_pkt(105, 35_000, b"")); // missing 102..104
         drain_outputs(&mut f);
 
-        // 50000: every entry's first nack (27600/33200/38800) is due -> one
-        // grouped Nack, retry at now + 1.1*clamp(rtt).
+        // Every entry's first nack is scheduled at now + reorder_buffer =
+        // 45000 + 15000 = 60000. The 5 ms cadence timer fires at 50000 and 55000
+        // with nothing yet due, re-arming each time.
         f.handle_timer(ts(50_000), TimerId::Nack);
+        let outs = drain_outputs(&mut f);
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Output::SendFeedback { .. }))
+        );
+        assert_eq!(
+            outs,
+            vec![Output::SetTimer {
+                id: TimerId::Nack,
+                deadline: ts(55_000)
+            }]
+        );
+        f.handle_timer(ts(55_000), TimerId::Nack);
+        let outs = drain_outputs(&mut f);
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Output::SendFeedback { .. }))
+        );
+
+        // 60000: every entry's first nack is due -> one grouped Nack, each
+        // re-scheduled at now + 1.1*clamp(rtt) = 60000 + 5500.
+        f.handle_timer(ts(60_000), TimerId::Nack);
         let outs = drain_outputs(&mut f);
         let nacks: Vec<&Output> = outs
             .iter()
@@ -967,17 +1001,17 @@ mod tests {
             *outs.last().unwrap(),
             Output::SetTimer {
                 id: TimerId::Nack,
-                deadline: ts(55_000)
+                deadline: ts(65_000)
             }
         );
         for e in &f.receiver.missing {
-            // next_nack = now + (u64)(rtt*1.1) = 50000 + 5500.
-            assert_eq!((e.next_nack, e.nack_count), (ts(55_500), 1));
+            // next_nack = now + (u64)(rtt*1.1) = 60000 + 5500.
+            assert_eq!((e.next_nack, e.nack_count), (ts(65_500), 1));
         }
         assert_eq!(f.stats().nacks_sent, 3);
 
-        // 55000: nothing due (55500 > 55000) -> no feedback, just the re-arm.
-        f.handle_timer(ts(55_000), TimerId::Nack);
+        // 65000: nothing due (65500 > 65000) -> no feedback, just the re-arm.
+        f.handle_timer(ts(65_000), TimerId::Nack);
         let outs = drain_outputs(&mut f);
         assert!(
             !outs
@@ -988,12 +1022,12 @@ mod tests {
             outs,
             vec![Output::SetTimer {
                 id: TimerId::Nack,
-                deadline: ts(60_000)
+                deadline: ts(70_000)
             }]
         );
 
-        // 60000: due again.
-        f.handle_timer(ts(60_000), TimerId::Nack);
+        // 70000: due again (65500 <= 70000).
+        f.handle_timer(ts(70_000), TimerId::Nack);
         let outs = drain_outputs(&mut f);
         assert_eq!(
             outs.iter()
@@ -1013,11 +1047,12 @@ mod tests {
         f.feed(ts(24_000), 0, mk_pkt(102, 14_000, b"")); // missing 101
         drain_outputs(&mut f);
 
-        f.process_nacks(ts(30_000)); // nack #1
-        f.process_nacks(ts(40_000)); // nack #2
+        // First nack is due at 24000 + reorder_buffer(15000) = 39000.
+        f.process_nacks(ts(40_000)); // nack #1 (due at 39000)
+        f.process_nacks(ts(50_000)); // nack #2 (next_nack was 40000+5500)
         assert_eq!(f.stats().nacks_sent, 2);
         // Third pass: nack_count(2) >= max_retries(2) -> abandon.
-        f.process_nacks(ts(50_000));
+        f.process_nacks(ts(60_000));
         let st = f.stats();
         assert_eq!(
             (st.abandoned, st.nacks_sent, f.receiver.missing.len()),

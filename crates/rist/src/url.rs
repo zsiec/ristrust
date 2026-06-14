@@ -229,6 +229,18 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
     if let Some(v) = q.get("secret") {
         cfg.secret = Some(v.clone());
     }
+    // Multicast options (libRIST: `miface` interface, `ttl` hop limit, `source`
+    // SSM source filter).
+    if let Some(v) = q.get("miface") {
+        cfg.interface = Some(v.clone());
+    }
+    if let Some(n) = int("ttl")? {
+        cfg.multicast_ttl =
+            u8::try_from(n).map_err(|_| Error::Url(format!("ttl={n} must be 0..=255")))?;
+    }
+    if let Some(v) = q.get("source") {
+        cfg.multicast_source = Some(v.clone());
+    }
     // `weight`, `key-rotation`, `username`, `password`, `compression` are known to
     // libRIST but have no Config home until bonding (WP5) / Main (WP3) / Advanced
     // (WP4); they are accepted and ignored for now.
@@ -317,6 +329,21 @@ mod tests {
         assert_eq!(cfg.keepalive_interval, ms(250));
         assert_eq!(cfg.max_bitrate_kbps, 8000);
         cfg.validate().expect("parsed config must validate");
+    }
+
+    #[test]
+    fn multicast_params_fold_into_config() {
+        let (addr, cfg) = parse_url(
+            "rist://239.1.2.3:5000?miface=lo0&ttl=16&source=10.0.0.7",
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(addr, "239.1.2.3:5000");
+        assert_eq!(cfg.interface.as_deref(), Some("lo0"));
+        assert_eq!(cfg.multicast_ttl, 16);
+        assert_eq!(cfg.multicast_source.as_deref(), Some("10.0.0.7"));
+        // An out-of-range TTL is rejected, not silently truncated.
+        assert!(parse_url("rist://239.1.2.3:5000?ttl=300", Config::default()).is_err());
     }
 
     #[test]

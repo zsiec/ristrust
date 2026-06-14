@@ -16,6 +16,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use crate::multicast::{Egress, Membership};
 use crate::runtime::{AsyncUdpSocket, Runtime};
 
 /// A RIST Simple-profile UDP transport: a media socket (even port) and an RTCP
@@ -33,10 +34,17 @@ impl SimpleSocket {
     /// (TR-06-1 §4: the media port is even, RTCP is the next port). This is the
     /// receiver-side constructor.
     ///
+    /// When `membership` is set (the bind address is a multicast group), both the
+    /// media and RTCP sockets join the group after binding.
+    ///
     /// # Errors
-    /// Returns an I/O error if the port is not a positive even number, or if
-    /// either socket cannot be bound.
-    pub(crate) fn listen(rt: &dyn Runtime, addr: SocketAddr) -> io::Result<SimpleSocket> {
+    /// Returns an I/O error if the port is not a positive even number, if either
+    /// socket cannot be bound, or if the multicast join fails.
+    pub(crate) fn listen(
+        rt: &dyn Runtime,
+        addr: SocketAddr,
+        membership: Option<&Membership>,
+    ) -> io::Result<SimpleSocket> {
         let port = addr.port();
         if port == 0 || !port.is_multiple_of(2) {
             return Err(io::Error::new(
@@ -48,6 +56,10 @@ impl SimpleSocket {
         let mut rtcp_addr = addr;
         rtcp_addr.set_port(port + 1);
         let rtcp = rt.bind(rtcp_addr)?;
+        if let Some(m) = membership {
+            media.join_multicast(m)?;
+            rtcp.join_multicast(m)?;
+        }
         Ok(SimpleSocket { media, rtcp })
     }
 
@@ -55,9 +67,17 @@ impl SimpleSocket {
     /// given family. This is the sender-side constructor: the local ports are
     /// arbitrary; the receiver learns them from inbound datagrams.
     ///
+    /// When `egress` is set (the destination is a multicast group), both sockets
+    /// receive the multicast egress options (interface, TTL, loopback).
+    ///
     /// # Errors
-    /// Returns an I/O error if either socket cannot be bound.
-    pub(crate) fn dial_ephemeral(rt: &dyn Runtime, ipv6: bool) -> io::Result<SimpleSocket> {
+    /// Returns an I/O error if either socket cannot be bound or the egress options
+    /// cannot be applied.
+    pub(crate) fn dial_ephemeral(
+        rt: &dyn Runtime,
+        ipv6: bool,
+        egress: Option<&Egress>,
+    ) -> io::Result<SimpleSocket> {
         let unspecified = if ipv6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         } else {
@@ -66,6 +86,10 @@ impl SimpleSocket {
         let any = SocketAddr::new(unspecified, 0);
         let media = rt.bind(any)?;
         let rtcp = rt.bind(any)?;
+        if let Some(e) = egress {
+            media.set_multicast_egress(e)?;
+            rtcp.set_multicast_egress(e)?;
+        }
         Ok(SimpleSocket { media, rtcp })
     }
 
@@ -122,35 +146,55 @@ impl MainSocket {
     /// Simple profile, the Main profile multiplexes everything onto one port, so any
     /// positive port is accepted.
     ///
+    /// When `membership` is set (the bind address is a multicast group), the socket
+    /// joins the group after binding.
+    ///
     /// # Errors
-    /// Returns an I/O error if the port is zero or the socket cannot be bound.
-    pub(crate) fn listen(rt: &dyn Runtime, addr: SocketAddr) -> io::Result<MainSocket> {
+    /// Returns an I/O error if the port is zero, the socket cannot be bound, or the
+    /// multicast join fails.
+    pub(crate) fn listen(
+        rt: &dyn Runtime,
+        addr: SocketAddr,
+        membership: Option<&Membership>,
+    ) -> io::Result<MainSocket> {
         if addr.port() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "rist: socket: main-profile port must be non-zero",
             ));
         }
-        Ok(MainSocket {
-            sock: rt.bind(addr)?,
-        })
+        let sock = rt.bind(addr)?;
+        if let Some(m) = membership {
+            sock.join_multicast(m)?;
+        }
+        Ok(MainSocket { sock })
     }
 
     /// Binds the socket to an OS-chosen port on the unspecified address of the given
     /// family (the sender-side constructor). The receiver learns the local port from
     /// inbound datagrams.
     ///
+    /// When `egress` is set (the destination is a multicast group), the socket
+    /// receives the multicast egress options (interface, TTL, loopback).
+    ///
     /// # Errors
-    /// Returns an I/O error if the socket cannot be bound.
-    pub(crate) fn dial_ephemeral(rt: &dyn Runtime, ipv6: bool) -> io::Result<MainSocket> {
+    /// Returns an I/O error if the socket cannot be bound or the egress options
+    /// cannot be applied.
+    pub(crate) fn dial_ephemeral(
+        rt: &dyn Runtime,
+        ipv6: bool,
+        egress: Option<&Egress>,
+    ) -> io::Result<MainSocket> {
         let unspecified = if ipv6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
-        Ok(MainSocket {
-            sock: rt.bind(SocketAddr::new(unspecified, 0))?,
-        })
+        let sock = rt.bind(SocketAddr::new(unspecified, 0))?;
+        if let Some(e) = egress {
+            sock.set_multicast_egress(e)?;
+        }
+        Ok(MainSocket { sock })
     }
 
     /// The local address the transport is bound to.
@@ -182,14 +226,14 @@ mod tests {
         let rt = TokioRuntime;
         for bad in [0u16, 5001] {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bad);
-            assert!(SimpleSocket::listen(&rt, addr).is_err(), "port {bad}");
+            assert!(SimpleSocket::listen(&rt, addr, None).is_err(), "port {bad}");
         }
     }
 
     #[tokio::test]
     async fn dial_ephemeral_binds_two_distinct_sockets() {
         let rt = TokioRuntime;
-        let s = SimpleSocket::dial_ephemeral(&rt, false).unwrap();
+        let s = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
         let media = s.media_local().unwrap();
         let rtcp = s.rtcp_local().unwrap();
         assert_ne!(media.port(), 0);
@@ -200,8 +244,8 @@ mod tests {
     #[tokio::test]
     async fn media_and_rtcp_round_trip_on_loopback() {
         let rt = TokioRuntime;
-        let recv = SimpleSocket::dial_ephemeral(&rt, false).unwrap();
-        let send = SimpleSocket::dial_ephemeral(&rt, false).unwrap();
+        let recv = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
+        let send = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
         // The sockets bind the unspecified address (0.0.0.0); send to loopback.
         let loop_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let recv_media_addr = SocketAddr::new(loop_ip, recv.media_local().unwrap().port());
@@ -221,10 +265,10 @@ mod tests {
     async fn main_socket_rejects_zero_port_and_round_trips() {
         let rt = TokioRuntime;
         let zero = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        assert!(MainSocket::listen(&rt, zero).is_err());
+        assert!(MainSocket::listen(&rt, zero, None).is_err());
 
-        let recv = MainSocket::dial_ephemeral(&rt, false).unwrap();
-        let send = MainSocket::dial_ephemeral(&rt, false).unwrap();
+        let recv = MainSocket::dial_ephemeral(&rt, false, None).unwrap();
+        let send = MainSocket::dial_ephemeral(&rt, false, None).unwrap();
         let dst = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             recv.local().unwrap().port(),

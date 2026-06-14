@@ -10,11 +10,13 @@
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
+
+pub use crate::multicast::{Egress, Membership, ResolvedIface};
 
 /// A pollable, runtime-agnostic UDP socket. `Debug` so host types holding one can
 /// derive `Debug`.
@@ -39,6 +41,28 @@ pub trait AsyncUdpSocket: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// Returns an I/O error if the local address cannot be determined.
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Joins the multicast group described by `m` (a receiver operation). The
+    /// default is a no-op, so non-OS runtimes used in tests need not implement it;
+    /// the real [`TokioRuntime`] socket performs the group join.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the membership cannot be established.
+    fn join_multicast(&self, m: &Membership) -> io::Result<()> {
+        let _ = m;
+        Ok(())
+    }
+
+    /// Applies multicast egress options — interface, hop limit, loopback — for a
+    /// sender transmitting to a group. The default is a no-op (see
+    /// [`join_multicast`](AsyncUdpSocket::join_multicast)).
+    ///
+    /// # Errors
+    /// Returns an I/O error if an option cannot be set.
+    fn set_multicast_egress(&self, e: &Egress) -> io::Result<()> {
+        let _ = e;
+        Ok(())
+    }
 }
 
 /// The async services the host needs: a clock, task spawning, timers, and UDP
@@ -114,6 +138,51 @@ impl AsyncUdpSocket for TokioUdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+
+    fn join_multicast(&self, m: &Membership) -> io::Result<()> {
+        let sock = socket2::SockRef::from(&self.inner);
+        let iface_v4 = m.iface.v4.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        match (m.group, m.source) {
+            (IpAddr::V4(group), None) => sock.join_multicast_v4(&group, &iface_v4),
+            (IpAddr::V4(group), Some(IpAddr::V4(source))) => {
+                sock.join_ssm_v4(&source, &group, &iface_v4)
+            }
+            (IpAddr::V6(group), None) => sock.join_multicast_v6(&group, m.iface.index),
+            (IpAddr::V6(_), Some(_)) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 source-specific multicast is not supported",
+            )),
+            (IpAddr::V4(_), Some(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multicast group and source IP families differ",
+            )),
+        }
+    }
+
+    fn set_multicast_egress(&self, e: &Egress) -> io::Result<()> {
+        let sock = socket2::SockRef::from(&self.inner);
+        match e.group {
+            IpAddr::V4(_) => {
+                if let Some(iface) = e.iface.v4 {
+                    sock.set_multicast_if_v4(&iface)?;
+                }
+                if e.ttl > 0 {
+                    sock.set_multicast_ttl_v4(u32::from(e.ttl))?;
+                }
+                sock.set_multicast_loop_v4(e.loopback)?;
+            }
+            IpAddr::V6(_) => {
+                if e.iface.index != 0 {
+                    sock.set_multicast_if_v6(e.iface.index)?;
+                }
+                if e.ttl > 0 {
+                    sock.set_multicast_hops_v6(u32::from(e.ttl))?;
+                }
+                sock.set_multicast_loop_v6(e.loopback)?;
+            }
+        }
+        Ok(())
     }
 }
 

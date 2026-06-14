@@ -53,6 +53,7 @@ waist, caught everywhere it must be handled by an exhaustive `match`.
 | Main Profile — GRE tunnel, PSK AES-CTR (128/256-bit), EAP-SRP auth | ✅ |
 | Advanced Profile (TR-06-3) — compact header, LZ4, control messages | ✅ |
 | Bonding / SMPTE 2022-7 multipath | ✅ |
+| Multicast — group join (ASM + source-specific), egress interface / TTL / loopback (`miface`/`ttl`/`source`) | ✅ |
 | Source adaptation (TR-06-4 Part 1) — Link Quality Messages + AIMD rate control | ✅ |
 | Congestion control — `recovery_maxbitrate` retransmit pacing (off / normal / aggressive) | ✅ |
 | libRIST interop (20 combinations) + ristgo differential, both byte-exact | ✅ |

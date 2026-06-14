@@ -15,6 +15,7 @@ mod driver;
 mod driver_adv;
 mod driver_bonded;
 mod driver_main;
+mod multicast;
 mod peer;
 mod receiver;
 mod sender;

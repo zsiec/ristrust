@@ -37,6 +37,9 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
 # OS CSPRNG for the Main-profile EAP-SRP authenticator's per-session salt.
 getrandom.workspace = true
+# Multicast group membership/egress socket options and `miface` resolution.
+socket2.workspace = true
+if-addrs.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

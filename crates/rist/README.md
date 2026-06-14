@@ -21,5 +21,7 @@ sender.send(b"media payload").await?;
 
 The crate exposes `dial` / `listen` (and the bonded `dial_bonded` / `listen_bonded`)
 constructors returning a `Sender` / `Receiver`, plus `parse_url` for `rist://`
-URLs. All three profiles, 2022-7 bonding, and source adaptation are supported;
-DTLS 1.2 is available behind the `dtls` feature.
+URLs. All three profiles, 2022-7 bonding, source adaptation, and multicast
+(group join + egress interface/TTL, via a group bind/destination address and the
+`miface`/`ttl`/`source` URL knobs) are supported; DTLS 1.2 is available behind the
+`dtls` feature.

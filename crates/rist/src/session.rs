@@ -236,9 +236,11 @@ pub(crate) fn build_sender(
     let ssrc = random_even_ssrc();
     let start_seq = random_start_seq();
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
+    // Multicast egress options when `remote` is a group; `None` for unicast.
+    let egress = crate::multicast::sender_egress(cfg, remote)?;
 
     if cfg.profile == Profile::Main {
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6())?;
+        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
         let local = socket.local()?;
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
@@ -264,7 +266,7 @@ pub(crate) fn build_sender(
     }
 
     if cfg.profile == Profile::Advanced {
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6())?;
+        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
         let local = socket.local()?;
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let main = build_main_codec(cfg, ssrc)?;
@@ -290,7 +292,7 @@ pub(crate) fn build_sender(
         });
     }
 
-    let socket = SimpleSocket::dial_ephemeral(rt, remote.is_ipv6())?;
+    let socket = SimpleSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
     let local = socket.media_local()?;
     let mut rtcp = remote;
     rtcp.set_port(remote.port().wrapping_add(1));
@@ -332,9 +334,11 @@ pub(crate) fn build_receiver(
     // for its RTCP until the media SSRC is learned.
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    // Multicast group membership when `local` is a group; `None` for unicast.
+    let membership = crate::multicast::receiver_membership(cfg, local)?;
 
     if cfg.profile == Profile::Main {
-        let socket = MainSocket::listen(rt, local)?;
+        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
         let bound = socket.local()?;
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
@@ -358,7 +362,7 @@ pub(crate) fn build_receiver(
     }
 
     if cfg.profile == Profile::Advanced {
-        let socket = MainSocket::listen(rt, local)?;
+        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
         let bound = socket.local()?;
         let main = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let adv = build_adv_codec(cfg, DEFAULT_FLOW_SSRC)?;
@@ -382,7 +386,7 @@ pub(crate) fn build_receiver(
         });
     }
 
-    let socket = SimpleSocket::listen(rt, local)?;
+    let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
     let bound = socket.media_local()?;
     let (data_out, task) = Driver::spawn_receiver(
         flow,
@@ -446,7 +450,8 @@ pub(crate) fn build_bonded_sender(
     let mut paths = Vec::with_capacity(remotes.len());
     let mut local = None;
     for (i, &remote) in remotes.iter().enumerate() {
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6())?;
+        let egress = crate::multicast::sender_egress(cfg, remote)?;
+        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
         if local.is_none() {
             local = Some(socket.local()?);
         }
@@ -508,7 +513,8 @@ pub(crate) fn build_bonded_receiver(
     let mut paths = Vec::with_capacity(locals.len());
     let mut bound = None;
     for (i, &local) in locals.iter().enumerate() {
-        let socket = MainSocket::listen(rt, local)?;
+        let membership = crate::multicast::receiver_membership(cfg, local)?;
+        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
         if bound.is_none() {
             bound = Some(socket.local()?);
         }

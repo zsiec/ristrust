@@ -28,6 +28,13 @@ bytes = "1"
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", default-features = false }
+# Host socket options std/tokio do not expose: multicast group join/leave (ASM +
+# source-specific), egress interface/TTL/loopback. Pure Rust over libc bindings,
+# no C build; socket2 is the project's intended host-I/O layer (see CLAUDE.md).
+socket2 = "0.6"
+# Network-interface enumeration, to resolve a multicast `miface` name to its IPv4
+# membership address and interface index. Pure Rust over libc bindings.
+if-addrs = "0.13"
 # --- crypto (RustCrypto, pure Rust; no OpenSSL/aws-lc/ring FFI) ---
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"

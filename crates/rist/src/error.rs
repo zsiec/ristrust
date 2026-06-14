@@ -56,6 +56,19 @@ pub enum ConfigError {
         /// The profile that does not support it.
         profile: &'static str,
     },
+    /// The configured multicast `interface` (libRIST `miface`) does not resolve to
+    /// a network interface on this host.
+    #[error("rist: multicast interface {name:?} not found")]
+    MulticastInterfaceNotFound {
+        /// The interface name that failed to resolve.
+        name: String,
+    },
+    /// `multicast_source` (the SSM source filter) is not a valid IP literal.
+    #[error("rist: multicast_source {value:?} is not a valid IP address")]
+    MulticastSourceInvalid {
+        /// The offending value.
+        value: String,
+    },
 }
 
 /// The top-level error type for the host crate.

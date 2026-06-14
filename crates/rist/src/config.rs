@@ -122,6 +122,24 @@ pub struct Config {
     /// Link Quality Message drives the AIMD controller and this is invoked with the
     /// new encoder bit-rate target. `None` (default) disables rate control.
     pub on_rate_adapt: Option<RateCallback>,
+    /// Network interface name for multicast (libRIST `miface`): a sender's egress
+    /// interface and a receiver's group-membership interface. `None` (the default)
+    /// lets the OS choose. Consulted only when the bind (receiver) or destination
+    /// (sender) address is a multicast group; a unicast address ignores it.
+    pub interface: Option<String>,
+    /// IP multicast hop limit (TTL) stamped on a sender's outbound multicast
+    /// datagrams. `0` (the default) uses the OS default of 1, restricting traffic
+    /// to the local link; routed multicast needs a higher value sized to the
+    /// network diameter. Consulted only when the destination is a multicast group.
+    pub multicast_ttl: u8,
+    /// Source-specific multicast (SSM, RFC 4607) source filter for a receiver bound
+    /// to a multicast group: only datagrams from this exact source IP are accepted.
+    /// `None` (the default) is any-source multicast. IPv4 only. It is an error to
+    /// set this when the bind address is not a multicast group.
+    pub multicast_source: Option<String>,
+    /// Whether a sender transmitting to a multicast group also receives its own
+    /// datagrams on the same host (`IP_MULTICAST_LOOP`). Default `false`.
+    pub multicast_loopback: bool,
 }
 
 impl Default for Config {
@@ -153,6 +171,10 @@ impl Default for Config {
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
+            interface: None,
+            multicast_ttl: 0,
+            multicast_source: None,
+            multicast_loopback: false,
         }
     }
 }
@@ -268,6 +290,37 @@ impl Config {
         self
     }
 
+    /// Sets the multicast interface name (libRIST `miface`) used for group
+    /// membership (receiver) and egress (sender).
+    #[must_use]
+    pub fn with_multicast_interface(mut self, name: impl Into<String>) -> Config {
+        self.interface = Some(name.into());
+        self
+    }
+
+    /// Sets the outbound multicast hop limit (TTL); `0` keeps the OS default of 1.
+    #[must_use]
+    pub fn with_multicast_ttl(mut self, ttl: u8) -> Config {
+        self.multicast_ttl = ttl;
+        self
+    }
+
+    /// Sets the source-specific-multicast (SSM) source IP filter for a receiver
+    /// bound to a multicast group (IPv4 only).
+    #[must_use]
+    pub fn with_multicast_source(mut self, source: impl Into<String>) -> Config {
+        self.multicast_source = Some(source.into());
+        self
+    }
+
+    /// Sets whether a multicast sender also receives its own datagrams on this
+    /// host (`IP_MULTICAST_LOOP`).
+    #[must_use]
+    pub fn with_multicast_loopback(mut self, on: bool) -> Config {
+        self.multicast_loopback = on;
+        self
+    }
+
     /// Sets the source-adaptation rate callback on a sender: each inbound Link
     /// Quality Message drives the AIMD controller and calls `f` with the new
     /// encoder bit-rate target (kbit/s).
@@ -349,6 +402,19 @@ impl Config {
             }
             Profile::Advanced => {}
         }
+        // Multicast field-level checks (address-dependent checks — e.g. an SSM
+        // source on a unicast bind — happen at socket construction, where the
+        // bind/destination address is known).
+        if let Some(name) = &self.interface
+            && crate::multicast::resolve_interface(name).is_err()
+        {
+            return Err(ConfigError::MulticastInterfaceNotFound { name: name.clone() });
+        }
+        if let Some(src) = &self.multicast_source
+            && src.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(ConfigError::MulticastSourceInvalid { value: src.clone() });
+        }
         Ok(())
     }
 }
@@ -381,6 +447,30 @@ mod tests {
     fn with_congestion_control_overrides_the_default() {
         let c = Config::default().with_congestion_control(CongestionMode::Aggressive);
         assert_eq!(c.congestion_control, CongestionMode::Aggressive);
+    }
+
+    #[test]
+    fn validate_rejects_bad_multicast_config() {
+        // A non-IP SSM source is rejected.
+        assert!(matches!(
+            Config::default()
+                .with_multicast_source("not-an-ip")
+                .validate(),
+            Err(ConfigError::MulticastSourceInvalid { .. })
+        ));
+        // An unknown interface name is rejected.
+        assert!(matches!(
+            Config::default()
+                .with_multicast_interface("nonexistent-iface-zzz")
+                .validate(),
+            Err(ConfigError::MulticastInterfaceNotFound { .. })
+        ));
+        // A valid IP source on its own (the bind-address check happens at
+        // construction) passes field-level validation.
+        Config::default()
+            .with_multicast_source("232.1.2.3")
+            .validate()
+            .expect("a valid source IP passes field validation");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod runtime;
 pub mod url;
 
 mod bonding;
+mod codec;
 mod driver;
 mod peer;
 mod receiver;

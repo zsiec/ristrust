@@ -91,6 +91,13 @@ pub enum Feedback {
     /// Simple/Main wire this is an RTCP APP packet (PT 204, name "RIST",
     /// subtype 2).
     RttEchoRequest {
+        /// The requester's "SSRC of media source". On an *inbound* request this
+        /// is the peer's SSRC (captured by the codec); the responder copies it
+        /// into the matching [`Feedback::RttEchoResponse`] so the requester
+        /// accepts the echo (libRIST drops a response whose SSRC differs from its
+        /// own peer SSRC). On a request the local flow *originates* it is left
+        /// `0` and the codec fills the local SSRC. Not a demux key.
+        ssrc: u32,
         /// The requester's clock sample, echoed back verbatim.
         timestamp: u64,
     },
@@ -98,6 +105,12 @@ pub enum Feedback {
     /// Answers an [`Feedback::RttEchoRequest`] (RTCP APP PT 204, subtype 3). The
     /// requester computes RTT as `(now − timestamp) − processing_delay`.
     RttEchoResponse {
+        /// The requester's "SSRC of media source", copied verbatim from the
+        /// request. It MUST equal the requester's SSRC — a libRIST requester
+        /// drops any response whose SSRC differs from its own peer SSRC, so
+        /// stamping the responder's own SSRC here silently breaks RTT
+        /// measurement.
+        ssrc: u32,
         /// The requester's original timestamp, echoed verbatim.
         timestamp: u64,
         /// Microseconds the responder spent between receiving the request and

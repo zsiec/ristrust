@@ -1228,10 +1228,12 @@ mod tests {
         f.feed(ts(10_000), 2, mk_pkt(100, 0, b""));
         drain_outputs(&mut f);
 
-        // Inbound request: answered verbatim, zero delay, on the most recent path.
+        // Inbound request: answered verbatim, zero delay, on the most recent
+        // path, echoing the requester's SSRC.
         f.feed_feedback(
             ts(20_000),
             Feedback::RttEchoRequest {
+                ssrc: 0xABCD_0001,
                 timestamp: 0xDEAD_BEEF,
             },
         );
@@ -1240,6 +1242,7 @@ mod tests {
             vec![Output::SendFeedback {
                 path: 2,
                 fb: Feedback::RttEchoResponse {
+                    ssrc: 0xABCD_0001,
                     timestamp: 0xDEAD_BEEF,
                     processing_delay: 0
                 },
@@ -1247,10 +1250,12 @@ mod tests {
         );
 
         // Inbound response: sample = (now - sent) - delay folded into the EWMA:
-        // 40000 - 40000/8 + 8000 = 43000 -> smoothed 5375.
+        // 40000 - 40000/8 + 8000 = 43000 -> smoothed 5375. The SSRC is ignored
+        // by the RTT calculation.
         f.feed_feedback(
             ts(20_000),
             Feedback::RttEchoResponse {
+                ssrc: 0,
                 timestamp: src_ntp(10_000),
                 processing_delay: 2_000,
             },
@@ -1270,7 +1275,9 @@ mod tests {
             vec![
                 Output::SendFeedback {
                     path: 1,
+                    // Originated: SSRC left 0 for the codec to fill.
                     fb: Feedback::RttEchoRequest {
+                        ssrc: 0,
                         timestamp: src_ntp(110_000)
                     },
                 },

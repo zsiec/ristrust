@@ -238,11 +238,14 @@ impl Flow {
     /// compile error here, forcing a deliberate handle-or-ignore decision.
     pub fn feed_feedback(&mut self, now: Timestamp, fb: Feedback) {
         match fb {
-            Feedback::RttEchoRequest { timestamp } => {
+            Feedback::RttEchoRequest { ssrc, timestamp } => {
+                // Echo the requester's SSRC (and timestamp) back: a libRIST
+                // requester drops any response whose SSRC differs from its own.
                 let path = self.feedback_path();
                 self.outputs.push_back(Output::SendFeedback {
                     path,
                     fb: Feedback::RttEchoResponse {
+                        ssrc,
                         timestamp,
                         processing_delay: 0,
                     },
@@ -251,6 +254,7 @@ impl Flow {
             Feedback::RttEchoResponse {
                 timestamp,
                 processing_delay,
+                ..
             } => {
                 // sample = (now - echoed timestamp) - processing delay. A negative
                 // sample is pinned to zero by the estimator (libRIST
@@ -316,6 +320,8 @@ impl Flow {
                         self.outputs.push_back(Output::SendFeedback {
                             path,
                             fb: Feedback::RttEchoRequest {
+                                // Originated: the codec fills the local SSRC.
+                                ssrc: 0,
                                 timestamp: Ntp64::from_timestamp(now).bits(),
                             },
                         });

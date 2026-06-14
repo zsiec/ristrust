@@ -233,6 +233,8 @@ impl Flow {
             self.outputs.push_back(Output::SendFeedback {
                 path: tx_path,
                 fb: Feedback::RttEchoRequest {
+                    // Originated: the codec fills the local SSRC.
+                    ssrc: 0,
                     timestamp: Ntp64::from_timestamp(now).bits(),
                 },
             });
@@ -420,6 +422,7 @@ mod tests {
         f.feed_feedback(
             ts(1_000_000),
             Feedback::RttEchoResponse {
+                ssrc: 0,
                 timestamp: src_ntp(1_000_000 - warm.unsigned_abs()),
                 processing_delay: 0,
             },
@@ -490,7 +493,9 @@ mod tests {
             vec![
                 Output::SendFeedback {
                     path: 0,
+                    // Originated: SSRC left 0 for the codec to fill.
                     fb: Feedback::RttEchoRequest {
+                        ssrc: 0,
                         timestamp: src_ntp(110_000)
                     },
                 },
@@ -501,13 +506,20 @@ mod tests {
             ]
         );
 
-        // Answer an inbound request verbatim with zero processing delay.
-        f.feed_feedback(ts(120_000), Feedback::RttEchoRequest { timestamp: 0xABCD });
+        // Answer an inbound request verbatim, echoing the requester's SSRC.
+        f.feed_feedback(
+            ts(120_000),
+            Feedback::RttEchoRequest {
+                ssrc: 0xFEED_0002,
+                timestamp: 0xABCD,
+            },
+        );
         assert_eq!(
             drain_outputs(&mut f),
             vec![Output::SendFeedback {
                 path: 0,
                 fb: Feedback::RttEchoResponse {
+                    ssrc: 0xFEED_0002,
                     timestamp: 0xABCD,
                     processing_delay: 0
                 },
@@ -519,6 +531,7 @@ mod tests {
         f.feed_feedback(
             ts(120_000),
             Feedback::RttEchoResponse {
+                ssrc: 0,
                 timestamp: src_ntp(110_000),
                 processing_delay: 2_000,
             },

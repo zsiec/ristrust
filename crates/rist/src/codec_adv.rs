@@ -423,6 +423,22 @@ impl AdvCodec {
     /// Wraps a control payload (CI + Length sub-header + body) in a Type=CONTROL
     /// packet on the unprotected (odd) SSRC: no encryption, no compression, F=L=E=1.
     fn frame_control(&mut self, payload: &[u8], ts: u32) -> Result<Vec<u8>, CodecError> {
+        self.frame_control_frag(payload, true, true, ts)
+    }
+
+    /// [`AdvCodec::frame_control`] with explicit fragment roles: a control message
+    /// larger than the MTU is sent as a run of Type=Control packets carrying the F/L
+    /// bits, which the peer reassembles before decoding. The control sequence counter
+    /// advances once per fragment, so consecutive fragments carry consecutive
+    /// sequences (the receiver derives a lost fragment from a sequence gap). Only the
+    /// in-band FEC carriage fragments control messages (TR-06-3 §5.3.5).
+    pub(crate) fn frame_control_frag(
+        &mut self,
+        payload: &[u8],
+        first: bool,
+        last: bool,
+        ts: u32,
+    ) -> Result<Vec<u8>, CodecError> {
         let seq = self.ctrl_seq;
         self.ctrl_seq = self.ctrl_seq.wrapping_add(1);
         let params = adv::Params {
@@ -432,8 +448,8 @@ impl AdvCodec {
             enc_type: adv::TYPE_CONTROL,
             psk_mode: adv::PSK_NONE,
             lpc_mode: adv::LPC_NONE,
-            first_frag: true,
-            last_frag: true,
+            first_frag: first,
+            last_frag: last,
             expedite: true,
             ..adv::Params::default()
         };
@@ -501,8 +517,9 @@ fn frag_to_flags(frag: FragRole) -> (bool, bool) {
 }
 
 /// Inverse of [`frag_to_flags`]: recovers the fragment role from the parsed
-/// first/last flag pair.
-fn flags_to_frag(first: bool, last: bool) -> FragRole {
+/// first/last flag pair. Shared with the FEC in-band carriage (the F/L bits of a
+/// fragmented FEC control packet).
+pub(crate) fn flags_to_frag(first: bool, last: bool) -> FragRole {
     match (first, last) {
         (true, true) => FragRole::Standalone,
         (true, false) => FragRole::First,

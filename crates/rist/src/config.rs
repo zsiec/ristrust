@@ -11,6 +11,7 @@ use rist_codec::crypto::AesKeyBits;
 use rist_core::flow::CongestionMode;
 
 use crate::error::ConfigError;
+use crate::fec::FecConfig;
 
 /// A source-adaptation rate callback (TR-06-4 Part 1): invoked with the new
 /// encoder bit-rate target, in kbit/s, each time an inbound Link Quality Message
@@ -181,6 +182,13 @@ pub struct Config {
     /// Invoked with each inbound flow-attribute payload. `None` (default) ignores
     /// them. Advanced profile only.
     pub on_flow_attr: Option<FlowAttrCallback>,
+    /// SMPTE ST 2022-1 / ST 2022-5 forward error correction (TR-06-2 §8.4 /
+    /// TR-06-3 §5.3.5). When set, the sender emits row/column FEC and the receiver
+    /// recovers loss with no NACK round trip; ARQ remains the backstop. Carried
+    /// in-band on the Advanced profile and on dedicated UDP ports on Simple/Main
+    /// (the [`FecConfig::carriage`] default). `None` (default) disables FEC. Set the
+    /// same matrix on both ends.
+    pub fec: Option<FecConfig>,
     /// Network interface name for multicast (libRIST `miface`): a sender's egress
     /// interface and a receiver's group-membership interface. `None` (the default)
     /// lets the OS choose. Consulted only when the bind (receiver) or destination
@@ -236,6 +244,7 @@ impl Default for Config {
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
             on_flow_attr: None,
+            fec: None,
             interface: None,
             multicast_ttl: 0,
             multicast_source: None,
@@ -467,6 +476,15 @@ impl Config {
         self
     }
 
+    /// Enables SMPTE ST 2022-1 / ST 2022-5 forward error correction with the given
+    /// matrix (TR-06-2 §8.4 / TR-06-3 §5.3.5). Set the same [`FecConfig`] on both
+    /// ends. See [`Config::fec`].
+    #[must_use]
+    pub fn with_fec(mut self, fec: FecConfig) -> Config {
+        self.fec = Some(fec);
+        self
+    }
+
     /// Validates the configuration against libRIST's accepted ranges.
     ///
     /// # Errors
@@ -560,6 +578,11 @@ impl Config {
                     return Err(unsupported("null-packet deletion", "Advanced"));
                 }
             }
+        }
+        // Forward error correction: the matrix bounds (per variant) and the
+        // carriage/profile rule (in-band is Advanced-only).
+        if let Some(fec) = &self.fec {
+            fec.validate(self.profile)?;
         }
         // Multicast field-level checks (address-dependent checks — e.g. an SSM
         // source on a unicast bind — happen at socket construction, where the

@@ -19,14 +19,17 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use rist_codec::rtcp::{self, EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
+use rist_codec::{fec_header, rtp};
 use rist_core::clock::{Ntp64, Timestamp};
+use rist_core::fec::{Direction, Recovered};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
-use rist_core::wire::{Feedback, MediaPacket};
+use rist_core::wire::{Feedback, FragRole, MediaPacket};
 
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self, MediaDecoder};
 use crate::error::Error;
+use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
 use crate::stats::StatsCell;
@@ -130,6 +133,13 @@ pub(crate) struct Driver {
     lqm: Option<LqmEmitter>,
     /// The sender's rate controller, when a rate callback is configured.
     rate: Option<RateControl>,
+
+    // --- forward error correction (TR-06-2 §8.4, separate-port carriage) ---
+    /// The FEC engine when FEC is configured: the sender clips each first-tx RTP
+    /// payload and sends the FEC packets as RTP on the column/row ports; the receiver
+    /// reads those ports, feeds media + FEC into the decoder, and re-injects
+    /// recoveries.
+    fec: Option<FecState>,
 }
 
 impl Driver {
@@ -147,6 +157,7 @@ impl Driver {
         keepalive: Duration,
         start_seq: u32,
         rate: Option<RateControl>,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -176,6 +187,7 @@ impl Driver {
             learned_ssrc: None,
             lqm: None,
             rate,
+            fec,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -193,6 +205,7 @@ impl Driver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -222,6 +235,7 @@ impl Driver {
             learned_ssrc: None,
             lqm,
             rate: None,
+            fec,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -243,6 +257,8 @@ impl Driver {
         let sock = self.socket.clone();
         let mut media_buf = vec![0u8; RECV_BUF];
         let mut rtcp_buf = vec![0u8; RECV_BUF];
+        let mut fec_col_buf = vec![0u8; RECV_BUF];
+        let mut fec_row_buf = vec![0u8; RECV_BUF];
 
         // A sender knows the peer's RTCP address up front; an immediate keepalive
         // lets the receiver learn the sender's return address (and so send NACKs)
@@ -266,6 +282,14 @@ impl Driver {
                 r = sock.recv_rtcp(&mut rtcp_buf) => match r {
                     Ok((n, src)) => self.on_rtcp(src, &rtcp_buf[..n]).await,
                     Err(_) => break,
+                },
+                // Separate-port FEC (receiver only; pending forever without a FEC
+                // socket). A FEC socket error is non-fatal — media/RTCP carry the flow.
+                r = sock.recv_fec_col(&mut fec_col_buf) => if let Ok((n, _)) = r {
+                    self.on_fec_rtp(&fec_col_buf[..n]).await;
+                },
+                r = sock.recv_fec_row(&mut fec_row_buf) => if let Ok((n, _)) = r {
+                    self.on_fec_rtp(&fec_row_buf[..n]).await;
                 },
                 payload = recv_app(&mut self.app_in) => match payload {
                     Some(p) => {
@@ -312,9 +336,66 @@ impl Driver {
             if let Some(e) = &mut self.lqm {
                 e.meter(pkt.payload.len(), pkt.retransmit);
             }
+            // FEC over the inner RTP payload (separate-port carriage): feed it keyed
+            // on the raw wire timestamp (the value the sender clipped) before the
+            // flow takes ownership of the payload, then re-inject any recovery.
+            let fec_input = self.fec.is_some().then(|| {
+                (
+                    pkt.seq,
+                    self.mdec.last_wire_ts(),
+                    pkt.ssrc,
+                    pkt.payload.clone(),
+                )
+            });
             self.flow.feed(now, 0, pkt);
+            if let Some((seq, wts, ssrc, payload)) = fec_input {
+                let recovered = self
+                    .fec
+                    .as_mut()
+                    .unwrap()
+                    .recv_media(seq, wts, FEC_PT, ssrc, payload);
+                self.feed_fec_recovered(now, recovered);
+            }
         }
         self.drain(now).await;
+    }
+
+    /// Handles one inbound separate-port FEC datagram: strips the RTP wrapper to the
+    /// FEC body, feeds it to the FEC decoder, and re-injects any recovered packet into
+    /// the flow (the FEC and flow layers both dedup it).
+    async fn on_fec_rtp(&mut self, data: &[u8]) {
+        let now = self.now();
+        let buf = Bytes::copy_from_slice(data);
+        let Ok(p) = rtp::Packet::decode(&buf) else {
+            return;
+        };
+        if self.fec.is_some() {
+            let recovered = self.fec.as_mut().unwrap().recv_fec(&p.payload);
+            self.feed_fec_recovered(now, recovered);
+        }
+        self.drain(now).await;
+    }
+
+    /// Re-injects FEC-recovered packets into the flow as media. The source time is
+    /// reconstructed (non-advancing) from the recovered RTP timestamp so a recovery
+    /// and a later ARQ retransmit of the same sequence dedup to one delivery.
+    fn feed_fec_recovered(&mut self, now: Timestamp, recovered: Vec<Recovered>) {
+        for r in recovered {
+            let source_time = self.mdec.source_time(r.timestamp);
+            self.flow.feed(
+                now,
+                0,
+                MediaPacket {
+                    seq: r.seq,
+                    source_time,
+                    ssrc: r.ssrc,
+                    payload: r.payload,
+                    retransmit: false,
+                    path_id: 0,
+                    frag: FragRole::Standalone,
+                },
+            );
+        }
     }
 
     /// Handles one inbound RTCP datagram (feedback path).
@@ -350,6 +431,12 @@ impl Driver {
                         self.highest_sent = pkt.seq;
                     }
                     self.send_media(&pkt).await;
+                    // FEC over the inner RTP payload (first transmissions only, in
+                    // sequence order): send any completed FEC packets on the
+                    // column/row ports.
+                    if self.fec.is_some() && !pkt.retransmit {
+                        self.send_fec_simple(&pkt).await;
+                    }
                 }
                 Output::SendFeedback { fb, .. } => fbs.push(fb),
                 Output::SetTimer { id, deadline } => {
@@ -383,6 +470,62 @@ impl Driver {
                 }
             }
             Err(e) => tracing::debug!(seq = pkt.seq, "rist: encode media failed: {e}"),
+        }
+    }
+
+    /// Clips one first-transmission media packet's RTP payload into the FEC matrix and
+    /// sends any completed FEC packets as standard ST 2022-1 / ST 2022-5 RTP packets
+    /// (PT 127) on the dedicated column (media port + 2) / row (+ 4) ports — the
+    /// carriage a conforming ST 2022-1 receiver interoperates with.
+    async fn send_fec_simple(&mut self, pkt: &MediaPacket) {
+        let Some(media_dst) = self.peer.media() else {
+            return;
+        };
+        if self.fec.is_none() {
+            return;
+        }
+        let variant = self.fec.as_ref().unwrap().variant();
+        let ts = codec::rtp_ts_from_source(pkt.source_time);
+        let fps = self
+            .fec
+            .as_mut()
+            .unwrap()
+            .clip(pkt.seq, ts, FEC_PT, &pkt.payload);
+        if fps.is_empty() {
+            return;
+        }
+        let ssrc = self.ssrc;
+        let sock = self.socket.clone();
+        for fp in &fps {
+            let (rtp_seq, port_off) = match fp.direction {
+                Direction::Column => (
+                    self.fec.as_mut().unwrap().next_col_seq(),
+                    FEC_COLUMN_PORT_OFFSET,
+                ),
+                Direction::Row => (
+                    self.fec.as_mut().unwrap().next_row_seq(),
+                    FEC_ROW_PORT_OFFSET,
+                ),
+            };
+            let rtp_pkt = rtp::Packet {
+                header: rtp::Header {
+                    version: rtp::VERSION,
+                    payload_type: FEC_PT,
+                    sequence_number: rtp_seq,
+                    ssrc,
+                    ..rtp::Header::default()
+                },
+                payload: fec_header::encode(fp, variant),
+                padding_size: 0,
+            };
+            let Ok(bytes) = rtp_pkt.encode() else {
+                continue;
+            };
+            let mut dst = media_dst;
+            dst.set_port(media_dst.port().wrapping_add(port_off));
+            if let Err(e) = sock.send_media(&bytes, dst).await {
+                tracing::debug!("rist: send separate-port fec failed: {e}");
+            }
         }
     }
 

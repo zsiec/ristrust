@@ -126,12 +126,34 @@ pub(crate) struct MediaDecoder {
     started: bool,
     ref_seq: u32,
     ref_ticks: i64,
+    /// The raw on-the-wire 32-bit RTP timestamp of the last decoded packet, the
+    /// value the FEC XOR is keyed on (the separate-port FEC clips this, not the
+    /// reconstructed source time).
+    last_wire_ts: u32,
 }
 
 impl MediaDecoder {
     /// A fresh decoder for one receiving flow.
     pub(crate) fn new() -> MediaDecoder {
         MediaDecoder::default()
+    }
+
+    /// The raw RTP timestamp of the last decoded packet (the FEC timestamp clip).
+    pub(crate) fn last_wire_ts(&self) -> u32 {
+        self.last_wire_ts
+    }
+
+    /// Reconstructs the dedup-stable NTP-64 source time of a FEC-recovered packet
+    /// from its recovered RTP timestamp, WITHOUT advancing the decoder's reference
+    /// (a recovered sequence is at or behind the in-order front). The mapping is
+    /// stable in the wire timestamp within the recovery window, so a recovery and a
+    /// later ARQ retransmit / 2022-7 duplicate of the same sequence reconstruct to
+    /// the identical `(seq, source_time)` and the flow's dedup absorbs the duplicate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(crate) fn source_time(&self, wire_ts: u32) -> u64 {
+        let ticks = widen_ticks(wire_ts, self.ref_ticks);
+        let micros = micros_from_rtp_ticks(ticks).max(0) as u64;
+        Ntp64::from_timestamp(Timestamp::from_micros(micros)).bits()
     }
 
     /// Parses one RTP datagram into the normalized [`MediaPacket`] fed to the
@@ -141,6 +163,7 @@ impl MediaDecoder {
         if p.header.version != rtp::VERSION {
             return Err(CodecError::BadVersion(p.header.version));
         }
+        self.last_wire_ts = p.header.timestamp;
         let (seq, source_time) = self.widen(p.header.sequence_number, p.header.timestamp);
         Ok(MediaPacket {
             seq,

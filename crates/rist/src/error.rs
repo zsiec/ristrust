@@ -73,6 +73,14 @@ pub enum ConfigError {
     /// channel for the handshake.
     #[error("rist: one-way mode is incompatible with EAP-SRP authentication")]
     OneWayWithAuth,
+    /// The forward-error-correction matrix or carriage is invalid: the L×D matrix is
+    /// outside the TR-06 bounds for the chosen variant, or in-band carriage was
+    /// requested on a non-Advanced profile.
+    #[error("rist: invalid FEC configuration: {reason}")]
+    FecInvalid {
+        /// A short description of the violation.
+        reason: &'static str,
+    },
 }
 
 /// The top-level error type for the host crate.

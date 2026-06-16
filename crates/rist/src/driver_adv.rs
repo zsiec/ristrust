@@ -26,11 +26,12 @@ use rist_core::seq::Seq32;
 use rist_core::wire::{Feedback, FragRole};
 
 use crate::adapt::{LqmEmitter, RateControl};
-use crate::codec_adv::AdvCodec;
+use crate::codec_adv::{AdvCodec, flags_to_frag};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::config::FlowAttrCallback;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
+use crate::fec::{FEC_MAX_CTRL_BODY, FecState};
 use crate::peer::Peer;
 use crate::reassembler::FragReassembler;
 use crate::socket::MainSocket;
@@ -117,6 +118,12 @@ pub(crate) struct AdvDriver {
     oob_in: Option<mpsc::Receiver<(u16, Vec<u8>)>>,
     /// Received OOB datagrams handed to `Receiver::read_oob` (`Some` on a receiver).
     oob_out: Option<mpsc::Sender<(u16, Bytes)>>,
+
+    // --- forward error correction (TR-06-3 §5.3.5, in-band carriage) ---
+    /// The FEC engine when FEC is configured: the sender clips each first-tx media
+    /// datagram and frames the resulting FEC packets as Type=Control messages; the
+    /// receiver feeds media and FEC into the decoder and re-injects recoveries.
+    fec: Option<FecState>,
 }
 
 impl AdvDriver {
@@ -138,6 +145,7 @@ impl AdvDriver {
         flow_attr_rx: mpsc::Receiver<Vec<u8>>,
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         frag_size: usize,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -177,6 +185,7 @@ impl AdvDriver {
             flow_attr_cmd: Some(flow_attr_rx),
             oob_in: Some(oob_in),
             oob_out: None,
+            fec,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -196,6 +205,7 @@ impl AdvDriver {
         lqm: Option<LqmEmitter>,
         on_flow_attr: Option<FlowAttrCallback>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -235,6 +245,7 @@ impl AdvDriver {
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: Some(oob_out),
+            fec,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -380,6 +391,16 @@ impl AdvDriver {
             }
             return;
         }
+        // SMPTE ST 2022-1 / ST 2022-5 FEC control message: route to the FEC decoder
+        // rather than the feedback path (it is neither media nor RTCP feedback). A
+        // fragmented control message (only FEC messages are fragmented) is
+        // reassembled before its FEC body is decoded.
+        if self.fec.is_some()
+            && parsed.enc_type == adv::TYPE_CONTROL
+            && self.try_fec_control(now, &parsed)
+        {
+            return;
+        }
         match self.adv.decode_parsed(&parsed) {
             Ok(Decoded::Media(pkt)) => {
                 if self.learned_ssrc.is_none() {
@@ -388,7 +409,23 @@ impl AdvDriver {
                 if let Some(e) = &mut self.lqm {
                     e.meter(pkt.payload.len(), pkt.retransmit);
                 }
+                let seq = pkt.seq;
                 self.flow.feed(now, 0, pkt);
+                // FEC protects the FULL wire datagram (post-compression/-encryption,
+                // TR-06-3 §5.3.5): feed it keyed by sequence and re-inject any
+                // recovered datagram through this same decode path. The recovered
+                // bytes are a complete wire datagram, so re-decoding honors every
+                // header field and the PSK; the FEC and flow layers both dedup it.
+                if self.fec.is_some() {
+                    let recovered =
+                        self.fec
+                            .as_mut()
+                            .unwrap()
+                            .recv_media(seq, 0, 0, 0, buf.clone());
+                    for r in recovered {
+                        self.on_adv(now, &r.payload);
+                    }
+                }
             }
             Ok(Decoded::Feedback(fbs)) => {
                 for fb in fbs {
@@ -417,6 +454,86 @@ impl AdvDriver {
             }
             Ok(Decoded::Ignored) => {}
             Err(e) => crate::driver::decode_warn(self.adv.has_psk(), "advanced", &e),
+        }
+    }
+
+    /// Routes one inbound Type=Control datagram that may be SMPTE FEC: a standalone
+    /// FEC control message is decoded directly; a fragmented one (only FEC fragments)
+    /// is folded into the control reassembler and decoded once complete. Recovered
+    /// datagrams are re-injected through [`AdvDriver::on_adv`]. Returns `true` when the
+    /// datagram was consumed as FEC (a non-FEC standalone control returns `false` so
+    /// the caller decodes it as feedback).
+    fn try_fec_control(&mut self, now: Timestamp, parsed: &adv::Parsed) -> bool {
+        let fec = self.fec.as_mut().expect("fec present (checked by caller)");
+        let variant = fec.variant();
+        let recovered = if !parsed.first_frag || !parsed.last_frag {
+            // A fragmented control message: only FEC fragments, so always consumed.
+            let role = flags_to_frag(parsed.first_frag, parsed.last_frag);
+            let Some(full) = fec.ctrl_reasm_push(parsed.seq, role, parsed.payload.clone()) else {
+                return true;
+            };
+            let Ok((ci, body)) = adv::parse_control(&full) else {
+                return true;
+            };
+            if !is_fec_ci(ci, variant) {
+                return true;
+            }
+            fec.recv_fec(&body)
+        } else {
+            // A standalone control message: decode only if it carries a FEC index;
+            // otherwise leave it to the normal feedback path.
+            let Ok((ci, body)) = adv::parse_control(&parsed.payload) else {
+                return false;
+            };
+            if !is_fec_ci(ci, variant) {
+                return false;
+            }
+            fec.recv_fec(&body)
+        };
+        for r in recovered {
+            self.on_adv(now, &r.payload);
+        }
+        true
+    }
+
+    /// Clips one first-transmission media datagram into the FEC matrix and frames any
+    /// completed FEC packets as Advanced Type=Control messages under the row/column
+    /// control index for the configured variant, fragmenting an over-MTU FEC control
+    /// message across consecutive control packets (TR-06-3 §5.3.5).
+    async fn send_fec_adv(&mut self, now: Timestamp, datagram: &[u8], seq: u32) {
+        let Some(dst) = self.peer.media() else { return };
+        let Some(fec) = self.fec.as_mut() else { return };
+        let variant = fec.variant();
+        let fps = fec.clip(seq, 0, 0, datagram);
+        if fps.is_empty() {
+            return;
+        }
+        let ts = adv_ctrl_ts(now);
+        let sock = self.socket.clone();
+        for fp in &fps {
+            let ci = fec_ci(variant, fp.direction);
+            let fec_bytes = rist_codec::fec_header::encode(fp, variant);
+            let mut body = Vec::new();
+            adv::build_control(&mut body, ci, &fec_bytes);
+            if body.len() <= FEC_MAX_CTRL_BODY {
+                if let Ok(dg) = self.adv.frame_control_frag(&body, true, true, ts) {
+                    let _ = sock.send(&dg, dst).await;
+                }
+                continue;
+            }
+            // Over-MTU FEC control message: fragment the body across consecutive
+            // control packets carrying the F/L bits; the receiver reassembles.
+            let mut off = 0;
+            while off < body.len() {
+                let end = (off + FEC_MAX_CTRL_BODY).min(body.len());
+                if let Ok(dg) =
+                    self.adv
+                        .frame_control_frag(&body[off..end], off == 0, end == body.len(), ts)
+                {
+                    let _ = sock.send(&dg, dst).await;
+                }
+                off = end;
+            }
         }
     }
 
@@ -462,6 +579,12 @@ impl AdvDriver {
                         Ok(bytes) => {
                             if let Err(e) = sock.send(&bytes, dst).await {
                                 tracing::debug!(seq = pkt.seq, "rist: adv send media failed: {e}");
+                            }
+                            // FEC over the full wire datagram (first transmissions
+                            // only, in sequence order); frame the resulting FEC
+                            // packets as in-band Type=Control messages.
+                            if self.fec.is_some() && !pkt.retransmit {
+                                self.send_fec_adv(now, &bytes, pkt.seq).await;
                             }
                         }
                         Err(e) => {
@@ -756,6 +879,28 @@ fn seq_after(a: u32, b: u32) -> bool {
 /// answering for those estimators to converge (TR-06-3 §5.3, RTT echo).
 fn drops_adv_echo_request(fb: &Feedback) -> bool {
     matches!(fb, Feedback::RttEchoRequest { .. })
+}
+
+/// The Advanced in-band control index for a FEC packet of the given variant and
+/// dimension (TR-06-3 §5.3.5).
+fn fec_ci(variant: rist_core::fec::Variant, direction: rist_core::fec::Direction) -> u16 {
+    use rist_core::fec::{Direction, Variant};
+    match (variant, direction) {
+        (Variant::St20221, Direction::Row) => adv::CI_FEC_2022_1_ROW,
+        (Variant::St20221, Direction::Column) => adv::CI_FEC_2022_1_COL,
+        (Variant::St20225, Direction::Row) => adv::CI_FEC_2022_5_ROW,
+        (Variant::St20225, Direction::Column) => adv::CI_FEC_2022_5_COL,
+    }
+}
+
+/// Whether `ci` is a FEC control index for the configured variant (the receiver only
+/// decodes its own variant's indices; the other variant's are left unsupported).
+fn is_fec_ci(ci: u16, variant: rist_core::fec::Variant) -> bool {
+    use rist_core::fec::Variant;
+    match variant {
+        Variant::St20221 => ci == adv::CI_FEC_2022_1_ROW || ci == adv::CI_FEC_2022_1_COL,
+        Variant::St20225 => ci == adv::CI_FEC_2022_5_ROW || ci == adv::CI_FEC_2022_5_COL,
+    }
 }
 
 #[cfg(test)]

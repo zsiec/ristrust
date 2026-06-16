@@ -15,6 +15,7 @@ mod driver;
 mod driver_adv;
 mod driver_bonded;
 mod driver_main;
+mod fec;
 mod multicast;
 mod peer;
 mod reassembler;
@@ -26,6 +27,7 @@ mod stats;
 
 pub use config::{Config, FlowAttrCallback, NackType, Profile, RateCallback};
 pub use error::{ConfigError, Error};
+pub use fec::{FecCarriage, FecConfig, FecVariant};
 pub use receiver::{
     Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_with,
     listen_with,

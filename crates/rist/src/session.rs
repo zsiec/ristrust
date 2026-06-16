@@ -26,6 +26,7 @@ use crate::driver::Driver;
 use crate::driver_adv::AdvDriver;
 use crate::driver_bonded::{BondedDriver, PathParts};
 use crate::driver_main::{EapRole, MainDriver};
+use crate::fec::FecState;
 use crate::peer::Peer;
 use crate::runtime::Runtime;
 use crate::socket::{MainSocket, SimpleSocket};
@@ -101,6 +102,13 @@ fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
         start_seq,
         no_recovery: cfg.one_way,
     }
+}
+
+/// Builds the per-flow FEC engine when forward error correction is configured,
+/// sized for the profile's carriage (full datagram for Advanced in-band, RTP payload
+/// for Simple/Main separate-port).
+fn build_fec(cfg: &Config) -> Option<FecState> {
+    cfg.fec.as_ref().map(|f| FecState::new(f, cfg.profile))
 }
 
 fn cname_of(cfg: &Config) -> String {
@@ -254,6 +262,9 @@ fn build_adv_codec(cfg: &Config, ssrc: u32) -> io::Result<AdvCodec> {
 /// # Errors
 /// Returns an I/O error if the transport sockets cannot be bound, or an invalid
 /// secret prevents PSK key derivation (Main).
+// A flat per-profile constructor wiring the session config into a driver; the three
+// profile branches push it just over the line cap.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_sender(
     rt: &dyn Runtime,
     cfg: &Config,
@@ -324,6 +335,7 @@ pub(crate) fn build_sender(
             attr_rx,
             oob_rx,
             cfg.fragment_size,
+            build_fec(cfg),
         );
         return Ok(SenderSpawned {
             local,
@@ -352,6 +364,7 @@ pub(crate) fn build_sender(
         cfg.keepalive_interval,
         start_seq,
         RateControl::from_config(cfg),
+        build_fec(cfg),
     );
     Ok(SenderSpawned {
         local,
@@ -436,6 +449,7 @@ pub(crate) fn build_receiver(
             build_lqm_emitter(cfg),
             cfg.on_flow_attr.clone(),
             oob_tx,
+            build_fec(cfg),
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -447,8 +461,15 @@ pub(crate) fn build_receiver(
         });
     }
 
-    let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
+    let mut socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
     let bound = socket.media_local()?;
+    // Separate-port FEC carriage: bind the column (media + 2) and, for 2-D FEC, the
+    // row (media + 4) FEC sockets the receiver reads (TR-06-2 §8.4 / SMPTE 2022-1).
+    if let Some(f) = &cfg.fec
+        && f.resolved_separate_ports(cfg.profile)
+    {
+        socket.bind_fec(rt, bound, membership.as_ref(), !f.column_only)?;
+    }
     let (data_out, close, stats, task) = Driver::spawn_receiver(
         flow,
         socket,
@@ -458,6 +479,7 @@ pub(crate) fn build_receiver(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         build_lqm_emitter(cfg),
+        build_fec(cfg),
     );
     Ok(ReceiverSpawned {
         local: bound,

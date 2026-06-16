@@ -26,6 +26,12 @@ use crate::runtime::{AsyncUdpSocket, Runtime};
 pub(crate) struct SimpleSocket {
     media: Arc<dyn AsyncUdpSocket>,
     rtcp: Arc<dyn AsyncUdpSocket>,
+    /// The separate-port column FEC socket (media port + 2), bound only on a receiver
+    /// that has enabled the separate-port SMPTE ST 2022-1 / ST 2022-5 FEC carriage.
+    fec_col: Option<Arc<dyn AsyncUdpSocket>>,
+    /// The separate-port row FEC socket (media port + 4); bound only for 2-D FEC
+    /// (column-only FEC binds the column socket alone).
+    fec_row: Option<Arc<dyn AsyncUdpSocket>>,
 }
 
 impl SimpleSocket {
@@ -60,7 +66,65 @@ impl SimpleSocket {
             media.join_multicast(m)?;
             rtcp.join_multicast(m)?;
         }
-        Ok(SimpleSocket { media, rtcp })
+        Ok(SimpleSocket {
+            media,
+            rtcp,
+            fec_col: None,
+            fec_row: None,
+        })
+    }
+
+    /// Binds the separate-port FEC sockets for a receiver: the column FEC port (media
+    /// port + 2) and, for 2-D FEC (`want_row`), the row FEC port (media port + 4).
+    /// `addr` is the media bind address; `membership` is reapplied to the FEC sockets
+    /// when the bind is a multicast group. Call after [`SimpleSocket::listen`], before
+    /// the socket is handed to the driver.
+    ///
+    /// # Errors
+    /// Returns an I/O error if a FEC socket cannot be bound or the multicast join
+    /// fails.
+    pub(crate) fn bind_fec(
+        &mut self,
+        rt: &dyn Runtime,
+        addr: SocketAddr,
+        membership: Option<&Membership>,
+        want_row: bool,
+    ) -> io::Result<()> {
+        let mut col_addr = addr;
+        col_addr.set_port(addr.port() + 2);
+        let col = rt.bind(col_addr)?;
+        if let Some(m) = membership {
+            col.join_multicast(m)?;
+        }
+        self.fec_col = Some(col);
+        if want_row {
+            let mut row_addr = addr;
+            row_addr.set_port(addr.port() + 4);
+            let row = rt.bind(row_addr)?;
+            if let Some(m) = membership {
+                row.join_multicast(m)?;
+            }
+            self.fec_row = Some(row);
+        }
+        Ok(())
+    }
+
+    /// Receives one column FEC datagram, or never resolves when no column FEC socket
+    /// is bound (so a `select!` arm is a no-op without FEC).
+    pub(crate) async fn recv_fec_col(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match &self.fec_col {
+            Some(s) => poll_fn(|cx| s.poll_recv(cx, buf)).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Receives one row FEC datagram, or never resolves when no row FEC socket is
+    /// bound (column-only FEC, or FEC disabled).
+    pub(crate) async fn recv_fec_row(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match &self.fec_row {
+            Some(s) => poll_fn(|cx| s.poll_recv(cx, buf)).await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Binds both sockets to OS-chosen ports on the unspecified address of the
@@ -90,7 +154,12 @@ impl SimpleSocket {
             media.set_multicast_egress(e)?;
             rtcp.set_multicast_egress(e)?;
         }
-        Ok(SimpleSocket { media, rtcp })
+        Ok(SimpleSocket {
+            media,
+            rtcp,
+            fec_col: None,
+            fec_row: None,
+        })
     }
 
     /// The local media (even) address the transport is bound to.

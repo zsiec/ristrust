@@ -73,6 +73,14 @@ pub(crate) struct Group {
     paths: Vec<Path>,
     /// Silence past this marks a seen path dead (libRIST `session_timeout`).
     timeout: Micros,
+    /// Extra silence a SMPTE 2022-7 *duplicate* path keeps being transmitted on
+    /// after it goes dead, before the sender prunes it from the fan-out — libRIST's
+    /// `hard_dead` grace (`recovery_buffer`). A path is reported dead for liveness /
+    /// NACK routing at the bare `timeout`, but its 2022-7 redundancy persists until
+    /// `timeout + dup_grace`, so a brief return-path RTCP stall does not shed
+    /// seamless protection a libRIST sender would keep. Weighted paths get no grace
+    /// (their share redistributes at the bare timeout).
+    dup_grace: Micros,
     /// The RTT clamp bounds applied to the NACK-selection tie-break.
     rtt_min: Micros,
     /// The upper RTT clamp bound.
@@ -81,12 +89,20 @@ pub(crate) struct Group {
 
 impl Group {
     /// Builds an empty group. `session_timeout` is the silence after which a seen
-    /// path is declared dead; `rtt_min`/`rtt_max` clamp the per-path RTT used in
-    /// NACK selection (the libRIST defaults are 2000 ms / 5 ms / 500 ms).
-    pub(crate) fn new(session_timeout: Micros, rtt_min: Micros, rtt_max: Micros) -> Group {
+    /// path is declared dead; `dup_grace` is the extra silence a 2022-7 duplicate
+    /// path keeps being transmitted on past that (libRIST `hard_dead`);
+    /// `rtt_min`/`rtt_max` clamp the per-path RTT used in NACK selection (the libRIST
+    /// defaults are 2000 ms / 1000 ms / 5 ms / 500 ms).
+    pub(crate) fn new(
+        session_timeout: Micros,
+        dup_grace: Micros,
+        rtt_min: Micros,
+        rtt_max: Micros,
+    ) -> Group {
         Group {
             paths: Vec::new(),
             timeout: session_timeout,
+            dup_grace,
             rtt_min,
             rtt_max,
         }
@@ -166,7 +182,7 @@ impl Group {
     pub(crate) fn duplicate_targets(&self, now: Timestamp) -> Vec<u8> {
         self.paths
             .iter()
-            .filter(|p| p.weight == WEIGHT_DUPLICATE && !self.proven_dead(p, now))
+            .filter(|p| p.weight == WEIGHT_DUPLICATE && !self.dup_dead(p, now))
             .map(|p| p.index)
             .collect()
     }
@@ -175,7 +191,7 @@ impl Group {
     /// single-path form of [`Group::duplicate_targets`]).
     pub(crate) fn should_duplicate(&self, index: u8, now: Timestamp) -> bool {
         self.path(index)
-            .is_some_and(|p| p.weight == WEIGHT_DUPLICATE && !self.proven_dead(p, now))
+            .is_some_and(|p| p.weight == WEIGHT_DUPLICATE && !self.dup_dead(p, now))
     }
 
     /// Whether any path is in the weighted load-share rotation (`weight > 0`). When
@@ -300,10 +316,19 @@ impl Group {
             .map_or(self.rtt_min, |p| p.rtt.clamped(self.rtt_min, self.rtt_max))
     }
 
-    /// True when `p` has been seen and is now silent past the timeout — the only
-    /// state that excludes a duplicate-weight path from transmission.
+    /// True when `p` has been seen and is now silent past the bare session timeout —
+    /// the dead state for liveness, NACK routing, and weighted load-share
+    /// redistribution.
     fn proven_dead(&self, p: &Path, now: Timestamp) -> bool {
         p.seen && (now - p.last_seen) > self.timeout
+    }
+
+    /// True when a 2022-7 *duplicate* path has been silent past the hard-dead horizon
+    /// (`timeout + dup_grace`, libRIST `hard_dead`) — the state that finally prunes it
+    /// from the duplicate fan-out. The grace past [`proven_dead`](Self::proven_dead)
+    /// keeps a flapping path's redundancy alive through a brief return-path stall.
+    fn dup_dead(&self, p: &Path, now: Timestamp) -> bool {
+        p.seen && (now - p.last_seen) > (self.timeout + self.dup_grace)
     }
 
     /// The NACK-selection ordering: higher priority wins; on a tie the lower raw
@@ -337,15 +362,52 @@ mod tests {
     use super::*;
 
     const TIMEOUT: Micros = Micros::from_millis(2000);
+    const DUP_GRACE: Micros = Micros::from_millis(1000);
     const RTT_MIN: Micros = Micros::from_millis(5);
     const RTT_MAX: Micros = Micros::from_millis(500);
 
     fn group(paths: &[(u8, u32, u32)]) -> Group {
-        let mut g = Group::new(TIMEOUT, RTT_MIN, RTT_MAX);
+        // The existing tests assert the bare-timeout death horizon; a zero grace keeps
+        // the duplicate prune at the session timeout, as they expect.
+        let mut g = Group::new(TIMEOUT, Micros::ZERO, RTT_MIN, RTT_MAX);
         for &(idx, weight, priority) in paths {
             g.add_path(idx, weight, priority);
         }
         g
+    }
+
+    #[test]
+    fn duplicate_grace_lingers_past_the_bare_timeout() {
+        // A duplicate path silent past the session timeout but within the 2022-7
+        // grace (timeout + dup_grace) is still a duplicate target; a weighted path is
+        // dropped at the bare timeout (its share redistributes immediately).
+        let t0 = Timestamp::from_micros(1_000_000);
+        let mut g = Group::new(TIMEOUT, DUP_GRACE, RTT_MIN, RTT_MAX);
+        g.add_path(0, WEIGHT_DUPLICATE, 0);
+        g.add_path(1, 1, 0); // weighted
+        g.observe(0, t0);
+        g.observe(1, t0);
+
+        // Within (timeout, timeout + grace): the duplicate path lingers.
+        let mid = t0 + TIMEOUT + Micros::from_millis(500);
+        assert!(
+            g.should_duplicate(0, mid),
+            "duplicate path must linger through the 2022-7 grace"
+        );
+        assert_eq!(g.duplicate_targets(mid), vec![0]);
+        // The weighted path is already dead at the bare timeout.
+        assert!(
+            !g.alive(1, mid),
+            "weighted path is dead at the bare timeout"
+        );
+
+        // Past timeout + grace: the duplicate path is finally pruned.
+        let late = t0 + TIMEOUT + DUP_GRACE + Micros::from_millis(1);
+        assert!(
+            !g.should_duplicate(0, late),
+            "duplicate path pruned past the grace"
+        );
+        assert!(g.duplicate_targets(late).is_empty());
     }
 
     fn at(ms: u64) -> Timestamp {

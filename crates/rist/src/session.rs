@@ -883,10 +883,15 @@ pub(crate) fn build_caller_receiver(
 /// An empty bonding group sized by the config's session timeout and RTT clamps,
 /// ready for `add_path`.
 fn bonding_group(cfg: &Config) -> Group {
+    // The 2022-7 duplicate-path grace is the recovery (playout) buffer, matching
+    // libRIST's hard_dead = dead_since + recovery_buffer_ticks: a duplicate path's
+    // redundancy lingers a playout window past the bare session timeout.
+    let (rtt_min, rtt_max) = effective_rtt_bounds(cfg);
     Group::new(
         dur_to_micros(cfg.session_timeout),
-        dur_to_micros(cfg.rtt_min),
-        dur_to_micros(cfg.rtt_max),
+        flow_config(cfg, 0, 0).recovery_buffer(),
+        rtt_min,
+        rtt_max,
     )
 }
 

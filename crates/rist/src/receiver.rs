@@ -16,6 +16,7 @@ pub struct Receiver {
     cfg: Config,
     local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
+    oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -42,6 +43,29 @@ impl Receiver {
     #[must_use]
     pub fn stats(&self) -> crate::Stats {
         self.stats.snapshot()
+    }
+
+    /// Reads the next out-of-band datagram's payload (the protocol type is
+    /// discarded; use [`Receiver::read_oob_typed`] to keep it).
+    ///
+    /// # Errors
+    /// As [`Receiver::read_oob_typed`].
+    pub async fn read_oob(&mut self) -> Result<Bytes, Error> {
+        self.read_oob_typed().await.map(|(_, payload)| payload)
+    }
+
+    /// Reads the next out-of-band datagram as `(GRE protocol type, payload)`. OOB
+    /// bypasses the flow core (no reordering or ARQ); it is delivered in arrival
+    /// order, decrypted under the PSK when one is configured.
+    ///
+    /// # Errors
+    /// Returns [`Error::OobUnsupported`] on a Simple-profile receiver, or
+    /// [`Error::Closed`] when the session has shut down.
+    pub async fn read_oob_typed(&mut self) -> Result<(u16, Bytes), Error> {
+        let Some(rx) = self.oob_out.as_mut() else {
+            return Err(Error::OobUnsupported);
+        };
+        rx.recv().await.ok_or(Error::Closed)
     }
 
     /// Reads the next in-order, ARQ-recovered media payload.
@@ -96,6 +120,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         cfg,
         local: spawned.local,
         data_out: spawned.data_out,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -138,6 +163,7 @@ pub async fn listen_bonded_with(
         cfg,
         local: spawned.local,
         data_out: spawned.data_out,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

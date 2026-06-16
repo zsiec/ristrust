@@ -125,9 +125,15 @@ pub(crate) struct MainDriver {
     highest_sent: u32,
     /// The local flow SSRC (stamped into the SR/echo).
     ssrc: u32,
+    /// Application out-of-band datagrams to transmit (`Sender::write_oob`); `Some`
+    /// on a sender. Each is `(GRE protocol type, payload)`.
+    oob_in: Option<mpsc::Receiver<(u16, Vec<u8>)>>,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
+    /// Received out-of-band datagrams handed to `Receiver::read_oob`; `Some` on a
+    /// receiver. Each is `(GRE protocol type, payload)`.
+    oob_out: Option<mpsc::Sender<(u16, Bytes)>>,
     /// The media SSRC learned from the first inbound packet.
     learned_ssrc: Option<u32>,
     /// Whether the initial GRE+RTCP handshake has been sent. libRIST gates media
@@ -166,6 +172,7 @@ impl MainDriver {
         start_seq: u32,
         eap: Option<EapRole>,
         rate: Option<RateControl>,
+        oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -192,7 +199,9 @@ impl MainDriver {
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
+            oob_in: Some(oob_in),
             data_out: None,
+            oob_out: None,
             learned_ssrc: None,
             greeted: false,
             eap,
@@ -218,6 +227,7 @@ impl MainDriver {
         keepalive: Duration,
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -244,7 +254,9 @@ impl MainDriver {
             app_in: None,
             highest_sent: 0,
             ssrc,
+            oob_in: None,
             data_out: Some(tx),
+            oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
             eap,
@@ -302,6 +314,12 @@ impl MainDriver {
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down.
+                },
+                // Application out-of-band datagrams (fire-and-forget, gated on auth
+                // like media): GRE-frame and send directly, outside the flow core.
+                oob = recv_oob_gated(&mut self.oob_in, self.authed) => match oob {
+                    Some((proto, payload)) => self.send_oob(&payload, proto).await,
+                    None => self.oob_in = None, // write side closed: stop watching
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();
@@ -362,6 +380,24 @@ impl MainDriver {
         if !self.authed {
             self.drain(now).await;
             return;
+        }
+
+        // Out-of-band datagrams (a GRE frame with a non-reserved protocol type)
+        // bypass the flow core entirely, delivered to `Receiver::read_oob`.
+        match self.codec.peek_oob(data) {
+            Ok(Some((payload, proto))) => {
+                if let Some(out) = &self.oob_out {
+                    let _ = out.send((proto, Bytes::from(payload))).await;
+                }
+                self.drain(now).await;
+                return;
+            }
+            Ok(None) => {} // not OOB: fall through to the media/control demux
+            Err(e) => {
+                tracing::debug!("rist: main oob decode failed: {e}");
+                self.drain(now).await;
+                return;
+            }
         }
 
         // A GRE keepalive is a liveness signal only — nothing for the flow.
@@ -500,6 +536,19 @@ impl MainDriver {
         let sock = self.socket.clone();
         if let Ok(bytes) = self.codec.encode_keepalive(&ka, gre::VERSION_MIN) {
             let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// GRE-frames and sends one out-of-band datagram to the peer (PSK-encrypted when
+    /// configured). A no-op until the peer's media address is known.
+    async fn send_oob(&mut self, payload: &[u8], proto: u16) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        match self.codec.encode_oob(payload, proto) {
+            Ok(bytes) => {
+                let _ = sock.send(&bytes, dst).await;
+            }
+            Err(e) => tracing::debug!("rist: main oob encode failed: {e}"),
         }
     }
 
@@ -652,6 +701,21 @@ async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, authed: bool
         return std::future::pending().await;
     }
     match app_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next application out-of-band datagram to transmit; never resolves
+/// while unauthenticated (held like media) or when there is no OOB write channel.
+async fn recv_oob_gated(
+    oob_in: &mut Option<mpsc::Receiver<(u16, Vec<u8>)>>,
+    authed: bool,
+) -> Option<(u16, Vec<u8>)> {
+    if !authed {
+        return std::future::pending().await;
+    }
+    match oob_in {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

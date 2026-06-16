@@ -508,6 +508,71 @@ impl MainCodec {
         }
     }
 
+    /// Frames one out-of-band datagram (libRIST `RIST_PAYLOAD_TYPE_DATA_OOB`): a GRE
+    /// frame carrying `prot_type` (an EtherType; [`gre::PROTO_FULL`] = libRIST's OOB)
+    /// with no reduced/RTP header — the raw `payload` follows the GRE header,
+    /// encrypted under the PSK when configured (OOB rides the PSK but never ARQ). The
+    /// GRE sequence is shared with media (it is the AES IV), so OOB and media advance
+    /// one monotonic sequence.
+    pub(crate) fn encode_oob(
+        &mut self,
+        payload: &[u8],
+        prot_type: u16,
+    ) -> Result<Vec<u8>, CodecError> {
+        let seq = self.gre_seq;
+        self.gre_seq = self.gre_seq.wrapping_add(1);
+        let key_size_256 = self.key_size_256;
+        let mut hdr = gre::Header {
+            version: gre::VERSION_MIN,
+            has_seq: true,
+            prot_type,
+            seq,
+            ..gre::Header::default()
+        };
+        let mut out = Vec::new();
+        if let Some(key) = self.send_key.as_mut() {
+            let ct = key.encrypt(seq, payload)?;
+            hdr.has_key = true;
+            hdr.key_size_256 = key_size_256;
+            hdr.nonce = key.nonce();
+            hdr.append_to(&mut out)?;
+            out.extend_from_slice(&ct);
+        } else {
+            hdr.append_to(&mut out)?;
+            out.extend_from_slice(payload);
+        }
+        Ok(out)
+    }
+
+    /// Reports whether `b` is an out-of-band datagram (a GRE frame whose protocol
+    /// type is not one RIST reserves for its own framing) and, if so, returns its
+    /// decrypted payload and that protocol type. Unlike EAPOL, OOB participates in
+    /// PSK, so it decrypts; the per-packet K bit is honored independently (a
+    /// cleartext OOB datagram is returned as cleartext even with a decryptor
+    /// configured). `Ok(None)` means `b` is not OOB (route it to the media/control
+    /// demux). Never panics on arbitrary input.
+    pub(crate) fn peek_oob(&mut self, b: &[u8]) -> Result<Option<(Vec<u8>, u16)>, CodecError> {
+        let Ok((hdr, off)) = gre::Header::parse(b) else {
+            return Ok(None);
+        };
+        if gre::is_reserved(hdr.prot_type) {
+            return Ok(None);
+        }
+        let region = &b[off..];
+        let payload = if hdr.has_key {
+            let Some(key) = self.recv_key.as_mut() else {
+                return Err(CodecError::Main(
+                    "encrypted OOB but no decryptor configured",
+                ));
+            };
+            key.set_key_bits(crypto::AesKeyBits::from_h_bit(hdr.key_size_256));
+            key.decrypt(hdr.nonce, hdr.seq, region)?
+        } else {
+            region.to_vec()
+        };
+        Ok(Some((payload, hdr.prot_type)))
+    }
+
     // ---- decode ----
 
     /// Parses one Main-profile data datagram, demultiplexing on the inner packet's

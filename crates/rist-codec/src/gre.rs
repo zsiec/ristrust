@@ -87,6 +87,19 @@ pub const PROTO_EAPOL: u16 = 0x888E;
 /// [`VsfProto`] header follows the GRE header and carries the true sub-protocol.
 pub const PROTO_VSF: u16 = 0xCCE0;
 
+/// Whether `prot_type` is a GRE protocol type RIST reserves for its own framing
+/// (reduced-overhead media/control, keepalive, EAPOL, or the VSF wrapper). An
+/// out-of-band datagram must use a non-reserved EtherType — [`PROTO_FULL`] (0x0800,
+/// libRIST's out-of-band data) by default, or any other — so the receiver's demux
+/// routes it to OOB delivery rather than the media/keepalive/EAP/VSF paths.
+#[must_use]
+pub fn is_reserved(prot_type: u16) -> bool {
+    matches!(
+        prot_type,
+        PROTO_REDUCED | PROTO_KEEPALIVE | PROTO_EAPOL | PROTO_VSF
+    )
+}
+
 /// The only defined VSF protocol type (`RIST_VSF_PROTOCOL_TYPE_RIST`); any other
 /// value is rejected on parse.
 pub const VSF_TYPE_RIST: u16 = 0x0000;
@@ -688,6 +701,18 @@ impl BufferNegotiation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_reserved_matches_rist_framing_only() {
+        // RIST's own framing types are reserved; OOB EtherTypes (FULL and arbitrary)
+        // are not, so the demux routes them to out-of-band delivery.
+        for p in [PROTO_REDUCED, PROTO_KEEPALIVE, PROTO_EAPOL, PROTO_VSF] {
+            assert!(is_reserved(p), "0x{p:04X} should be reserved");
+        }
+        for p in [PROTO_FULL, 0x88B7, 0x0000, 0xFFFF] {
+            assert!(!is_reserved(p), "0x{p:04X} should not be reserved");
+        }
+    }
 
     struct GoldenHeader {
         name: &'static str,

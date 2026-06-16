@@ -114,6 +114,16 @@ pub enum Error {
     /// Advanced-profile control message.
     #[error("rist: flow attributes require the Advanced profile")]
     FlowAttrUnsupported,
+    /// An out-of-band operation was used on a profile without the OOB side channel.
+    /// OOB passthrough exists only on the Main and Advanced profiles.
+    #[error("rist: out-of-band data requires the Main or Advanced profile")]
+    OobUnsupported,
+    /// `write_oob_typed` was given a GRE protocol type RIST reserves for its own
+    /// framing (reduced/keepalive/EAPOL/VSF); such a datagram would be misrouted by
+    /// the peer's demux. Use [`OOB_PROTOCOL_IP`](crate::OOB_PROTOCOL_IP) or another
+    /// non-reserved EtherType.
+    #[error("rist: OOB protocol type 0x{0:04X} is reserved for RIST framing")]
+    OobProtocol(u16),
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

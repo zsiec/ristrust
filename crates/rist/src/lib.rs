@@ -44,3 +44,11 @@ pub use rist_core::flow::CongestionMode;
 
 /// The crate version (`CARGO_PKG_VERSION`), e.g. for an SDES tool tag or logging.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The default out-of-band GRE protocol type: EtherType `0x0800` (IPv4), the value
+/// libRIST stamps on every out-of-band datagram. [`Sender::write_oob`] uses it; it
+/// is the only OOB protocol type that interoperates with libRIST (a libRIST peer
+/// delivers a `0x0800` GRE frame as out-of-band data but drops other types). Other
+/// values tunnel an arbitrary protocol between two ristrust peers, dispatched on
+/// via the protocol type [`Receiver::read_oob`] returns.
+pub const OOB_PROTOCOL_IP: u16 = rist_codec::gre::PROTO_FULL;

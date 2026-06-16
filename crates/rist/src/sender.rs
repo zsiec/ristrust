@@ -20,6 +20,7 @@ pub struct Sender {
     app_in: mpsc::Sender<Bytes>,
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
+    oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -82,6 +83,37 @@ impl Sender {
             return Err(Error::FlowAttrUnsupported);
         };
         cmd.send(json.to_vec())
+            .await
+            .map_err(|_| self.close.error())
+    }
+
+    /// Sends one out-of-band datagram alongside the media stream as an IPv4 GRE
+    /// frame ([`OOB_PROTOCOL_IP`](crate::OOB_PROTOCOL_IP)) — the libRIST-interoperable
+    /// out-of-band form. PSK-encrypted when a secret is configured; never ARQ-retried.
+    ///
+    /// # Errors
+    /// As [`Sender::write_oob_typed`].
+    pub async fn write_oob(&self, payload: &[u8]) -> Result<(), Error> {
+        self.write_oob_typed(crate::OOB_PROTOCOL_IP, payload).await
+    }
+
+    /// Sends one out-of-band datagram under the GRE protocol type `proto` (an
+    /// EtherType). Any non-reserved value tunnels an arbitrary protocol to a peer
+    /// that dispatches on the type [`Receiver::read_oob`](crate::Receiver::read_oob)
+    /// returns. Fire-and-forget; held until the peer is known/authenticated.
+    ///
+    /// # Errors
+    /// Returns [`Error::OobUnsupported`] on a Simple-profile sender, [`Error::OobProtocol`]
+    /// if `proto` is one RIST reserves for its own framing, or [`Error::Closed`] if the
+    /// session has shut down.
+    pub async fn write_oob_typed(&self, proto: u16, payload: &[u8]) -> Result<(), Error> {
+        if rist_codec::gre::is_reserved(proto) {
+            return Err(Error::OobProtocol(proto));
+        }
+        let Some(cmd) = &self.oob_in else {
+            return Err(Error::OobUnsupported);
+        };
+        cmd.send((proto, payload.to_vec()))
             .await
             .map_err(|_| self.close.error())
     }
@@ -153,6 +185,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -200,6 +233,7 @@ pub async fn dial_bonded_with(
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -253,6 +287,7 @@ pub async fn dial_bonded_weighted_with(
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

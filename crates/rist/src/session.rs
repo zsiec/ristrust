@@ -50,6 +50,9 @@ pub(crate) struct SenderSpawned {
     /// Application flow attributes to transmit (`Sender::write_flow_attribute`);
     /// `Some` only on an Advanced sender.
     pub(crate) flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
+    /// Out-of-band datagrams to transmit (`Sender::write_oob`); `Some` on a
+    /// Main/Advanced sender. Each is `(GRE protocol type, payload)`.
+    pub(crate) oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -64,6 +67,9 @@ pub(crate) struct ReceiverSpawned {
     pub(crate) local: SocketAddr,
     /// Receives delivered payloads from the driver.
     pub(crate) data_out: mpsc::Receiver<Bytes>,
+    /// Received out-of-band datagrams (`Receiver::read_oob`); `Some` on a
+    /// Main/Advanced receiver. Each is `(GRE protocol type, payload)`.
+    pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -265,6 +271,7 @@ pub(crate) fn build_sender(
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
+        let (oob_tx, oob_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = MainDriver::spawn_sender(
             flow,
             socket,
@@ -277,12 +284,14 @@ pub(crate) fn build_sender(
             start_seq,
             eap,
             RateControl::from_config(cfg),
+            oob_rx,
         );
         return Ok(SenderSpawned {
             local,
             app_in,
             weight_cmd: None,
             flow_attr_cmd: None,
+            oob_in: Some(oob_tx),
             close,
             stats,
             task,
@@ -296,8 +305,9 @@ pub(crate) fn build_sender(
         let main = build_main_codec(cfg, ssrc)?;
         let adv = build_adv_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
-        // The fire-and-forget flow-attribute send channel (rare, small depth).
+        // The fire-and-forget flow-attribute and OOB send channels (rare, small).
         let (attr_tx, attr_rx) = mpsc::channel(16);
+        let (oob_tx, oob_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = AdvDriver::spawn_sender(
             flow,
             socket,
@@ -312,12 +322,14 @@ pub(crate) fn build_sender(
             RateControl::from_config(cfg),
             cfg.on_flow_attr.clone(),
             attr_rx,
+            oob_rx,
         );
         return Ok(SenderSpawned {
             local,
             app_in,
             weight_cmd: None,
             flow_attr_cmd: Some(attr_tx),
+            oob_in: Some(oob_tx),
             close,
             stats,
             task,
@@ -345,6 +357,7 @@ pub(crate) fn build_sender(
         app_in,
         weight_cmd: None,
         flow_attr_cmd: None,
+        oob_in: None,
         close,
         stats,
         task,
@@ -378,6 +391,7 @@ pub(crate) fn build_receiver(
         let bound = socket.local()?;
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
+        let (oob_tx, oob_rx) = mpsc::channel(16);
         let (data_out, close, stats, task) = MainDriver::spawn_receiver(
             flow,
             socket,
@@ -389,10 +403,12 @@ pub(crate) fn build_receiver(
             cfg.keepalive_interval,
             eap,
             build_lqm_emitter(cfg),
+            oob_tx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
+            oob_out: Some(oob_rx),
             close,
             stats,
             task,
@@ -405,6 +421,7 @@ pub(crate) fn build_receiver(
         let main = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let adv = build_adv_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
+        let (oob_tx, oob_rx) = mpsc::channel(16);
         let (data_out, close, stats, task) = AdvDriver::spawn_receiver(
             flow,
             socket,
@@ -417,10 +434,12 @@ pub(crate) fn build_receiver(
             eap,
             build_lqm_emitter(cfg),
             cfg.on_flow_attr.clone(),
+            oob_tx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
+            oob_out: Some(oob_rx),
             close,
             stats,
             task,
@@ -442,6 +461,7 @@ pub(crate) fn build_receiver(
     Ok(ReceiverSpawned {
         local: bound,
         data_out,
+        oob_out: None,
         close,
         stats,
         task,
@@ -534,6 +554,7 @@ pub(crate) fn build_bonded_sender(
         app_in,
         weight_cmd: Some(weight_tx),
         flow_attr_cmd: None,
+        oob_in: None,
         close,
         stats,
         task,
@@ -598,6 +619,7 @@ pub(crate) fn build_bonded_receiver(
     Ok(ReceiverSpawned {
         local: bound,
         data_out,
+        oob_out: None,
         close,
         stats,
         task,

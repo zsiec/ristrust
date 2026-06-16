@@ -104,6 +104,12 @@ pub(crate) struct AdvDriver {
     /// Application-submitted flow attributes to transmit (sender only; `None` on a
     /// receiver), from `Sender::write_flow_attribute`.
     flow_attr_cmd: Option<mpsc::Receiver<Vec<u8>>>,
+
+    // --- out-of-band passthrough (carried on the GRE substrate) ---
+    /// Application OOB datagrams to transmit (`Some` on a sender). `(prot_type, payload)`.
+    oob_in: Option<mpsc::Receiver<(u16, Vec<u8>)>>,
+    /// Received OOB datagrams handed to `Receiver::read_oob` (`Some` on a receiver).
+    oob_out: Option<mpsc::Sender<(u16, Bytes)>>,
 }
 
 impl AdvDriver {
@@ -123,6 +129,7 @@ impl AdvDriver {
         rate: Option<RateControl>,
         on_flow_attr: Option<FlowAttrCallback>,
         flow_attr_rx: mpsc::Receiver<Vec<u8>>,
+        oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -158,6 +165,8 @@ impl AdvDriver {
             rate,
             on_flow_attr,
             flow_attr_cmd: Some(flow_attr_rx),
+            oob_in: Some(oob_in),
+            oob_out: None,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -176,6 +185,7 @@ impl AdvDriver {
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
         on_flow_attr: Option<FlowAttrCallback>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -211,6 +221,8 @@ impl AdvDriver {
             rate: None,
             on_flow_attr,
             flow_attr_cmd: None,
+            oob_in: None,
+            oob_out: Some(oob_out),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -263,6 +275,12 @@ impl AdvDriver {
                     }
                     None => self.flow_attr_cmd = None,
                 },
+                // Application out-of-band datagrams (fire-and-forget, auth-gated):
+                // GRE-frame on the substrate codec and send directly.
+                oob = recv_oob(&mut self.oob_in, self.authed) => match oob {
+                    Some((proto, payload)) => self.send_oob(&payload, proto).await,
+                    None => self.oob_in = None,
+                },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();
                     self.fire_timers(now);
@@ -305,16 +323,31 @@ impl AdvDriver {
             if self.authed {
                 self.on_adv(now, data);
             }
+        } else if let Some(eap_payload) = self.main.peek_eapol(data).map(<[u8]>::to_vec) {
+            // Raw Main-profile GRE substrate: EAPOL auth drives the handshake.
+            self.handle_eap(&eap_payload).await;
         } else {
-            // Raw Main-profile GRE substrate: EAPOL auth, keepalive, or the RTCP
-            // handshake (no flow feedback rides the substrate on this path).
-            if let Some(eap_payload) = self.main.peek_eapol(data).map(<[u8]>::to_vec) {
-                self.handle_eap(&eap_payload).await;
+            // Out-of-band passthrough (non-reserved GRE protocol type) bypasses the
+            // flow core, auth-gated like media. The SR/RR/SDES handshake must still
+            // be processed before auth completes, so OOB is peeked only when authed.
+            let oob = if self.authed {
+                self.main.peek_oob(data)
             } else {
-                let (kind, _ka, _ver) = self.main.peek_control(data);
-                if kind != ControlKind::Keepalive {
-                    // SR/RR/SDES handshake carry no flow input; ignore decode errors.
-                    let _ = self.main.decode(data, self.highest_sent);
+                Ok(None)
+            };
+            match oob {
+                Ok(Some((payload, proto))) => {
+                    if let Some(out) = &self.oob_out {
+                        let _ = out.send((proto, Bytes::from(payload))).await;
+                    }
+                }
+                Err(e) => tracing::debug!("rist: adv oob decode failed: {e}"),
+                Ok(None) => {
+                    // Keepalive is liveness only; SR/RR/SDES carry no flow input.
+                    let (kind, _ka, _ver) = self.main.peek_control(data);
+                    if kind != ControlKind::Keepalive {
+                        let _ = self.main.decode(data, self.highest_sent);
+                    }
                 }
             }
         }
@@ -491,6 +524,19 @@ impl AdvDriver {
         }
     }
 
+    /// GRE-frames and sends one out-of-band datagram on the substrate codec
+    /// (PSK-encrypted when configured). A no-op until the peer's address is known.
+    async fn send_oob(&mut self, payload: &[u8], proto: u16) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        match self.main.encode_oob(payload, proto) {
+            Ok(bytes) => {
+                let _ = sock.send(&bytes, dst).await;
+            }
+            Err(e) => tracing::debug!("rist: adv oob encode failed: {e}"),
+        }
+    }
+
     /// Frames and sends one fire-and-forget flow-attribute control datagram
     /// (TR-06-3 §5.3.7) to the peer. A no-op until the peer's media address is known.
     async fn send_flow_attr(&mut self, json: &[u8], now: Timestamp) {
@@ -612,6 +658,21 @@ async fn recv_flow_attr(ch: &mut Option<mpsc::Receiver<Vec<u8>>>, authed: bool) 
         return std::future::pending().await;
     }
     match ch {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next application out-of-band datagram to transmit; never resolves
+/// while unauthenticated (held like media) or when there is no OOB write channel.
+async fn recv_oob(
+    oob_in: &mut Option<mpsc::Receiver<(u16, Vec<u8>)>>,
+    authed: bool,
+) -> Option<(u16, Vec<u8>)> {
+    if !authed {
+        return std::future::pending().await;
+    }
+    match oob_in {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

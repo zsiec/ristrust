@@ -44,6 +44,9 @@ pub(crate) struct SenderSpawned {
     pub(crate) local: SocketAddr,
     /// Sends application payloads into the driver.
     pub(crate) app_in: mpsc::Sender<Bytes>,
+    /// Runtime `(path, weight)` commands for a bonded sender (`Sender::set_weight`);
+    /// `None` for non-bonded senders.
+    pub(crate) weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -275,6 +278,7 @@ pub(crate) fn build_sender(
         return Ok(SenderSpawned {
             local,
             app_in,
+            weight_cmd: None,
             close,
             stats,
             task,
@@ -304,6 +308,7 @@ pub(crate) fn build_sender(
         return Ok(SenderSpawned {
             local,
             app_in,
+            weight_cmd: None,
             close,
             stats,
             task,
@@ -329,6 +334,7 @@ pub(crate) fn build_sender(
     Ok(SenderSpawned {
         local,
         app_in,
+        weight_cmd: None,
         close,
         stats,
         task,
@@ -466,16 +472,16 @@ fn require_main(cfg: &Config) -> io::Result<()> {
 pub(crate) fn build_bonded_sender(
     rt: &dyn Runtime,
     cfg: &Config,
-    remotes: &[SocketAddr],
+    peers: &[(SocketAddr, u32)],
 ) -> io::Result<SenderSpawned> {
     require_main(cfg)?;
     let ssrc = random_even_ssrc();
     let start_seq = random_start_seq();
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     let mut group = bonding_group(cfg);
-    let mut paths = Vec::with_capacity(remotes.len());
+    let mut paths = Vec::with_capacity(peers.len());
     let mut local = None;
-    for (i, &remote) in remotes.iter().enumerate() {
+    for (i, &(remote, weight)) in peers.iter().enumerate() {
         let egress = crate::multicast::sender_egress(cfg, remote)?;
         let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
         if local.is_none() {
@@ -484,11 +490,8 @@ pub(crate) fn build_bonded_sender(
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
-        group.add_path(
-            u8::try_from(i).unwrap_or(u8::MAX),
-            bonding::WEIGHT_DUPLICATE,
-            0,
-        );
+        // `weight` 0 = full 2022-7 duplication; > 0 = weighted load-share.
+        group.add_path(u8::try_from(i).unwrap_or(u8::MAX), weight, 0);
         paths.push(PathParts {
             socket,
             peer,
@@ -502,6 +505,8 @@ pub(crate) fn build_bonded_sender(
             "rist: bonded sender needs at least one remote",
         )
     })?;
+    // The runtime `set_weight` command channel (rare control traffic, small depth).
+    let (weight_tx, weight_rx) = mpsc::channel(16);
     let (app_in, close, stats, task) = BondedDriver::spawn_sender(
         flow,
         group,
@@ -511,10 +516,12 @@ pub(crate) fn build_bonded_sender(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         start_seq,
+        weight_rx,
     );
     Ok(SenderSpawned {
         local,
         app_in,
+        weight_cmd: Some(weight_tx),
         close,
         stats,
         task,

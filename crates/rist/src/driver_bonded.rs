@@ -111,6 +111,9 @@ pub(crate) struct BondedDriver {
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
+    /// Runtime `(path_index, weight)` commands from `Sender::set_weight` (sender
+    /// only). `None` on a receiver.
+    weight_cmd: Option<mpsc::Receiver<(u8, u32)>>,
     /// The highest first-transmission sequence sent (shared across paths — the RTP
     /// sequence space is one stream), the NACK-widening reference.
     highest_sent: u32,
@@ -138,6 +141,7 @@ impl BondedDriver {
         bitmask: bool,
         keepalive: Duration,
         start_seq: u32,
+        weight_rx: mpsc::Receiver<(u8, u32)>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -160,6 +164,7 @@ impl BondedDriver {
             close: close.clone(),
             stats: stats.clone(),
             app_in: Some(rx),
+            weight_cmd: Some(weight_rx),
             highest_sent: start_seq,
             ssrc,
             data_out: None,
@@ -202,6 +207,7 @@ impl BondedDriver {
             close: close.clone(),
             stats: stats.clone(),
             app_in: None,
+            weight_cmd: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
@@ -266,6 +272,13 @@ impl BondedDriver {
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down
+                },
+                // Runtime load-share re-balancing from `Sender::set_weight`.
+                cmd = recv_weight(&mut self.weight_cmd) => match cmd {
+                    Some((index, weight)) => self.group.set_weight(index, weight),
+                    // The command channel closed: stop watching it (the dropped
+                    // Sender handle also closes the app channel, which breaks above).
+                    None => self.weight_cmd = None,
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();
@@ -371,6 +384,12 @@ impl BondedDriver {
                     // Full 2022-7 redundancy: the identical (seq, source_time) packet
                     // on every live duplicate-weight path, each in its own GRE frame.
                     for idx in self.group.duplicate_targets(now) {
+                        self.send_media_on(idx as usize, &pkt).await;
+                    }
+                    // Weighted load-share: route this datagram to one elected weighted
+                    // path (disjoint from the duplicate paths above, so no path is sent
+                    // it twice), splitting the stream in proportion to the weights.
+                    if let Some(idx) = self.group.select_weighted(now) {
                         self.send_media_on(idx as usize, &pkt).await;
                     }
                 }
@@ -667,6 +686,15 @@ async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, authed: bool
         return std::future::pending().await;
     }
     match app_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next runtime weight command; never resolves when there is no command
+/// channel (a receiver-role driver, which takes no weight commands).
+async fn recv_weight(ch: &mut Option<mpsc::Receiver<(u8, u32)>>) -> Option<(u8, u32)> {
+    match ch {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

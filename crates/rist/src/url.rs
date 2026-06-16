@@ -32,12 +32,11 @@ const MAX_URL_MILLIS: u64 = 7 * 24 * 3600 * 1000;
 /// `buffer-max`, `rtt`, `rtt-min`, `rtt-max`, `reorder-buffer`,
 /// `session-timeout`, `keepalive` / `keepalive-interval`; `rtt-multiplier`,
 /// `bandwidth` (kbps), `min-retries`, `max-retries`, `aes-type` (128/256),
-/// `key-rotation`, `virt-src-port`, `virt-dst-port`, `profile`, `cname`,
-/// `secret`, `username`, `password`, `compression` (0/1), and the multicast
-/// `miface`/`ttl`/`source`. `buffer` sets both buffer bounds and `rtt` sets both
-/// RTT bounds; an explicit `-min`/`-max` always wins regardless of URL order (a
-/// deliberate simplification of libRIST's order-dependent parsing). `weight` is
-/// accepted but ignored until weighted bonding lands.
+/// `key-rotation`, `weight`, `virt-src-port`, `virt-dst-port`, `profile`,
+/// `cname`, `secret`, `username`, `password`, `compression` (0/1), and the
+/// multicast `miface`/`ttl`/`source`. `buffer` sets both buffer bounds and `rtt`
+/// sets both RTT bounds; an explicit `-min`/`-max` always wins regardless of URL
+/// order (a deliberate simplification of libRIST's order-dependent parsing).
 ///
 /// # Errors
 /// Returns [`Error::Url`] for an unsupported scheme, a missing port, or a query
@@ -229,9 +228,8 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
 
 /// Folds the string- and feature-valued query parameters (`cname`, `secret`, the
 /// multicast `miface`/`ttl`/`source`, the EAP-SRP `username`/`password`,
-/// `compression`, `key-rotation`) into `cfg`. Split out of [`apply_query`] to keep
-/// that function under the line cap. `weight` is accepted but ignored until
-/// weighted bonding gives it a home.
+/// `compression`, `key-rotation`, `weight`) into `cfg`. Split out of [`apply_query`]
+/// to keep that function under the line cap.
 fn apply_string_and_feature_params(
     cfg: &mut Config,
     q: &HashMap<String, String>,
@@ -279,6 +277,10 @@ fn apply_string_and_feature_params(
     // `key-rotation`: packets per PSK nonce before rotating (Main/Advanced).
     if let Some(n) = int("key-rotation")? {
         cfg.key_rotation = clamp_u32("key-rotation", n)?;
+    }
+    // `weight`: the uniform 2022-7 bonding load-share weight (0 = full duplication).
+    if let Some(n) = int("weight")? {
+        cfg.weight = clamp_u32("weight", n)?;
     }
     Ok(())
 }

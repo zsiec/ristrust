@@ -41,8 +41,12 @@ struct Path {
     /// feeds into [`rist_core::flow::Flow::feed`].
     index: u8,
     /// Load-sharing weight; [`WEIGHT_DUPLICATE`] (0) selects full 2022-7
-    /// redundancy. Weighted round-robin (`weight > 0`) is a documented follow-on.
+    /// redundancy, `weight > 0` puts the path in the weighted load-share rotation.
     weight: u32,
+    /// Remaining send credit for this weighted path in the current rotation round
+    /// (libRIST `w_count`). Re-seeded to `weight` when the round refills or the
+    /// weight changes; unused by duplicate-weight paths.
+    w_count: u32,
     /// NACK-recovery priority: higher wins the NACK-peer election outright.
     priority: u32,
     /// The per-path RTT estimator; its raw last sample breaks priority ties.
@@ -98,6 +102,7 @@ impl Group {
         self.paths.push(Path {
             index,
             weight,
+            w_count: weight, // seed the rotation credit
             priority,
             rtt: Estimator::new(self.rtt_min),
             last_seen: Timestamp::ZERO,
@@ -171,6 +176,82 @@ impl Group {
     pub(crate) fn should_duplicate(&self, index: u8, now: Timestamp) -> bool {
         self.path(index)
             .is_some_and(|p| p.weight == WEIGHT_DUPLICATE && !self.proven_dead(p, now))
+    }
+
+    /// Whether any path is in the weighted load-share rotation (`weight > 0`). When
+    /// false the sender duplicates to the [`WEIGHT_DUPLICATE`] paths alone.
+    pub(crate) fn has_weighted(&self) -> bool {
+        self.paths.iter().any(|p| p.weight > 0)
+    }
+
+    /// Elects the weighted load-share path to carry one media datagram, the libRIST
+    /// weighted-send credit rotation: each round, every live weighted path is
+    /// granted `weight` credits; the path with the most remaining credit is elected
+    /// and spends one, so over a round a path carries `weight`-in-total of the
+    /// datagrams. When the round is exhausted it refills the *live* weighted paths
+    /// (a dead path is skipped and its share passes to the survivors) and re-elects.
+    /// Returns `None` when there are no weighted paths or every weighted path is
+    /// dead. Disjoint from [`Group::duplicate_targets`]: a duplicate path is never
+    /// elected here, so no path is sent the same datagram twice.
+    pub(crate) fn select_weighted(&mut self, now: Timestamp) -> Option<u8> {
+        if !self.has_weighted() {
+            return None;
+        }
+        let best = self.best_weighted(now)?; // None → every weighted path is dead
+        if self.path(best).is_some_and(|p| p.w_count == 0) {
+            // The round is exhausted among the live weighted paths: refill them and
+            // re-elect. Dead paths stay empty, so their share passes to survivors.
+            let timeout = self.timeout;
+            for p in &mut self.paths {
+                if p.weight > 0 && !(p.seen && (now - p.last_seen) > timeout) {
+                    p.w_count = p.weight;
+                }
+            }
+            let best = self.best_weighted(now)?;
+            self.spend(best);
+            return Some(best);
+        }
+        self.spend(best);
+        Some(best)
+    }
+
+    /// The live weighted path with the most remaining credit; ties resolve to the
+    /// earliest-registered. `None` when no weighted path is sendable.
+    fn best_weighted(&self, now: Timestamp) -> Option<u8> {
+        let mut best: Option<&Path> = None;
+        for p in &self.paths {
+            if p.weight == 0 || self.proven_dead(p, now) {
+                continue;
+            }
+            if best.is_none_or(|b| p.w_count > b.w_count) {
+                best = Some(p);
+            }
+        }
+        best.map(|p| p.index)
+    }
+
+    /// Spends one rotation credit from `index` (saturating at 0).
+    fn spend(&mut self, index: u8) {
+        if let Some(p) = self.path_mut(index) {
+            p.w_count = p.w_count.saturating_sub(1);
+        }
+    }
+
+    /// Changes a path's load-share weight at runtime (libRIST weighted re-balance):
+    /// the new weight takes effect from the next round, which restarts immediately
+    /// so every path regains full credit. Unknown indices are ignored. A weight of
+    /// [`WEIGHT_DUPLICATE`] moves the path back to full-redundancy duplication.
+    pub(crate) fn set_weight(&mut self, index: u8, weight: u32) {
+        if self.path(index).is_none() {
+            return;
+        }
+        if let Some(p) = self.path_mut(index) {
+            p.weight = weight;
+        }
+        // Restart the round at the new weights.
+        for q in &mut self.paths {
+            q.w_count = q.weight;
+        }
     }
 
     /// Selects the path to route a NACK on, libRIST's `rist_nack_peer_preferred`:
@@ -276,6 +357,69 @@ mod tests {
         let mut g = group(&[(0, 0, 0), (0, 0, 0)]);
         g.add_path(0, 7, 7);
         assert_eq!(g.len(), 1);
+    }
+
+    #[test]
+    fn select_weighted_splits_in_proportion() {
+        // Paths 0 and 1 weighted 3:1. Over a four-credit round (3+1) path 0 carries
+        // three datagrams to path 1's one; two rounds give 6:2.
+        let mut g = group(&[(0, 3, 0), (1, 1, 0)]);
+        let mut counts = [0u32; 2];
+        for _ in 0..8 {
+            let idx = g
+                .select_weighted(at(0))
+                .expect("a weighted path is elected");
+            counts[idx as usize] += 1;
+        }
+        assert_eq!(counts, [6, 2], "weight 3:1 over two rounds");
+    }
+
+    #[test]
+    fn select_weighted_is_none_when_all_duplicate() {
+        let mut g = group(&[(0, 0, 0), (1, 0, 0)]);
+        assert!(!g.has_weighted());
+        assert_eq!(g.select_weighted(at(0)), None);
+    }
+
+    #[test]
+    fn select_weighted_skips_a_dead_path() {
+        // Two equal weighted paths; path 1 falls silent past the timeout, so every
+        // election routes to the surviving path 0 (its share redistributes).
+        let mut g = group(&[(0, 1, 0), (1, 1, 0)]);
+        g.observe(0, at(0));
+        g.observe(1, at(0));
+        g.observe(0, at(3000)); // path 1 is now silent 3 s > the 2 s timeout
+        for _ in 0..6 {
+            assert_eq!(
+                g.select_weighted(at(3000)),
+                Some(0),
+                "a dead weighted path must be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn set_weight_rebalances_the_rotation() {
+        let mut g = group(&[(0, 1, 0), (1, 1, 0)]); // starts 1:1
+        g.set_weight(0, 3); // now 3:1
+        let mut counts = [0u32; 2];
+        for _ in 0..8 {
+            counts[g.select_weighted(at(0)).expect("elected") as usize] += 1;
+        }
+        assert_eq!(counts, [6, 2]);
+        // Moving a path back to duplicate removes it from the rotation.
+        g.set_weight(0, WEIGHT_DUPLICATE);
+        for _ in 0..4 {
+            assert_eq!(
+                g.select_weighted(at(0)),
+                Some(1),
+                "only path 1 stays weighted"
+            );
+        }
+        assert!(
+            g.should_duplicate(0, at(0)),
+            "path 0 is a duplicate path again"
+        );
     }
 
     #[test]

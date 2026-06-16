@@ -129,6 +129,12 @@ pub struct Config {
     /// playout-skip). Set it on **both** ends. Incompatible with EAP-SRP (the
     /// handshake needs a return channel). Default: off.
     pub one_way: bool,
+    /// The uniform SMPTE 2022-7 bonding load-share weight applied to every path of
+    /// a `dial_bonded` sender. `0` (the default, `WEIGHT_DUPLICATE`) duplicates the
+    /// stream onto every path for full redundancy; `> 0` load-shares it across the
+    /// paths in proportion to the weight. Per-path weights use `dial_bonded_weighted`
+    /// instead. Ignored by non-bonded senders and by all receivers.
+    pub weight: u32,
     /// Make a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
     /// or an Advanced control message (index `0x0002`). Default: off.
@@ -189,6 +195,7 @@ impl Default for Config {
             compression: false,
             null_packet_deletion: false,
             one_way: false,
+            weight: 0,
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
@@ -320,6 +327,15 @@ impl Config {
     #[must_use]
     pub fn with_one_way(mut self, on: bool) -> Config {
         self.one_way = on;
+        self
+    }
+
+    /// Sets the uniform 2022-7 bonding load-share weight for a `dial_bonded` sender
+    /// (`0` = full duplication; `> 0` = load-share). For per-path weights use
+    /// `dial_bonded_weighted`.
+    #[must_use]
+    pub fn with_weight(mut self, weight: u32) -> Config {
+        self.weight = weight;
         self
     }
 

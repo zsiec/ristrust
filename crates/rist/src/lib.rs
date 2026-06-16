@@ -27,7 +27,10 @@ pub use config::{Config, NackType, Profile, RateCallback};
 pub use error::{ConfigError, Error};
 pub use receiver::{Receiver, listen, listen_bonded, listen_bonded_with, listen_with};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
-pub use sender::{Sender, dial, dial_bonded, dial_bonded_with, dial_with};
+pub use sender::{
+    Sender, dial, dial_bonded, dial_bonded_weighted, dial_bonded_weighted_with, dial_bonded_with,
+    dial_with,
+};
 pub use stats::Stats;
 pub use url::parse_url;
 

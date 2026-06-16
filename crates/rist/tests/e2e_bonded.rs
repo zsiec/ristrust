@@ -14,13 +14,13 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rist::{
-    AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_bonded_with,
-    listen_bonded,
+    AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_bonded_weighted_with,
+    dial_bonded_with, listen_bonded,
 };
 
 /// A Main-profile bonded base config with a short recovery buffer.
@@ -196,4 +196,168 @@ impl AsyncUdpSocket for BlackholeSocket {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
+}
+
+/// A [`Runtime`] that totals the media-sized datagrams each bound socket transmits,
+/// one counter per `bind` in call order. The bonded sender binds one socket per path
+/// in path order, so `counters()[i]` is path `i`'s media count — the witness that
+/// weighted load-share split the stream across the paths.
+#[derive(Debug, Default)]
+struct CountingPathRuntime {
+    counters: Mutex<Vec<Arc<AtomicU64>>>,
+}
+
+impl CountingPathRuntime {
+    fn new() -> CountingPathRuntime {
+        CountingPathRuntime::default()
+    }
+    /// The per-path media counters, in path (bind) order.
+    fn counters(&self) -> Vec<Arc<AtomicU64>> {
+        self.counters.lock().expect("counters").clone()
+    }
+}
+
+impl Runtime for CountingPathRuntime {
+    fn now(&self) -> Instant {
+        TokioRuntime.now()
+    }
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        TokioRuntime.spawn(future);
+    }
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        TokioRuntime.sleep_until(deadline)
+    }
+    fn bind(&self, addr: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let inner = TokioRuntime.bind(addr)?;
+        let counter = Arc::new(AtomicU64::new(0));
+        self.counters
+            .lock()
+            .expect("counters")
+            .push(Arc::clone(&counter));
+        Ok(Arc::new(CountingPathSocket { inner, counter }))
+    }
+}
+
+/// A socket that adds each media-sized send to its path counter.
+#[derive(Debug)]
+struct CountingPathSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    counter: Arc<AtomicU64>,
+}
+
+impl AsyncUdpSocket for CountingPathSocket {
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        dest: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        let r = self.inner.poll_send(cx, buf, dest);
+        if let std::task::Poll::Ready(Ok(n)) = &r
+            && buf.len() > MEDIA_THRESHOLD
+        {
+            self.counter.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<(usize, SocketAddr)>> {
+        self.inner.poll_recv(cx, buf)
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Drives a weighted bonded sender (per-path or runtime-set weights) through a
+/// counting runtime, asserts the receiver merges all `N` payloads in order, and
+/// returns the per-path media byte counts.
+async fn run_weighted(
+    rt: Arc<CountingPathRuntime>,
+    sender: rist::Sender,
+    mut receiver: Receiver,
+    n: usize,
+) -> Vec<u64> {
+    let body = "x".repeat(200); // >128 so each media datagram is loss-eligible/counted
+    let mk = move |i: usize| format!("w-{i:04}-{body}").into_bytes();
+    let send_mk = mk.clone();
+    let send_task = tokio::spawn(async move {
+        for i in 0..n {
+            sender.send(&send_mk(i)).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sender
+    });
+    for i in 0..n {
+        let got = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session stayed open");
+        assert_eq!(
+            got.as_ref(),
+            mk(i).as_slice(),
+            "payload {i} corrupt or out of order"
+        );
+    }
+    let sender = send_task.await.expect("send task");
+    let counts: Vec<u64> = rt
+        .counters()
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+    counts
+}
+
+#[tokio::test]
+async fn bonded_weighted_load_share_splits_three_to_one() {
+    let cfg = bonded_cfg();
+    let (receiver, refs) = listen_free_bonded(&cfg, 2).await;
+    let rt = Arc::new(CountingPathRuntime::new());
+    // Path 0 weight 3, path 1 weight 1: path 0 carries ~three quarters of the stream.
+    let peers: Vec<(&str, u32)> = vec![(refs[0].as_str(), 3), (refs[1].as_str(), 1)];
+    let sender = dial_bonded_weighted_with(&peers, cfg.clone(), rt.as_ref())
+        .await
+        .expect("dial weighted bonded");
+    let counts = run_weighted(Arc::clone(&rt), sender, receiver, 120).await;
+
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "a weighted path carried no media: {counts:?} (load not shared)"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = counts[0] as f64 / counts[1] as f64;
+    assert!(
+        (2.3..=4.5).contains(&ratio),
+        "weighted split {counts:?} (ratio {ratio:.2}), want ~3:1; ~1:1 would be duplication"
+    );
+}
+
+#[tokio::test]
+async fn bonded_set_weight_rebalances_at_runtime() {
+    let cfg = bonded_cfg().with_weight(1); // start uniform 1:1
+    let (receiver, refs) = listen_free_bonded(&cfg, 2).await;
+    let rt = Arc::new(CountingPathRuntime::new());
+    let addrs: Vec<&str> = refs.iter().map(String::as_str).collect();
+    let sender = dial_bonded_with(&addrs, cfg.clone(), rt.as_ref())
+        .await
+        .expect("dial bonded");
+    // Rebalance to 3:1 before the stream really gets going.
+    sender.set_weight(0, 3).await.expect("set_weight");
+    let counts = run_weighted(Arc::clone(&rt), sender, receiver, 120).await;
+
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "a path carried no media: {counts:?}"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = counts[0] as f64 / counts[1] as f64;
+    assert!(
+        ratio > 2.0,
+        "set_weight did not rebalance: {counts:?} (ratio {ratio:.2}), want path 0 favored"
+    );
 }

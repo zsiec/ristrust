@@ -18,6 +18,7 @@ pub struct Sender {
     local: SocketAddr,
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
+    weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -49,6 +50,22 @@ impl Sender {
     #[must_use]
     pub fn stats(&self) -> crate::Stats {
         self.stats.snapshot()
+    }
+
+    /// Changes the SMPTE 2022-7 load-share weight of bonded path `path` at runtime
+    /// (`0` returns it to full duplication; `> 0` puts it in the weighted rotation).
+    /// Takes effect from the next rotation round.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-bonded sender (only a `dial_bonded`
+    /// / `dial_bonded_weighted` sender has per-path weights), or [`Error::Closed`] if
+    /// the session has shut down.
+    pub async fn set_weight(&self, path: usize, weight: u32) -> Result<(), Error> {
+        let Some(cmd) = &self.weight_cmd else {
+            return Err(Error::Unimplemented("set_weight requires a bonded sender"));
+        };
+        let index = u8::try_from(path).map_err(|_| Error::InvalidAddr(format!("path {path}")))?;
+        cmd.send((index, weight)).await.map_err(|_| Error::Closed)
     }
 
     /// Submits one media payload for reliable transmission. Applies back-pressure
@@ -116,6 +133,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         local: spawned.local,
         remote,
         app_in: spawned.app_in,
+        weight_cmd: spawned.weight_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -152,13 +170,68 @@ pub async fn dial_bonded_with(
     }
     cfg.validate()?;
     let remotes = resolve_bonded_addrs(addrs)?;
-    let spawned = crate::session::build_bonded_sender(rt, &cfg, &remotes)?;
-    tracing::debug!(paths = remotes.len(), "rist: bonded sender dialed");
+    // Uniform weight on every path (`cfg.weight`; 0 = full duplication).
+    let peers: Vec<(SocketAddr, u32)> = remotes.iter().map(|&a| (a, cfg.weight)).collect();
+    let spawned = crate::session::build_bonded_sender(rt, &cfg, &peers)?;
+    tracing::debug!(paths = peers.len(), "rist: bonded sender dialed");
     Ok(Sender {
         cfg,
         local: spawned.local,
-        remote: remotes[0],
+        remote: peers[0].0,
         app_in: spawned.app_in,
+        weight_cmd: spawned.weight_cmd,
+        close: spawned.close,
+        stats: spawned.stats,
+        task: spawned.task,
+    })
+}
+
+/// Connects a SMPTE 2022-7 bonded sender with a per-path load-share `weight` on
+/// each address: `0` duplicates the stream onto that path (full redundancy), `> 0`
+/// puts it in the weighted load-share rotation (datagrams split across the weighted
+/// paths in proportion to their weights). Duplicate and weighted paths compose.
+/// Bonding requires the Main profile. The path index for [`Sender::set_weight`] is
+/// the position in `peers`.
+///
+/// # Errors
+/// As [`dial_bonded`].
+pub async fn dial_bonded_weighted(peers: &[(&str, u32)], cfg: Config) -> Result<Sender, Error> {
+    dial_bonded_weighted_with(peers, cfg, &TokioRuntime).await
+}
+
+/// Like [`dial_bonded_weighted`], but binds every path's transport socket through `rt`.
+///
+/// # Errors
+/// As [`dial_bonded`].
+pub async fn dial_bonded_weighted_with(
+    peers: &[(&str, u32)],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Sender, Error> {
+    if peers.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded sender needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let addrs: Vec<&str> = peers.iter().map(|&(a, _)| a).collect();
+    let remotes = resolve_bonded_addrs(&addrs)?;
+    let resolved: Vec<(SocketAddr, u32)> = remotes
+        .iter()
+        .zip(peers)
+        .map(|(&addr, &(_, weight))| (addr, weight))
+        .collect();
+    let spawned = crate::session::build_bonded_sender(rt, &cfg, &resolved)?;
+    tracing::debug!(
+        paths = resolved.len(),
+        "rist: weighted bonded sender dialed"
+    );
+    Ok(Sender {
+        cfg,
+        local: spawned.local,
+        remote: resolved[0].0,
+        app_in: spawned.app_in,
+        weight_cmd: spawned.weight_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

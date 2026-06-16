@@ -32,12 +32,12 @@ const MAX_URL_MILLIS: u64 = 7 * 24 * 3600 * 1000;
 /// `buffer-max`, `rtt`, `rtt-min`, `rtt-max`, `reorder-buffer`,
 /// `session-timeout`, `keepalive` / `keepalive-interval`; `rtt-multiplier`,
 /// `bandwidth` (kbps), `min-retries`, `max-retries`, `aes-type` (128/256),
-/// `virt-src-port`, `virt-dst-port`, `profile`, `cname`, `secret`. `buffer` sets
-/// both buffer bounds and `rtt` sets both RTT bounds; an explicit `-min`/`-max`
-/// always wins regardless of URL order (a deliberate simplification of libRIST's
-/// order-dependent parsing). Parameters for later workpackages (`weight`,
-/// `key-rotation`, `username`, `password`, `compression`) are accepted and
-/// ignored for now.
+/// `key-rotation`, `virt-src-port`, `virt-dst-port`, `profile`, `cname`,
+/// `secret`, `username`, `password`, `compression` (0/1), and the multicast
+/// `miface`/`ttl`/`source`. `buffer` sets both buffer bounds and `rtt` sets both
+/// RTT bounds; an explicit `-min`/`-max` always wins regardless of URL order (a
+/// deliberate simplification of libRIST's order-dependent parsing). `weight` is
+/// accepted but ignored until weighted bonding lands.
 ///
 /// # Errors
 /// Returns [`Error::Url`] for an unsupported scheme, a missing port, or a query
@@ -223,6 +223,28 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
         }
     }
     apply_enum_params(cfg, q)?;
+    apply_string_and_feature_params(cfg, q)?;
+    Ok(())
+}
+
+/// Folds the string- and feature-valued query parameters (`cname`, `secret`, the
+/// multicast `miface`/`ttl`/`source`, the EAP-SRP `username`/`password`,
+/// `compression`, `key-rotation`) into `cfg`. Split out of [`apply_query`] to keep
+/// that function under the line cap. `weight` is accepted but ignored until
+/// weighted bonding gives it a home.
+fn apply_string_and_feature_params(
+    cfg: &mut Config,
+    q: &HashMap<String, String>,
+) -> Result<(), Error> {
+    let int = |key: &str| -> Result<Option<i64>, Error> {
+        match q.get(key) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| Error::Url(format!("{key}={v:?} is not an integer"))),
+        }
+    };
     if let Some(v) = q.get("cname") {
         cfg.cname = Some(v.clone());
     }
@@ -241,9 +263,23 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
     if let Some(v) = q.get("source") {
         cfg.multicast_source = Some(v.clone());
     }
-    // `weight`, `key-rotation`, `username`, `password`, `compression` are known to
-    // libRIST but have no Config home until bonding (WP5) / Main (WP3) / Advanced
-    // (WP4); they are accepted and ignored for now.
+    // EAP-SRP credentials (Main profile): `username`/`password` enable
+    // authentication together, mirroring `with_srp_credentials`.
+    if let Some(v) = q.get("username") {
+        cfg.srp_username = Some(v.clone());
+    }
+    if let Some(v) = q.get("password") {
+        cfg.srp_password = Some(v.clone());
+    }
+    // `compression` (libRIST: enable LZ4, Advanced only) is `0`/`1`; any non-zero
+    // value enables it. `Config::validate` rejects it off the Advanced profile.
+    if let Some(n) = int("compression")? {
+        cfg.compression = n != 0;
+    }
+    // `key-rotation`: packets per PSK nonce before rotating (Main/Advanced).
+    if let Some(n) = int("key-rotation")? {
+        cfg.key_rotation = clamp_u32("key-rotation", n)?;
+    }
     Ok(())
 }
 
@@ -387,6 +423,25 @@ mod tests {
         assert_eq!((cfg.min_retries, cfg.max_retries), (8, 40));
         assert_eq!((cfg.rtt_min, cfg.rtt_max), (ms(33), ms(33)));
         assert_eq!(cfg.virt_src_port, 1971);
+    }
+
+    #[test]
+    fn auth_compression_and_key_rotation_fold_in() {
+        // Advanced so `compression` and the SRP credentials all validate.
+        let (_, cfg) = parse_url(
+            "rist://h:5000?profile=2&username=alice&password=s%40cret&compression=1&key-rotation=1000",
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.srp_username.as_deref(), Some("alice"));
+        assert_eq!(cfg.srp_password.as_deref(), Some("s@cret")); // percent-decoded
+        assert!(cfg.compression);
+        assert_eq!(cfg.key_rotation, 1000);
+        cfg.validate().expect("parsed config must validate");
+
+        // compression=0 disables it (and then it is valid on any profile).
+        let (_, off) = parse_url("rist://h:5000?compression=0", Config::default()).unwrap();
+        assert!(!off.compression);
     }
 
     #[test]

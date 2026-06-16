@@ -107,6 +107,10 @@ pub struct Config {
     pub secret: Option<String>,
     /// AES key size when `secret` is set; defaults to 256-bit if unset.
     pub aes_key_bits: Option<AesKeyBits>,
+    /// Packets to encrypt under one PSK nonce before rotating to a fresh nonce and
+    /// re-derived key (Main/Advanced). `0` (the default) rotates only at the
+    /// per-nonce reuse-limit ceiling, matching libRIST.
+    pub key_rotation: u32,
     /// EAP-SRP username (Main profile); enables authentication when set with
     /// `srp_password`. A sender authenticates as this user; a listener verifies it.
     pub srp_username: Option<String>,
@@ -173,6 +177,7 @@ impl Default for Config {
             cname: None,
             secret: None,
             aes_key_bits: None,
+            key_rotation: 0,
             srp_username: None,
             srp_password: None,
             compression: false,
@@ -262,6 +267,14 @@ impl Config {
     #[must_use]
     pub fn with_aes_key_bits(mut self, bits: AesKeyBits) -> Config {
         self.aes_key_bits = Some(bits);
+        self
+    }
+
+    /// Sets the PSK key-rotation interval in packets (Main/Advanced); `0` (the
+    /// default) rotates only at the per-nonce reuse-limit ceiling.
+    #[must_use]
+    pub fn with_key_rotation(mut self, packets: u32) -> Config {
+        self.key_rotation = packets;
         self
     }
 
@@ -587,10 +600,14 @@ mod tests {
             .with_profile(Profile::Main)
             .with_secret("hunter2")
             .with_aes_key_bits(AesKeyBits::Aes128)
+            .with_key_rotation(2048)
+            .with_session_timeout(Duration::from_millis(3000))
             .with_nack_type(NackType::Bitmask);
         assert_eq!(c.profile, Profile::Main);
         assert_eq!(c.secret.as_deref(), Some("hunter2"));
         assert_eq!(c.aes_key_bits, Some(AesKeyBits::Aes128));
+        assert_eq!(c.key_rotation, 2048);
+        assert_eq!(c.session_timeout, Duration::from_millis(3000));
         assert_eq!(c.nack_type, NackType::Bitmask);
     }
 }

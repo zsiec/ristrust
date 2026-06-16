@@ -36,3 +36,6 @@ pub use rist_codec::crypto::AesKeyBits;
 /// The sender's retransmission-pacing mode, re-exported for use with
 /// [`Config::with_congestion_control`].
 pub use rist_core::flow::CongestionMode;
+
+/// The crate version (`CARGO_PKG_VERSION`), e.g. for an SDES tool tag or logging.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

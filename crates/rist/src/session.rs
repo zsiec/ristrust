@@ -192,7 +192,7 @@ fn build_psk_keys(cfg: &Config) -> io::Result<PskKeys> {
     };
     let bits = cfg.aes_key_bits.unwrap_or(AesKeyBits::Aes256);
     let to_io = |e: crypto::CryptoError| io::Error::new(io::ErrorKind::InvalidInput, e.to_string());
-    let send = crypto::Key::new(secret.as_bytes(), bits, 0, false).map_err(to_io)?;
+    let send = crypto::Key::new(secret.as_bytes(), bits, cfg.key_rotation, false).map_err(to_io)?;
     let recv = crypto::Decryptor::new(secret.as_bytes(), bits).map_err(to_io)?;
     Ok((Some(send), Some(recv), bits == AesKeyBits::Aes256))
 }

@@ -294,3 +294,64 @@ async fn adv_recovers_heavy_loss_via_arq() {
     sender.close().await.expect("close sender");
     receiver.close().await.expect("close receiver");
 }
+
+#[tokio::test]
+async fn flow_attribute_round_trips_to_callback() {
+    // The Advanced sender writes a flow attribute; the receiver surfaces it through
+    // its configured callback (a fire-and-forget side channel, not media).
+    let attr = br#"{"name":"cam-1","gop":60}"#.to_vec();
+    let attrs = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let sink = Arc::clone(&attrs);
+    let rx_cfg =
+        adv_cfg().with_flow_attr_callback(move |json| sink.lock().expect("sink").push(json));
+    let (mut receiver, port) = listen_free(&rx_cfg).await;
+    let sender = dial_with(&format!("127.0.0.1:{port}"), adv_cfg(), &TokioRuntime)
+        .await
+        .expect("dial the Advanced receiver");
+
+    // One media payload warms the session, then the flow attribute is written.
+    sender.send(b"adv-media-warmup").await.expect("send media");
+    let got = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("media did not arrive")
+        .expect("session open");
+    assert_eq!(got.as_ref(), b"adv-media-warmup");
+    sender
+        .write_flow_attribute(&attr)
+        .await
+        .expect("write flow attr");
+
+    // The attribute arrives out-of-band; poll until the callback has fired.
+    for _ in 0..100 {
+        if !attrs.lock().expect("recv").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Scope the guard so it is dropped before the awaits below.
+    {
+        let got = attrs.lock().expect("recv");
+        assert_eq!(
+            got.len(),
+            1,
+            "expected exactly one flow attribute, got {got:?}"
+        );
+        assert_eq!(got[0], attr, "flow attribute payload mismatch");
+    }
+
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
+async fn write_flow_attribute_rejected_off_advanced() {
+    // A non-Advanced sender has no flow-attribute channel.
+    let sender = dial_with("127.0.0.1:5000", Config::default(), &TokioRuntime)
+        .await
+        .expect("dial simple");
+    assert!(matches!(
+        sender.write_flow_attribute(b"x").await,
+        Err(rist::Error::FlowAttrUnsupported)
+    ));
+    sender.close().await.ok();
+}

@@ -265,10 +265,12 @@ pub(crate) fn encode_feedback(
             }
             // SR (the lead), Keepalive, ExtSeq, and LinkQuality are not flow
             // feedback effects on the Simple wire; the flow never emits them here.
+            // FlowAttribute is Advanced-only — the Simple wire has no such message.
             Feedback::SenderReport { .. }
             | Feedback::Keepalive
             | Feedback::ExtSeq { .. }
-            | Feedback::LinkQuality { .. } => {}
+            | Feedback::LinkQuality { .. }
+            | Feedback::FlowAttribute { .. } => {}
         }
     }
     pkts.extend(nacks);

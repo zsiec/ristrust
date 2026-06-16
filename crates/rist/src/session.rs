@@ -47,6 +47,9 @@ pub(crate) struct SenderSpawned {
     /// Runtime `(path, weight)` commands for a bonded sender (`Sender::set_weight`);
     /// `None` for non-bonded senders.
     pub(crate) weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
+    /// Application flow attributes to transmit (`Sender::write_flow_attribute`);
+    /// `Some` only on an Advanced sender.
+    pub(crate) flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -279,6 +282,7 @@ pub(crate) fn build_sender(
             local,
             app_in,
             weight_cmd: None,
+            flow_attr_cmd: None,
             close,
             stats,
             task,
@@ -292,6 +296,8 @@ pub(crate) fn build_sender(
         let main = build_main_codec(cfg, ssrc)?;
         let adv = build_adv_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
+        // The fire-and-forget flow-attribute send channel (rare, small depth).
+        let (attr_tx, attr_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = AdvDriver::spawn_sender(
             flow,
             socket,
@@ -304,11 +310,14 @@ pub(crate) fn build_sender(
             start_seq,
             eap,
             RateControl::from_config(cfg),
+            cfg.on_flow_attr.clone(),
+            attr_rx,
         );
         return Ok(SenderSpawned {
             local,
             app_in,
             weight_cmd: None,
+            flow_attr_cmd: Some(attr_tx),
             close,
             stats,
             task,
@@ -335,6 +344,7 @@ pub(crate) fn build_sender(
         local,
         app_in,
         weight_cmd: None,
+        flow_attr_cmd: None,
         close,
         stats,
         task,
@@ -406,6 +416,7 @@ pub(crate) fn build_receiver(
             cfg.keepalive_interval,
             eap,
             build_lqm_emitter(cfg),
+            cfg.on_flow_attr.clone(),
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -522,6 +533,7 @@ pub(crate) fn build_bonded_sender(
         local,
         app_in,
         weight_cmd: Some(weight_tx),
+        flow_attr_cmd: None,
         close,
         stats,
         task,

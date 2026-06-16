@@ -297,10 +297,12 @@ impl MainCodec {
                         padding: Bytes::new(),
                     }));
                 }
+                // FlowAttribute is Advanced-only; the Main wire never emits it.
                 Feedback::SenderReport { .. }
                 | Feedback::Keepalive
                 | Feedback::ExtSeq { .. }
-                | Feedback::LinkQuality { .. } => {}
+                | Feedback::LinkQuality { .. }
+                | Feedback::FlowAttribute { .. } => {}
             }
         }
         pkts.extend(nacks);

@@ -28,6 +28,7 @@ use rist_core::wire::Feedback;
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
+use crate::config::FlowAttrCallback;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::peer::Peer;
@@ -96,6 +97,13 @@ pub(crate) struct AdvDriver {
     lqm: Option<LqmEmitter>,
     /// The sender's rate controller, when a rate callback is configured.
     rate: Option<RateControl>,
+
+    // --- flow attributes (TR-06-3 §5.3.7) ---
+    /// Invoked with each inbound flow-attribute payload, when a callback is set.
+    on_flow_attr: Option<FlowAttrCallback>,
+    /// Application-submitted flow attributes to transmit (sender only; `None` on a
+    /// receiver), from `Sender::write_flow_attribute`.
+    flow_attr_cmd: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl AdvDriver {
@@ -113,6 +121,8 @@ impl AdvDriver {
         start_seq: u32,
         eap: Option<EapRole>,
         rate: Option<RateControl>,
+        on_flow_attr: Option<FlowAttrCallback>,
+        flow_attr_rx: mpsc::Receiver<Vec<u8>>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -146,6 +156,8 @@ impl AdvDriver {
             authed,
             lqm: None,
             rate,
+            on_flow_attr,
+            flow_attr_cmd: Some(flow_attr_rx),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -163,6 +175,7 @@ impl AdvDriver {
         keepalive: Duration,
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
+        on_flow_attr: Option<FlowAttrCallback>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -196,6 +209,8 @@ impl AdvDriver {
             authed,
             lqm,
             rate: None,
+            on_flow_attr,
+            flow_attr_cmd: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -237,6 +252,16 @@ impl AdvDriver {
                         self.drain(now).await;
                     }
                     None => break,
+                },
+                // Application-submitted flow attributes (fire-and-forget, gated on
+                // auth like media): frame one Type=Control CI=0x8001 datagram and
+                // send it directly, outside the flow core.
+                attr = recv_flow_attr(&mut self.flow_attr_cmd, self.authed) => match attr {
+                    Some(json) => {
+                        let now = self.now();
+                        self.send_flow_attr(&json, now).await;
+                    }
+                    None => self.flow_attr_cmd = None,
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();
@@ -328,6 +353,13 @@ impl AdvDriver {
                         Feedback::LinkQuality { lqm } => {
                             if let Some(r) = &mut self.rate {
                                 r.handle(&lqm);
+                            }
+                        }
+                        // A flow attribute is a host-level side channel: invoke the
+                        // application callback, never the flow core.
+                        Feedback::FlowAttribute { json } => {
+                            if let Some(cb) = &self.on_flow_attr {
+                                cb.call(json);
                             }
                         }
                         // Drop inbound Advanced RTT-echo *requests* so the flow
@@ -459,6 +491,19 @@ impl AdvDriver {
         }
     }
 
+    /// Frames and sends one fire-and-forget flow-attribute control datagram
+    /// (TR-06-3 §5.3.7) to the peer. A no-op until the peer's media address is known.
+    async fn send_flow_attr(&mut self, json: &[u8], now: Timestamp) {
+        let Some(dst) = self.peer.media() else { return };
+        let sock = self.socket.clone();
+        match self.adv.flow_attr_datagram(json, adv_ctrl_ts(now)) {
+            Ok(bytes) => {
+                let _ = sock.send(&bytes, dst).await;
+            }
+            Err(e) => tracing::debug!("rist: adv flow-attr encode failed: {e}"),
+        }
+    }
+
     /// Sends the GRE RTCP handshake + the Advanced keepalive, marking greeted.
     async fn greet(&mut self, now: Timestamp) {
         self.send_handshake(now).await;
@@ -555,6 +600,18 @@ async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, authed: bool
         return std::future::pending().await;
     }
     match app_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next application flow attribute to transmit; never resolves while
+/// unauthenticated (held like media) or when there is no flow-attribute channel.
+async fn recv_flow_attr(ch: &mut Option<mpsc::Receiver<Vec<u8>>>, authed: bool) -> Option<Vec<u8>> {
+    if !authed {
+        return std::future::pending().await;
+    }
+    match ch {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

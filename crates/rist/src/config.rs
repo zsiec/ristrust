@@ -37,6 +37,30 @@ impl std::fmt::Debug for RateCallback {
     }
 }
 
+/// An Advanced-profile flow-attribute receive callback (TR-06-3 §5.3.7): invoked
+/// with each inbound flow-attribute payload (opaque UTF-8 JSON by convention). The
+/// callback runs on the session task, so it must not block.
+#[derive(Clone)]
+pub struct FlowAttrCallback(Arc<dyn Fn(Vec<u8>) + Send + Sync>);
+
+impl FlowAttrCallback {
+    /// Wraps `f` as a flow-attribute callback.
+    pub fn new(f: impl Fn(Vec<u8>) + Send + Sync + 'static) -> FlowAttrCallback {
+        FlowAttrCallback(Arc::new(f))
+    }
+
+    /// Invokes the callback with one received flow-attribute payload.
+    pub(crate) fn call(&self, json: Vec<u8>) {
+        (self.0)(json);
+    }
+}
+
+impl std::fmt::Debug for FlowAttrCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlowAttrCallback(..)")
+    }
+}
+
 /// The RIST profile (wire dialect) a session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -146,6 +170,10 @@ pub struct Config {
     /// Link Quality Message drives the AIMD controller and this is invoked with the
     /// new encoder bit-rate target. `None` (default) disables rate control.
     pub on_rate_adapt: Option<RateCallback>,
+    /// The Advanced-profile flow-attribute receive callback (TR-06-3 §5.3.7).
+    /// Invoked with each inbound flow-attribute payload. `None` (default) ignores
+    /// them. Advanced profile only.
+    pub on_flow_attr: Option<FlowAttrCallback>,
     /// Network interface name for multicast (libRIST `miface`): a sender's egress
     /// interface and a receiver's group-membership interface. `None` (the default)
     /// lets the OS choose. Consulted only when the bind (receiver) or destination
@@ -199,6 +227,7 @@ impl Default for Config {
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
+            on_flow_attr: None,
             interface: None,
             multicast_ttl: 0,
             multicast_source: None,
@@ -402,6 +431,17 @@ impl Config {
         self
     }
 
+    /// Sets the Advanced-profile flow-attribute receive callback (TR-06-3 §5.3.7):
+    /// `f` is invoked with each inbound flow-attribute payload. Advanced profile only.
+    #[must_use]
+    pub fn with_flow_attr_callback(
+        mut self,
+        f: impl Fn(Vec<u8>) + Send + Sync + 'static,
+    ) -> Config {
+        self.on_flow_attr = Some(FlowAttrCallback::new(f));
+        self
+    }
+
     /// Sets the canonical name (RTCP SDES CNAME).
     #[must_use]
     pub fn with_cname(mut self, cname: impl Into<String>) -> Config {
@@ -458,6 +498,15 @@ impl Config {
         // Fail closed: reject features a profile would silently ignore.
         let unsupported =
             |feature, profile| ConfigError::ProfileFeatureUnsupported { feature, profile };
+        // Flow attributes are an Advanced-only control message.
+        if self.on_flow_attr.is_some() && self.profile != Profile::Advanced {
+            let name = if self.profile == Profile::Simple {
+                "Simple"
+            } else {
+                "Main"
+            };
+            return Err(unsupported("flow attributes", name));
+        }
         match self.profile {
             Profile::Simple => {
                 if self.secret.is_some() {
@@ -619,6 +668,22 @@ mod tests {
             Config::default()
                 .with_profile(Profile::Main)
                 .with_null_packet_deletion(true)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_gates_flow_attr_callback_to_advanced() {
+        // A flow-attribute callback is an Advanced-only control channel.
+        assert!(matches!(
+            Config::default().with_flow_attr_callback(|_| {}).validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(
+            Config::default()
+                .with_profile(Profile::Advanced)
+                .with_flow_attr_callback(|_| {})
                 .validate()
                 .is_ok()
         );

@@ -305,11 +305,14 @@ impl Flow {
                 }
             }
             // SenderReport (WP4 offset refinement), Keepalive (host liveness),
-            // ExtSeq / LinkQuality (codec / host concerns): no core handler.
+            // ExtSeq / LinkQuality / FlowAttribute (codec / host concerns): no core
+            // handler. The host intercepts LinkQuality and FlowAttribute before the
+            // core; reaching here means they were not, so count and ignore them.
             Feedback::SenderReport { .. }
             | Feedback::Keepalive
             | Feedback::ExtSeq { .. }
-            | Feedback::LinkQuality { .. } => {
+            | Feedback::LinkQuality { .. }
+            | Feedback::FlowAttribute { .. } => {
                 self.stats.ignored_feedback += 1;
             }
         }

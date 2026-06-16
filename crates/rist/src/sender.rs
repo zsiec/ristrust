@@ -19,6 +19,7 @@ pub struct Sender {
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
+    flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -66,6 +67,23 @@ impl Sender {
         };
         let index = u8::try_from(path).map_err(|_| Error::InvalidAddr(format!("path {path}")))?;
         cmd.send((index, weight)).await.map_err(|_| Error::Closed)
+    }
+
+    /// Sends one Advanced-profile flow attribute (TR-06-3 §5.3.7): an opaque,
+    /// fire-and-forget control message (UTF-8 JSON by convention) the peer surfaces
+    /// through its `Config::with_flow_attr_callback`. Held until the peer is known
+    /// and (under EAP-SRP) authenticated, like media.
+    ///
+    /// # Errors
+    /// Returns [`Error::FlowAttrUnsupported`] on a non-Advanced sender, or
+    /// [`Error::Closed`] if the session has shut down.
+    pub async fn write_flow_attribute(&self, json: &[u8]) -> Result<(), Error> {
+        let Some(cmd) = &self.flow_attr_cmd else {
+            return Err(Error::FlowAttrUnsupported);
+        };
+        cmd.send(json.to_vec())
+            .await
+            .map_err(|_| self.close.error())
     }
 
     /// Submits one media payload for reliable transmission. Applies back-pressure
@@ -134,6 +152,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         remote,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        flow_attr_cmd: spawned.flow_attr_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -180,6 +199,7 @@ pub async fn dial_bonded_with(
         remote: peers[0].0,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        flow_attr_cmd: spawned.flow_attr_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -232,6 +252,7 @@ pub async fn dial_bonded_weighted_with(
         remote: resolved[0].0,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        flow_attr_cmd: spawned.flow_attr_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

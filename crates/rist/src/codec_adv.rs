@@ -336,6 +336,9 @@ impl AdvCodec {
                     vec![Feedback::LinkQuality { lqm }]
                 }
             }
+            adv::CI_FLOW_ATTR => vec![Feedback::FlowAttribute {
+                json: body.to_vec(),
+            }],
             _ => Vec::new(),
         };
         Ok(out)
@@ -406,9 +409,13 @@ impl AdvCodec {
                     );
                     out.push(self.frame_control(&body, ts)?);
                 }
+                // Not emitted by the flow on the encode path: SenderReport/ExtSeq/
+                // LinkQuality are host/codec concerns, and a flow attribute is sent
+                // directly via `encode_flow_attr`, never as a flow-emitted feedback.
                 Feedback::SenderReport { .. }
                 | Feedback::ExtSeq { .. }
-                | Feedback::LinkQuality { .. } => {}
+                | Feedback::LinkQuality { .. }
+                | Feedback::FlowAttribute { .. } => {}
             }
         }
         Ok(out)
@@ -456,6 +463,18 @@ impl AdvCodec {
     pub(crate) fn lqm_datagram(&mut self, lqm: &[u8; 44], ts: u32) -> Result<Vec<u8>, CodecError> {
         let mut body = Vec::new();
         adv::build_control(&mut body, adv::CI_LQM_GLOBAL, lqm);
+        self.frame_control(&body, ts)
+    }
+
+    /// Frames one fire-and-forget flow-attribute control datagram (TR-06-3 §5.3.7,
+    /// control index `0x8001`) carrying the opaque `json` payload.
+    pub(crate) fn flow_attr_datagram(
+        &mut self,
+        json: &[u8],
+        ts: u32,
+    ) -> Result<Vec<u8>, CodecError> {
+        let mut body = Vec::new();
+        adv::build_flow_attr(&mut body, json);
         self.frame_control(&body, ts)
     }
 }

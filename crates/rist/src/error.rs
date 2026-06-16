@@ -109,6 +109,11 @@ pub enum Error {
     /// session was torn down. Surfaced by `send`/`recv` once the session ends.
     #[error("rist: authentication failed")]
     Auth,
+    /// [`Sender::write_flow_attribute`](crate::Sender::write_flow_attribute) was
+    /// called on a non-Advanced sender. Flow attributes (TR-06-3 §5.3.7) are an
+    /// Advanced-profile control message.
+    #[error("rist: flow attributes require the Advanced profile")]
+    FlowAttrUnsupported,
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

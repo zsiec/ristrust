@@ -152,4 +152,14 @@ pub enum Feedback {
         /// The 44-byte Link Quality Message.
         lqm: [u8; 44],
     },
+
+    /// A VSF TR-06-3 §5.3.7 Advanced-profile flow attribute: an opaque, fire-and-
+    /// forget UTF-8 JSON blob the application attaches to the flow (Advanced control
+    /// index `0x8001`). Like [`Feedback::LinkQuality`] it is a host concern, not
+    /// `flow` input — the host intercepts an inbound one to invoke the application
+    /// callback, and originates outbound ones outside the flow core.
+    FlowAttribute {
+        /// The opaque flow-attribute payload (UTF-8 JSON by convention).
+        json: Vec<u8>,
+    },
 }

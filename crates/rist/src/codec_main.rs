@@ -90,6 +90,22 @@ pub(crate) enum Decoded {
     Ignored,
 }
 
+/// The inner result of [`MainCodec::main_region`]: either the decoded inner region
+/// (with whether it is RTCP feedback vs RTP media, and whether it was encrypted) or a
+/// terminal [`Decoded`] for a VSF control datagram (buffer-negotiation / ignored).
+/// Splitting parse+decrypt+unwrap from media decoding lets it serve as a probe (it
+/// never advances the media decoder), which [`MainCodec::feedback_cname`] relies on.
+enum Region {
+    /// The decoded inner packet region.
+    Inner {
+        region: Bytes,
+        is_rtcp: bool,
+        encrypted: bool,
+    },
+    /// A VSF control datagram that carries no media or feedback.
+    Control(Decoded),
+}
+
 /// The stateful Main-profile codec for one direction of a flow. It carries the GRE
 /// sequence counter, the PSK send [`crypto::Key`] and receive [`crypto::Decryptor`],
 /// the media decoder's widening references, and the reduced-header virtual ports. It
@@ -121,6 +137,10 @@ pub(crate) struct MainCodec {
     ssrc: u32,
     /// The SDES canonical name for outbound compound RTCP.
     cname: String,
+    /// The peer's SDES CNAME most recently decoded from an ENCRYPTED RTCP datagram,
+    /// for NAT-rebind re-association. Learned only behind a keyed session (a forger or
+    /// cleartext sender cannot supply it); the host reads it via [`MainCodec::peer_cname`].
+    last_rx_cname: Option<String>,
 }
 
 impl MainCodec {
@@ -151,6 +171,35 @@ impl MainCodec {
             npd_enabled,
             ssrc,
             cname,
+            last_rx_cname: None,
+        }
+    }
+
+    /// The peer's SDES CNAME learned from an encrypted RTCP datagram, if any (the
+    /// host trusts it only behind an authenticated session). Used to validate a NAT
+    /// source-port rebind re-association: a migrated tuple must present the same CNAME.
+    pub(crate) fn peer_cname(&self) -> Option<&str> {
+        self.last_rx_cname.as_deref()
+    }
+
+    /// Probes a candidate datagram for the SDES CNAME of an ENCRYPTED RTCP feedback
+    /// packet, returning it only when the datagram decrypts under the session key and
+    /// is RTCP feedback carrying a CNAME. It never advances the media decoder, so it
+    /// is a safe probe; a forger with no key, a cleartext sender, or a media datagram
+    /// all yield `None`. Used to gate a NAT source-port rebind re-association.
+    pub(crate) fn feedback_cname(&mut self, b: &[u8]) -> Option<String> {
+        match self.main_region(b) {
+            Ok(Region::Inner {
+                region,
+                is_rtcp: true,
+                encrypted: true,
+            }) => rtcp::parse_compound(&region).ok().and_then(|pkts| {
+                pkts.into_iter().find_map(|p| match p {
+                    RtcpPacket::Sdes(s) => Some(s.cname),
+                    _ => None,
+                })
+            }),
+            _ => None,
         }
     }
 
@@ -639,28 +688,51 @@ impl MainCodec {
     /// preceded by an EXTSEQ packet. Arbitrary, truncated, or short-ciphertext input
     /// returns an error and never panics.
     pub(crate) fn decode(&mut self, b: &[u8], nack_ref: u32) -> Result<Decoded, CodecError> {
+        match self.main_region(b)? {
+            Region::Control(d) => Ok(d),
+            Region::Inner {
+                region,
+                is_rtcp: true,
+                encrypted,
+            } => Ok(Decoded::Feedback(
+                self.decode_feedback_main(&region, nack_ref, encrypted)?,
+            )),
+            Region::Inner {
+                region,
+                is_rtcp: false,
+                ..
+            } => Ok(Decoded::Media(self.decode_media_main(&region)?)),
+        }
+    }
+
+    /// Parses, (per the GRE K bit) decrypts, and unwraps the VSF + reduced framing of
+    /// a Main datagram, demuxing the inner packet — returning the inner region, whether
+    /// it is RTCP feedback, and whether it was encrypted, or a terminal [`Decoded`] for
+    /// a VSF control datagram. It does NO media decoding (never advances `self.dec`), so
+    /// it is safe to call as a probe ([`feedback_cname`](Self::feedback_cname)); it does
+    /// mutate the receive `Decryptor`'s per-packet key/nonce state, but harmlessly —
+    /// every genuine decode re-derives that from its own GRE header.
+    fn main_region(&mut self, b: &[u8]) -> Result<Region, CodecError> {
         let (hdr, off) = gre::Header::parse(b)?;
         let is_vsf = match hdr.prot_type {
             gre::PROTO_REDUCED => false,
             gre::PROTO_VSF => true,
             _ => return Err(CodecError::Main("GRE protocol type is not reduced")),
         };
+        let encrypted = hdr.has_key;
         let mut region = self.unwrap_region(&hdr, &b[off..])?;
 
         // Unwrap the version-2 VSF proto (now decrypted). Only REDUCED carries
-        // media/RTCP we decode; keepalive/buffer-negotiation subtypes are accepted
-        // without action rather than dropped.
+        // media/RTCP we decode; keepalive/buffer-negotiation subtypes carry no flow input.
         if is_vsf {
             let (vsf, vn) = gre::VsfProto::parse(&region)?;
             if vsf.subtype == gre::VSF_SUBTYPE_BUFFER_NEGOTIATION {
-                // The peer's recovery-buffer advertisement (GRE v2); surfaced to the
-                // host, which feeds the sender-max to the flow's auto-scaler.
-                return Ok(Decoded::BufferNeg(gre::BufferNegotiation::parse(
-                    &region[vn..],
-                )?));
+                return Ok(Region::Control(Decoded::BufferNeg(
+                    gre::BufferNegotiation::parse(&region[vn..])?,
+                )));
             }
             if vsf.subtype != gre::VSF_SUBTYPE_REDUCED {
-                return Ok(Decoded::Ignored);
+                return Ok(Region::Control(Decoded::Ignored));
             }
             region = region.slice(vn..);
         }
@@ -674,13 +746,11 @@ impl MainCodec {
             return Err(CodecError::Main("inner packet too short to demux"));
         }
         let pt = region[RTCP_PT_BYTE_LOW] & 0x7F;
-        if (RTCP_PT_MIN..=RTCP_PT_MAX).contains(&pt) {
-            Ok(Decoded::Feedback(
-                self.decode_feedback_main(&region, nack_ref)?,
-            ))
-        } else {
-            Ok(Decoded::Media(self.decode_media_main(&region)?))
-        }
+        Ok(Region::Inner {
+            region,
+            is_rtcp: (RTCP_PT_MIN..=RTCP_PT_MAX).contains(&pt),
+            encrypted,
+        })
     }
 
     /// Returns the region after the GRE header, decrypted when a key is present. A
@@ -752,9 +822,10 @@ impl MainCodec {
     /// Parses a compound RTCP datagram into normalized feedback, folding each EXTSEQ
     /// packet's high 16 bits into the NACK packets that follow it (TR-06-2 §8.4).
     fn decode_feedback_main(
-        &self,
+        &mut self,
         region: &Bytes,
         nack_ref: u32,
+        encrypted: bool,
     ) -> Result<Vec<Feedback>, CodecError> {
         let pkts = rtcp::parse_compound(region)?;
         let mut out = Vec::new();
@@ -797,6 +868,11 @@ impl MainCodec {
                 }),
                 RtcpPacket::LinkQualityReport(pk) => {
                     out.push(Feedback::LinkQuality { lqm: pk.lqm });
+                }
+                RtcpPacket::Sdes(s) if encrypted => {
+                    // Record the peer's CNAME only from an ENCRYPTED RTCP envelope, so a
+                    // forger or cleartext sender cannot supply the NAT-rebind identity key.
+                    self.last_rx_cname = Some(s.cname.clone());
                 }
                 _ => {}
             }

@@ -758,19 +758,15 @@ pub(crate) fn build_injected_bonded(
 }
 
 /// Rejects a reversed-role session on a profile/feature it does not support.
-/// Reversed-role transport currently rides the Main-profile GRE substrate and has
-/// no return channel for the EAP-SRP handshake, so credentials are refused.
+/// Reversed-role transport rides the Main-profile GRE substrate; EAP-SRP is
+/// supported (the single bidirectional GRE socket carries the handshake once the
+/// peer is learned — the media sender is the authenticatee whichever side dials),
+/// but DTLS is not.
 fn require_reversible_main(cfg: &Config) -> io::Result<()> {
     if cfg.profile != Profile::Main {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "rist: reversed-role transport currently requires the Main profile",
-        ));
-    }
-    if cfg.srp_username.is_some() || cfg.srp_password.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: reversed-role transport does not support EAP-SRP authentication",
         ));
     }
     // Reversed-role peer-learning (a sender that waits, or a receiver that dials an
@@ -788,7 +784,8 @@ fn require_reversible_main(cfg: &Config) -> io::Result<()> {
 /// Builds a reversed-role **listener-sender**: a media *sender* that binds the
 /// well-known port and waits, learning the receiver's address from its inbound
 /// announcement (the caller-receiver), then sending media to it. Media is held
-/// until that address is known. Main profile only; PSK supported, EAP-SRP refused.
+/// until that address is known. Main profile only; PSK and EAP-SRP supported (the
+/// sender is the authenticatee and opens its EAPOL-START once it learns the caller).
 ///
 /// # Errors
 /// As [`build_listener_sender`]'s profile/feature checks, or an I/O bind error.
@@ -807,6 +804,7 @@ pub(crate) fn build_listener_sender(
     // Empty peer: the caller-receiver's announcement teaches us where to send.
     let peer = Peer::new(dur_to_micros(cfg.session_timeout));
     let codec = build_main_codec(cfg, ssrc)?;
+    let eap = build_eap_role(cfg, true)?; // the media sender is the authenticatee
     let (oob_tx, oob_rx) = mpsc::channel(16);
     let (app_in, close, stats, task) = MainDriver::spawn_sender(
         flow,
@@ -818,7 +816,7 @@ pub(crate) fn build_listener_sender(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         start_seq,
-        None, // reversed-role refuses EAP-SRP
+        eap,
         RateControl::from_config(cfg),
         oob_rx,
         None, // FEC + reversed-role deferred
@@ -838,7 +836,8 @@ pub(crate) fn build_listener_sender(
 /// Builds a reversed-role **caller-receiver**: a media *receiver* that dials the
 /// listening sender's well-known address, announcing itself (an immediate
 /// greeting + keepalives) so the sender learns where to send, then receiving media.
-/// Main profile only; PSK supported, EAP-SRP refused.
+/// Main profile only; PSK and EAP-SRP supported (the receiver is the authenticator,
+/// verifying the listener-sender once that side opens the handshake).
 ///
 /// # Errors
 /// As [`build_caller_receiver`]'s profile/feature checks, or an I/O bind error.
@@ -855,6 +854,7 @@ pub(crate) fn build_caller_receiver(
     // The sender's address is known up front (we dialled it), so we announce to it.
     let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
     let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
+    let eap = build_eap_role(cfg, false)?; // the media receiver is the authenticator
     let (oob_tx, oob_rx) = mpsc::channel(16);
     let (data_out, close, stats, task) = MainDriver::spawn_receiver(
         flow,
@@ -865,7 +865,7 @@ pub(crate) fn build_caller_receiver(
         flow_mac(DEFAULT_FLOW_SSRC),
         bitmask_of(cfg),
         cfg.keepalive_interval,
-        None, // reversed-role refuses EAP-SRP
+        eap,
         build_lqm_emitter(cfg),
         oob_tx,
         None, // FEC + reversed-role deferred

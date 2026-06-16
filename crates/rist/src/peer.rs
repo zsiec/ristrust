@@ -91,11 +91,30 @@ impl Peer {
         self.seen = true;
     }
 
+    /// Replaces the peer's media and RTCP return addresses with `addr` — the
+    /// deliberate override (unlike `learn_*`, which lock the first source) that
+    /// migrates the tuple during a NAT source-port rebind recovery. The caller MUST
+    /// gate it on forcing a fresh authentication (see the driver re-association path).
+    /// It does NOT touch the liveness clock: the migration alone is not evidence of
+    /// liveness, and the held re-auth that follows is bounded by the driver's re-auth
+    /// deadline, not `last_seen` (which the migrated tuple's own datagrams would
+    /// otherwise keep refreshing on a still-unproven peer).
+    pub(crate) fn rebind(&mut self, addr: SocketAddr) {
+        self.media = Some(addr);
+        self.rtcp = Some(addr);
+    }
+
+    /// Whether the peer was seen at least once and has now been silent longer than
+    /// `d`. The "dormant candidate" test for NAT-rebind re-association.
+    pub(crate) fn silent_for(&self, now: Timestamp, d: Micros) -> bool {
+        self.seen && (now - self.last_seen) > d
+    }
+
     /// Whether the peer was once seen but has now been silent for longer than the
     /// session timeout — the condition for tearing the session down. A peer that
     /// has never been seen does not expire (the session is still forming).
     pub(crate) fn expired(&self, now: Timestamp) -> bool {
-        self.seen && (now - self.last_seen) > self.timeout
+        self.silent_for(now, self.timeout)
     }
 }
 

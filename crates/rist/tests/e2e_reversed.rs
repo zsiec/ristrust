@@ -95,12 +95,39 @@ async fn listen_sender_rejects_non_main() {
 }
 
 #[tokio::test]
-async fn dial_receiver_rejects_eap_srp() {
-    // Reversed-role has no return channel for the EAP-SRP handshake.
-    let cfg = rev_cfg(None).with_srp_credentials("user", "pass");
-    let err = dial_receiver("127.0.0.1:5000", cfg).await.unwrap_err();
-    assert!(
-        matches!(err, Error::Io(_)),
-        "expected the EAP-SRP rejection"
-    );
+async fn reversed_role_delivers_authenticated_srp() {
+    // EAP-SRP over the reversed-role transport: the listener-sender is the
+    // authenticatee and opens its EAPOL-START once the caller-receiver (the
+    // authenticator) announces itself; media is held until the handshake
+    // authenticates, then flows in order. Combined with a PSK so the
+    // authenticated + encrypted reversed-role path is exercised end to end.
+    const N: usize = 30;
+    let cfg = rev_cfg(Some("rev-psk")).with_srp_credentials("rist", "reversed");
+    let (sender, port) = listen_sender_free(&cfg).await;
+    let mut receiver = dial_receiver(&format!("127.0.0.1:{port}"), cfg.clone())
+        .await
+        .expect("dial the listener-sender");
+
+    let send_task = tokio::spawn(async move {
+        for i in 0..N {
+            sender
+                .send(format!("rev-srp-{i:03}").as_bytes())
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        sender
+    });
+
+    for i in 0..N {
+        let got = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session stayed open");
+        assert_eq!(got.as_ref(), format!("rev-srp-{i:03}").as_bytes());
+    }
+
+    let sender = send_task.await.expect("send task");
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
 }

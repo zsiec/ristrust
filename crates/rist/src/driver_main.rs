@@ -21,7 +21,7 @@ use rist_codec::rtcp::{
     EmptyReceiverReport, LinkQualityReport, Packet as RtcpPacket, SenderReport,
 };
 use rist_codec::{fec_header, gre, rtp};
-use rist_core::clock::Timestamp;
+use rist_core::clock::{Micros, Timestamp};
 use rist_core::fec::{Direction, Recovered};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
@@ -102,6 +102,29 @@ impl EapRole {
             EapRole::Authenticator(a) => a.session_key(),
         }
     }
+
+    /// Restarts the role's state machine for a forced re-authentication (a NAT
+    /// source-port rebind), discarding the prior session so a fresh handshake must
+    /// complete before the migrated peer is trusted again.
+    pub(crate) fn restart(&mut self) {
+        match self {
+            EapRole::Authenticatee(a) => a.restart(),
+            EapRole::Authenticator(a) => a.restart(),
+        }
+    }
+
+    /// Re-opens the handshake after a peer migration, returning the opening frame's
+    /// wire bytes: an authenticatee re-emits EAPOL-START, an authenticator re-issues
+    /// the identity request. Call [`restart`](Self::restart) first.
+    pub(crate) fn reopen(&mut self) -> Vec<u8> {
+        let frame = match self {
+            EapRole::Authenticatee(a) => a.start(),
+            EapRole::Authenticator(a) => a.start(),
+        };
+        let mut w = Vec::new();
+        frame.append_to(&mut w);
+        w
+    }
 }
 
 /// The EAP identifier ristrust stamps on its unsolicited passphrase push (bit 6
@@ -109,8 +132,9 @@ impl EapRole {
 const PASSPHRASE_PUSH_ID: u8 = 0x40;
 
 /// The Main-profile session driver, run as one detached task per flow.
-// Justification: `sender`/`greeted`/`authed`/`bitmask` are independent per-flow
-// flags, not a state enum; collapsing them would obscure the pump's control flow.
+// Justification: `sender`/`greeted`/`authed`/`bitmask`/`ever_authed`/`reauthing`
+// are independent per-flow flags, not a state enum; collapsing them would obscure
+// the pump's control flow.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MainDriver {
     /// Whether this is the media-originating (sender) half.
@@ -162,6 +186,27 @@ pub(crate) struct MainDriver {
     /// configured, else only once the EAP-SRP handshake succeeds. A sender holds
     /// outbound media until this is set.
     authed: bool,
+    /// The peer's RTCP SDES CNAME, recorded only from ENCRYPTED RTCP under an
+    /// authenticated SRP session — the identity a migrated tuple must re-present to
+    /// trigger a NAT source-port rebind re-association. `None` until learned.
+    peer_cname: Option<String>,
+    /// Whether the EAP-SRP handshake has succeeded at least once. Distinguishes an
+    /// initial auth failure (tear the session down) from a re-auth failure (hold
+    /// media), and gates CNAME-based re-association on a proven identity.
+    ever_authed: bool,
+    /// Whether a NAT-rebind / in-band EAP re-authentication is in flight: media is
+    /// held (`authed` false) on the as-yet-unproven tuple and the ordinary
+    /// session-timeout teardown is suppressed until [`reauth_deadline`](Self::reauth_deadline).
+    reauthing: bool,
+    /// When an unfinished re-auth tears the session down (a stalled or forged
+    /// handshake must not pin the session open). Meaningful only while `reauthing`.
+    reauth_deadline: Timestamp,
+    /// Whether the authenticatee's opening EAPOL-START has been sent. A dialing
+    /// sender knows its peer at startup and starts immediately; a listener-sender
+    /// has no peer yet and starts only once it learns the caller (this latch fires
+    /// the START exactly once). A forced re-auth re-opens via [`start_reauth`](Self::start_reauth),
+    /// not this latch.
+    eap_start_sent: bool,
 
     // --- source adaptation (TR-06-4 Part 1) ---
     /// The receiver's Link Quality Message emitter, when source adaptation is on.
@@ -237,6 +282,11 @@ impl MainDriver {
             greeted: false,
             eap,
             authed,
+            peer_cname: None,
+            ever_authed: false,
+            reauthing: false,
+            reauth_deadline: Timestamp::ZERO,
+            eap_start_sent: false,
             lqm: None,
             rate,
             fec,
@@ -298,6 +348,11 @@ impl MainDriver {
             greeted: false,
             eap,
             authed,
+            peer_cname: None,
+            ever_authed: false,
+            reauthing: false,
+            reauth_deadline: Timestamp::ZERO,
+            eap_start_sent: false,
             lqm,
             rate: None,
             fec,
@@ -361,6 +416,11 @@ impl MainDriver {
             greeted: false,
             eap,
             authed,
+            peer_cname: None,
+            ever_authed: false,
+            reauthing: false,
+            reauth_deadline: Timestamp::ZERO,
+            eap_start_sent: false,
             lqm,
             rate: None,
             fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
@@ -398,9 +458,10 @@ impl MainDriver {
             let now = self.now();
             self.greet(now).await;
         }
-        if self.sender {
-            self.send_eap_start().await;
-        }
+        // Open the EAP-SRP handshake (authenticatee only). A dialing sender knows its
+        // peer up front and starts now; a listener-sender has no peer yet and starts
+        // later, once `on_recv` learns the caller.
+        self.maybe_start_eap().await;
 
         let mut keepalive = tokio::time::interval(self.keepalive);
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -439,15 +500,35 @@ impl MainDriver {
                 },
                 _ = keepalive.tick() => {
                     let now = self.now();
-                    if self.eap.as_ref().is_some_and(EapRole::failed) {
+                    // An initial auth failure (the handshake never succeeded) tears the
+                    // session down. A failure AFTER a prior success is a re-auth failure,
+                    // handled in `handle_eap` (media held, re-auth window armed) — not here.
+                    if !self.ever_authed && self.eap.as_ref().is_some_and(EapRole::failed) {
                         self.close.set_auth();
                         break;
                     }
-                    if self.peer.expired(now) {
+                    // Liveness / teardown. While a NAT-rebind / in-band re-auth holds media
+                    // on an as-yet-unproven tuple, the ordinary expiry teardown is SUPPRESSED
+                    // so a genuine re-auth gets its full round-trip (the rebind only fires once
+                    // the old tuple is already dormant, so expiry would otherwise fire on the
+                    // very next tick). The window is bounded by `reauth_deadline`: a stalled or
+                    // forged re-auth that cannot complete must not pin the session open, so when
+                    // it lapses the session IS torn down (a fresh reconnect re-establishes it).
+                    if self.reauthing {
+                        if now > self.reauth_deadline {
+                            self.reauthing = false;
+                            self.close.set_session_timeout();
+                            break;
+                        }
+                    } else if self.peer.expired(now) {
                         self.close.set_session_timeout();
                         break;
                     }
-                    if self.peer.media().is_some() {
+                    // Periodic keepalive — suppressed during a re-auth: the peer tuple is
+                    // unproven then, so a full RTCP/GRE beacon must not be reflected to it
+                    // (a forged trigger carrying a victim source could otherwise turn this
+                    // into a reflection); only the EAPOL handshake is sent to it.
+                    if self.peer.media().is_some() && !self.reauthing {
                         // The periodic RTCP handshake keeps the session alive and
                         // re-authenticated; the GRE MAC beacon mirrors libRIST's
                         // separate keepalive timer.
@@ -481,7 +562,19 @@ impl MainDriver {
     /// routes it as a keepalive (control), media, or feedback.
     async fn on_recv(&mut self, src: SocketAddr, data: &[u8]) {
         let now = self.now();
+
+        // NAT source-port rebind recovery: on an authenticated SRP session a datagram
+        // from a source other than the established peer is consumed here (re-associated
+        // under a forced EAP-SRP re-auth, or ignored) instead of through first-source
+        // learning. A no-op for a non-SRP, still-forming, or established-peer datagram.
+        if self.maybe_reassociate(now, src, data).await {
+            return;
+        }
+
+        // One GRE socket carries both directions, so the peer's media and RTCP
+        // addresses are the one learned address.
         self.peer.learn_media(src);
+        self.peer.learn_rtcp(src);
         self.peer.observe(now);
 
         // On first learning the peer (the receiver's case), greet it so libRIST
@@ -489,12 +582,16 @@ impl MainDriver {
         if !self.greeted && self.peer.media().is_some() {
             self.greet(now).await;
         }
+        // A listener-sender authenticatee opens its EAP-SRP handshake only once it has
+        // learned the calling peer (a no-op after the first START, or for a non-sender
+        // / non-authenticatee / already-started flow).
+        self.maybe_start_eap().await;
 
         // EAP-SRP authentication frames (GRE EAPOL, never encrypted) drive the
         // handshake, not the flow. Copy the payload out so the codec borrow ends
         // before driving the role.
         if let Some(eap_payload) = self.codec.peek_eapol(data).map(<[u8]>::to_vec) {
-            self.handle_eap(&eap_payload).await;
+            self.handle_eap(now, &eap_payload).await;
             self.drain(now).await;
             return;
         }
@@ -575,6 +672,20 @@ impl MainDriver {
                 Ok(Decoded::BufferNeg(bn)) => self.on_buffer_neg(bn),
                 Ok(Decoded::Ignored) => {}
                 Err(e) => crate::driver::decode_warn(self.codec.has_psk(), "main", &e),
+            }
+        }
+
+        // Record the peer's CNAME for NAT-rebind re-association, but only under a
+        // proven SRP identity. The codec surfaces it solely from ENCRYPTED RTCP SDES
+        // (so a keyless forger or a cleartext sender cannot supply one); this gate
+        // additionally requires an established per-peer SRP identity so a shared-PSK
+        // or plaintext CNAME is never trusted as identity.
+        if self.srp_authed() {
+            let cname = self.codec.peer_cname().map(str::to_owned);
+            if let Some(c) = cname
+                && self.peer_cname.as_deref() != Some(c.as_str())
+            {
+                self.peer_cname = Some(c);
             }
         }
         self.drain(now).await;
@@ -883,8 +994,13 @@ impl MainDriver {
         }
     }
 
-    /// Opens the EAP-SRP handshake by sending EAPOL-START (authenticatee only).
-    async fn send_eap_start(&mut self) {
+    /// Opens the EAP-SRP handshake by sending EAPOL-START once the peer is known
+    /// (authenticatee only): a no-op until the calling peer is learned, after the
+    /// START has already been sent, or for a non-authenticatee flow.
+    async fn maybe_start_eap(&mut self) {
+        if self.eap_start_sent || self.peer.media().is_none() {
+            return;
+        }
         let start = match self.eap.as_mut() {
             Some(EapRole::Authenticatee(a)) => {
                 let mut w = Vec::new();
@@ -894,13 +1010,16 @@ impl MainDriver {
             _ => return,
         };
         self.send_eapol(&start).await;
+        self.eap_start_sent = true;
     }
 
     /// Drives the EAP role with one received EAP payload, transmitting any reply
-    /// frame and updating the authenticated gate. On the transition to
-    /// authenticated it re-keys the data channel to the SRP session key and pushes
-    /// it to the peer.
-    async fn handle_eap(&mut self, payload: &[u8]) {
+    /// frame and updating the authenticated gate. On the transition to authenticated
+    /// it re-keys the data channel to the SRP session key and pushes it to the peer;
+    /// on a regression out of (or failure after) a prior success it holds media and
+    /// arms the bounded re-auth window — a forged or replayed EAPOL frame can then
+    /// force at most a bounded media gap, never deliver under an unproven tuple.
+    async fn handle_eap(&mut self, now: Timestamp, payload: &[u8]) {
         let was_authed = self.authed;
         let Some(role) = self.eap.as_mut() else {
             return;
@@ -910,12 +1029,148 @@ impl MainDriver {
         if let Some(wire) = reply {
             self.send_eapol(&wire).await;
         }
-        // On the transition to authenticated, key the data channel. A configured
-        // PSK secret keys it already (SRP only gates); with no PSK, re-key to the
-        // SRP session key K and push it to the peer.
-        if self.authed && !was_authed && !self.codec.has_psk() {
-            self.on_authenticated().await;
+        if self.authed {
+            // SUCCESS — the initial handshake, or a NAT-rebind / in-band re-auth just
+            // completed and re-proved the migrated tuple.
+            self.ever_authed = true;
+            self.reauthing = false; // any re-auth is now proven and complete
+            // On the transition to authenticated, key the data channel. A configured
+            // PSK secret keys it already (SRP only gates); with no PSK, re-key to the
+            // SRP session key K and push it to the peer.
+            if !was_authed && !self.codec.has_psk() {
+                self.on_authenticated().await;
+            }
+        } else if self.eap.as_ref().is_some_and(EapRole::failed) {
+            // A terminal failure. An initial failure (never authenticated) tears the
+            // session down — the keepalive tick observes `failed()` and closes with
+            // an auth error. A failure AFTER a prior success is a re-auth failure
+            // (e.g. a forged/replayed re-auth that could not complete): HOLD media and
+            // keep the re-auth window armed so the tick abandons it at the deadline.
+            if self.ever_authed {
+                self.hold_for_reauth(now);
+            }
+        } else if was_authed && self.ever_authed {
+            // Mid-handshake after a prior success: an inbound EAPOL frame regressed the
+            // role OUT of SUCCESS — the genuine peer re-proving after its own
+            // rebind/restart (it honors a peer-driven identity request / START), or a
+            // forged frame spoofed from the peer's tuple (EAPOL is never encrypted).
+            // Either way the tuple is no longer proven: drop `authed` and hold media
+            // until the fresh handshake re-proves identity.
+            self.hold_for_reauth(now);
         }
+    }
+
+    /// Holds media (drops `authed`) and arms the bounded re-auth window if it is not
+    /// already armed: the keepalive tick tears the session down at the deadline if the
+    /// handshake does not complete, so a stalled or forged re-auth cannot wedge it.
+    fn hold_for_reauth(&mut self, now: Timestamp) {
+        self.authed = false;
+        if !self.reauthing {
+            self.reauthing = true;
+            self.reauth_deadline = now + self.reauth_timeout();
+        }
+    }
+
+    /// The window a NAT-rebind / in-band re-auth is given to complete before the
+    /// session is torn down: the larger of the recovery buffer (held media that
+    /// outlives it is lost anyway) and 4 keepalive intervals (a floor comfortably
+    /// above a handshake round-trip and the keepalive-granularity poll that enforces
+    /// it). Mirrors libRIST issue #188's bounded re-auth.
+    fn reauth_timeout(&self) -> Micros {
+        let four_ka =
+            Micros::from_micros(i64::try_from(4 * self.keepalive.as_micros()).unwrap_or(i64::MAX));
+        self.flow.config().recovery_buffer_max.max(four_ka)
+    }
+
+    /// Whether this side's tuple is locked to an authenticated per-peer SRP identity:
+    /// an EAP role is configured and has authenticated at least once. Keys off
+    /// `ever_authed`, not the live `authed`, so a foreign source stays gated during an
+    /// in-flight re-auth (when `authed` is briefly false). A shared PSK (no EAP role)
+    /// or plaintext session never qualifies.
+    fn srp_authed(&self) -> bool {
+        self.eap.is_some() && self.ever_authed
+    }
+
+    /// Whether `src` is the established peer's tuple. One Main GRE socket carries both
+    /// directions, so the peer's media and RTCP addresses are the one learned address.
+    fn same_source(&self, src: SocketAddr) -> bool {
+        self.peer.media() == Some(src) || self.peer.rtcp() == Some(src)
+    }
+
+    /// Whether `data` is a valid NAT-rebind re-association trigger: an ENCRYPTED RTCP
+    /// feedback that decrypts under the per-peer session key AND carries the
+    /// established peer's CNAME (libRIST's identity key). The decrypt-under-key is the
+    /// unforgeable proof a keyless forger cannot produce; requiring it to be ENCRYPTED
+    /// means a cleartext sender or cleartext-RTCP forger cannot supply a matching CNAME
+    /// either. EAPOL (forgeable, never encrypted) and media (no SDES) are NOT triggers.
+    /// It does not advance the media decoder, so probing a then-dropped datagram cannot
+    /// corrupt media decode. (A replay carries the genuine CNAME, so this alone does not
+    /// prove liveness — the forced re-auth that follows does; this gate only blocks the
+    /// trivially-forged triggers.)
+    fn reassoc_trigger(&mut self, data: &[u8]) -> bool {
+        if self.peer_cname.is_none() {
+            return false;
+        }
+        let got = self.codec.feedback_cname(data);
+        got.is_some() && got.as_deref() == self.peer_cname.as_deref()
+    }
+
+    /// Re-opens the EAP-SRP handshake to the (migrated) peer: the authenticatee
+    /// re-emits EAPOL-START, the authenticator re-issues the identity request. Call
+    /// [`EapRole::restart`] first so the opening frame starts a fresh handshake.
+    async fn start_reauth(&mut self) {
+        let Some(role) = self.eap.as_mut() else {
+            return;
+        };
+        let frame = role.reopen();
+        self.send_eapol(&frame).await;
+    }
+
+    /// Recovers a NAT source-port rebind on an authenticated single-flow EAP-SRP
+    /// session (mirrors libRIST issue #188, SRP only). Returns `true` when it has
+    /// consumed the datagram — by starting a re-association OR by ignoring a datagram
+    /// from a source other than the established peer — so the caller skips
+    /// first-source-wins learning; `false` lets the normal path run (non-SRP,
+    /// still-forming, or the established peer).
+    ///
+    /// A tuple change is honored only when an authenticated per-peer SRP session is in
+    /// force, the established tuple is DORMANT (silent > 2× the keepalive interval),
+    /// and the datagram is a valid trigger (see [`reassoc_trigger`](Self::reassoc_trigger)).
+    /// Even then the new tuple is NOT trusted: the address migrates and a fresh
+    /// EAP-SRP re-auth is forced with media held (`authed` dropped), bounded by
+    /// [`reauth_deadline`](Self::reauth_deadline) — so a replay or forger that cannot
+    /// finish the handshake never receives media and cannot pin the session open.
+    /// Under plaintext or a shared PSK (no per-peer SRP) the CNAME and source are
+    /// forgeable, so a rebind is left to the caller-side socket-rebind path.
+    ///
+    /// Scope: single-flow Main only. A demultiplexing [`MultiReceiver`](crate::multi)
+    /// keys flows by source address, so a rebinding peer surfaces there as a NEW flow
+    /// (a fresh handshake) and the old flow ages out on timeout.
+    async fn maybe_reassociate(&mut self, now: Timestamp, src: SocketAddr, data: &[u8]) -> bool {
+        if !self.srp_authed() || self.peer.rtcp().is_none() || self.same_source(src) {
+            return false;
+        }
+        // 2× the keepalive interval == the default session timeout: the established
+        // tuple must already be dormant before a foreign source can claim it.
+        let dormant =
+            Micros::from_micros(i64::try_from(2 * self.keepalive.as_micros()).unwrap_or(i64::MAX));
+        if self.reauthing || !self.peer.silent_for(now, dormant) || !self.reassoc_trigger(data) {
+            return true; // re-auth in flight, peer still live, or not a valid trigger: ignore
+        }
+        self.peer.rebind(src);
+        self.reauthing = true;
+        self.reauth_deadline = now + self.reauth_timeout();
+        self.authed = false; // hold media until the migrated tuple re-proves identity
+        if let Some(role) = self.eap.as_mut() {
+            role.restart();
+        }
+        self.start_reauth().await;
+        tracing::info!(
+            target: crate::logging::SESSION,
+            %src,
+            "rist: main nat-rebind: peer moved; forcing EAP-SRP re-auth"
+        );
+        true
     }
 
     /// On reaching authentication with no configured PSK, re-keys the data channel

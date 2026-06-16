@@ -46,6 +46,8 @@ pub(crate) struct SenderSpawned {
     pub(crate) app_in: mpsc::Sender<Bytes>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
+    /// The live stats snapshot, read by the handle's `stats()`.
+    pub(crate) stats: crate::stats::StatsCell,
     /// The driver task handle (aborted on close).
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
@@ -58,6 +60,8 @@ pub(crate) struct ReceiverSpawned {
     pub(crate) data_out: mpsc::Receiver<Bytes>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
+    /// The live stats snapshot, read by the handle's `stats()`.
+    pub(crate) stats: crate::stats::StatsCell,
     /// The driver task handle (aborted on close).
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
@@ -252,7 +256,7 @@ pub(crate) fn build_sender(
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
-        let (app_in, close, task) = MainDriver::spawn_sender(
+        let (app_in, close, stats, task) = MainDriver::spawn_sender(
             flow,
             socket,
             peer,
@@ -269,6 +273,7 @@ pub(crate) fn build_sender(
             local,
             app_in,
             close,
+            stats,
             task,
         });
     }
@@ -280,7 +285,7 @@ pub(crate) fn build_sender(
         let main = build_main_codec(cfg, ssrc)?;
         let adv = build_adv_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
-        let (app_in, close, task) = AdvDriver::spawn_sender(
+        let (app_in, close, stats, task) = AdvDriver::spawn_sender(
             flow,
             socket,
             peer,
@@ -297,6 +302,7 @@ pub(crate) fn build_sender(
             local,
             app_in,
             close,
+            stats,
             task,
         });
     }
@@ -306,7 +312,7 @@ pub(crate) fn build_sender(
     let mut rtcp = remote;
     rtcp.set_port(remote.port().wrapping_add(1));
     let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, rtcp);
-    let (app_in, close, task) = Driver::spawn_sender(
+    let (app_in, close, stats, task) = Driver::spawn_sender(
         flow,
         socket,
         peer,
@@ -321,6 +327,7 @@ pub(crate) fn build_sender(
         local,
         app_in,
         close,
+        stats,
         task,
     })
 }
@@ -352,7 +359,7 @@ pub(crate) fn build_receiver(
         let bound = socket.local()?;
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
-        let (data_out, close, task) = MainDriver::spawn_receiver(
+        let (data_out, close, stats, task) = MainDriver::spawn_receiver(
             flow,
             socket,
             peer,
@@ -368,6 +375,7 @@ pub(crate) fn build_receiver(
             local: bound,
             data_out,
             close,
+            stats,
             task,
         });
     }
@@ -378,7 +386,7 @@ pub(crate) fn build_receiver(
         let main = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let adv = build_adv_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
-        let (data_out, close, task) = AdvDriver::spawn_receiver(
+        let (data_out, close, stats, task) = AdvDriver::spawn_receiver(
             flow,
             socket,
             peer,
@@ -394,13 +402,14 @@ pub(crate) fn build_receiver(
             local: bound,
             data_out,
             close,
+            stats,
             task,
         });
     }
 
     let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
     let bound = socket.media_local()?;
-    let (data_out, close, task) = Driver::spawn_receiver(
+    let (data_out, close, stats, task) = Driver::spawn_receiver(
         flow,
         socket,
         peer,
@@ -414,6 +423,7 @@ pub(crate) fn build_receiver(
         local: bound,
         data_out,
         close,
+        stats,
         task,
     })
 }
@@ -489,7 +499,7 @@ pub(crate) fn build_bonded_sender(
             "rist: bonded sender needs at least one remote",
         )
     })?;
-    let (app_in, close, task) = BondedDriver::spawn_sender(
+    let (app_in, close, stats, task) = BondedDriver::spawn_sender(
         flow,
         group,
         paths,
@@ -503,6 +513,7 @@ pub(crate) fn build_bonded_sender(
         local,
         app_in,
         close,
+        stats,
         task,
     })
 }
@@ -553,7 +564,7 @@ pub(crate) fn build_bonded_receiver(
             "rist: bonded receiver needs at least one local address",
         )
     })?;
-    let (data_out, close, task) = BondedDriver::spawn_receiver(
+    let (data_out, close, stats, task) = BondedDriver::spawn_receiver(
         flow,
         group,
         paths,
@@ -566,6 +577,7 @@ pub(crate) fn build_bonded_receiver(
         local: bound,
         data_out,
         close,
+        stats,
         task,
     })
 }

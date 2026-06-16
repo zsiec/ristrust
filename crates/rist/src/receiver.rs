@@ -17,6 +17,7 @@ pub struct Receiver {
     local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
     close: crate::driver::CloseFlag,
+    stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -33,6 +34,14 @@ impl Receiver {
     /// Never; the result is for API symmetry (the address is resolved at listen).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         Ok(self.local)
+    }
+
+    /// A snapshot of this receiver's counters (the receiver-half fields are
+    /// populated; sender-half fields are zero). Updated continuously by the session
+    /// task.
+    #[must_use]
+    pub fn stats(&self) -> crate::Stats {
+        self.stats.snapshot()
     }
 
     /// Reads the next in-order, ARQ-recovered media payload.
@@ -88,6 +97,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         local: spawned.local,
         data_out: spawned.data_out,
         close: spawned.close,
+        stats: spawned.stats,
         task: spawned.task,
     })
 }
@@ -129,6 +139,7 @@ pub async fn listen_bonded_with(
         local: spawned.local,
         data_out: spawned.data_out,
         close: spawned.close,
+        stats: spawned.stats,
         task: spawned.task,
     })
 }

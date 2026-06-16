@@ -81,6 +81,52 @@ async fn simple_loopback_delivers_all_payloads_in_order() {
     receiver.close().await.expect("close receiver");
 }
 
+#[tokio::test]
+async fn stats_reflect_a_clean_transfer() {
+    const N: usize = 20;
+    let cfg = Config::default().with_buffer(Duration::from_millis(100));
+    let (mut receiver, port) = listen_free(&cfg).await;
+    let sender = dial(&format!("127.0.0.1:{port}"), cfg.clone())
+        .await
+        .expect("dial the receiver");
+
+    let send_task = tokio::spawn(async move {
+        for i in 0..N {
+            sender
+                .send(format!("stats-{i:03}").as_bytes())
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sender
+    });
+    for i in 0..N {
+        tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session stayed open");
+    }
+    // Give the final drain a moment to publish the latest snapshot.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sender = send_task.await.expect("send task");
+    let tx = sender.stats();
+    let rx = receiver.stats();
+    assert!(tx.sent >= N as u64, "sender sent {} (< {N})", tx.sent);
+    assert!(
+        rx.delivered >= N as u64,
+        "receiver delivered {} (< {N})",
+        rx.delivered
+    );
+    assert_eq!(rx.lost, 0, "a clean transfer must lose nothing");
+    // Cross-role fields are zero: a sender has no delivered, a receiver no sent.
+    assert_eq!(tx.delivered, 0);
+    assert_eq!(rx.sent, 0);
+
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
 /// A [`Runtime`] whose UDP sockets drop a fraction of *forward media* datagrams
 /// (those larger than [`MEDIA_THRESHOLD`]). RTCP compounds — NACKs, echoes,
 /// reports — are small and pass through losslessly, so the receiver's NACK

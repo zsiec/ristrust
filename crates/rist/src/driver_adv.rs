@@ -32,6 +32,7 @@ use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::peer::Peer;
 use crate::socket::MainSocket;
+use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
 const RECV_BUF: usize = 65_536;
@@ -73,6 +74,8 @@ pub(crate) struct AdvDriver {
     bitmask: bool,
     /// Records why the task exited, read by the handle once its channel closes.
     close: CloseFlag,
+    /// The latest stats snapshot published to the handle's `stats()`.
+    stats: StatsCell,
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
@@ -110,10 +113,16 @@ impl AdvDriver {
         start_seq: u32,
         eap: Option<EapRole>,
         rate: Option<RateControl>,
-    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Sender<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let authed = eap.is_none();
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = AdvDriver {
             sender: true,
             flow,
@@ -126,6 +135,7 @@ impl AdvDriver {
             adv,
             bitmask,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
@@ -137,7 +147,7 @@ impl AdvDriver {
             lqm: None,
             rate,
         };
-        (tx, close, tokio::spawn(driver.run()))
+        (tx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns an Advanced-profile receiver driver.
@@ -156,11 +166,13 @@ impl AdvDriver {
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
+        StatsCell,
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let authed = eap.is_none();
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = AdvDriver {
             sender: false,
             flow,
@@ -173,6 +185,7 @@ impl AdvDriver {
             adv,
             bitmask,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
@@ -184,7 +197,7 @@ impl AdvDriver {
             lqm,
             rate: None,
         };
-        (rx, close, tokio::spawn(driver.run()))
+        (rx, close, stats, tokio::spawn(driver.run()))
     }
 
     #[allow(clippy::cast_possible_truncation)] // session durations fit u64 micros
@@ -372,6 +385,7 @@ impl AdvDriver {
                 return;
             }
         }
+        self.stats.publish(self.flow.stats());
     }
 
     /// Sends each drained feedback effect as an Advanced Type=4 control datagram.

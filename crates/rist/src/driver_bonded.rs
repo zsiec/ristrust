@@ -36,6 +36,7 @@ use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::peer::Peer;
 use crate::socket::MainSocket;
+use crate::stats::StatsCell;
 
 /// The largest datagram a path reader will receive.
 const RECV_BUF: usize = 65_536;
@@ -105,6 +106,8 @@ pub(crate) struct BondedDriver {
     bitmask: bool,
     /// Records why the task exited, read by the handle once its channel closes.
     close: CloseFlag,
+    /// The latest stats snapshot published to the handle's `stats()`.
+    stats: StatsCell,
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
@@ -135,9 +138,15 @@ impl BondedDriver {
         bitmask: bool,
         keepalive: Duration,
         start_seq: u32,
-    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Sender<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = BondedDriver {
             sender: true,
             flow,
@@ -149,13 +158,14 @@ impl BondedDriver {
             mac,
             bitmask,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
             data_out: None,
             learned_ssrc: None,
         };
-        (tx, close, tokio::spawn(driver.run()))
+        (tx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns a bonded receiver driver merging media from `paths` (each
@@ -173,10 +183,12 @@ impl BondedDriver {
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
+        StatsCell,
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = BondedDriver {
             sender: false,
             flow,
@@ -188,13 +200,14 @@ impl BondedDriver {
             mac,
             bitmask,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
             learned_ssrc: None,
         };
-        (rx, close, tokio::spawn(driver.run()))
+        (rx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -380,6 +393,7 @@ impl BondedDriver {
                 return; // the application Receiver was dropped
             }
         }
+        self.stats.publish(self.flow.stats());
     }
 
     /// Encodes and transmits one media packet on path `i`, if it is addressed and

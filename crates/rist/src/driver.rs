@@ -29,6 +29,7 @@ use crate::codec::{self, MediaDecoder};
 use crate::error::Error;
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
+use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
 const RECV_BUF: usize = 65_536;
@@ -103,6 +104,8 @@ pub(crate) struct Driver {
     keepalive: Duration,
     /// Records why the task exited, read by the handle once its channel closes.
     close: CloseFlag,
+    /// The latest stats snapshot published to the handle's `stats()`.
+    stats: StatsCell,
 
     // --- sender half ---
     /// Application payloads to transmit (`None` on a receiver).
@@ -144,9 +147,15 @@ impl Driver {
         keepalive: Duration,
         start_seq: u32,
         rate: Option<RateControl>,
-    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Sender<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = Driver {
             sender: true,
             flow,
@@ -156,6 +165,7 @@ impl Driver {
             timers: HashMap::new(),
             keepalive,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
@@ -167,7 +177,7 @@ impl Driver {
             lqm: None,
             rate,
         };
-        (tx, close, tokio::spawn(driver.run()))
+        (tx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns a receiver driver that learns the sender's return
@@ -186,10 +196,12 @@ impl Driver {
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
+        StatsCell,
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let close = CloseFlag::default();
+        let stats = StatsCell::default();
         let driver = Driver {
             sender: false,
             flow,
@@ -199,6 +211,7 @@ impl Driver {
             timers: HashMap::new(),
             keepalive,
             close: close.clone(),
+            stats: stats.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
@@ -210,7 +223,7 @@ impl Driver {
             lqm,
             rate: None,
         };
-        (rx, close, tokio::spawn(driver.run()))
+        (rx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -357,6 +370,7 @@ impl Driver {
                 return; // the application Receiver was dropped.
             }
         }
+        self.stats.publish(self.flow.stats());
     }
 
     /// Encodes and transmits one media datagram to the peer's media address.

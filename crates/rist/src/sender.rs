@@ -19,6 +19,7 @@ pub struct Sender {
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
     close: crate::driver::CloseFlag,
+    stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -41,6 +42,13 @@ impl Sender {
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    /// A snapshot of this sender's counters (the sender-half fields are populated;
+    /// receiver-half fields are zero). Updated continuously by the session task.
+    #[must_use]
+    pub fn stats(&self) -> crate::Stats {
+        self.stats.snapshot()
     }
 
     /// Submits one media payload for reliable transmission. Applies back-pressure
@@ -109,6 +117,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         remote,
         app_in: spawned.app_in,
         close: spawned.close,
+        stats: spawned.stats,
         task: spawned.task,
     })
 }
@@ -151,6 +160,7 @@ pub async fn dial_bonded_with(
         remote: remotes[0],
         app_in: spawned.app_in,
         close: spawned.close,
+        stats: spawned.stats,
         task: spawned.task,
     })
 }

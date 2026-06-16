@@ -23,6 +23,29 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// Assembles a `Receiver` from its parts — used by [`listen`] and by the
+    /// [`MultiReceiver`](crate::multi) to surface a demultiplexed per-flow receiver.
+    #[allow(clippy::too_many_arguments)] // a constructor over the handle's parts
+    pub(crate) fn from_parts(
+        cfg: Config,
+        local: SocketAddr,
+        data_out: mpsc::Receiver<Bytes>,
+        oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
+        close: crate::driver::CloseFlag,
+        stats: crate::stats::StatsCell,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Receiver {
+        Receiver {
+            cfg,
+            local,
+            data_out,
+            oob_out,
+            close,
+            stats,
+            task,
+        }
+    }
+
     /// The configuration this receiver was created with.
     #[must_use]
     pub fn config(&self) -> &Config {

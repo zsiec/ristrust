@@ -22,7 +22,7 @@ use crate::bonding::{self, Group};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::MainCodec;
 use crate::config::{Config, NackType, Profile};
-use crate::driver::Driver;
+use crate::driver::{Driver, SimpleInbound};
 use crate::driver_adv::AdvDriver;
 use crate::driver_bonded::{BondedDriver, PathParts};
 use crate::driver_main::{EapRole, MainDriver};
@@ -498,6 +498,42 @@ pub(crate) fn build_receiver(
         stats,
         task,
     })
+}
+
+/// Builds one **injected** Simple-profile receiver flow for a [`MultiReceiver`]:
+/// a per-flow [`Driver`] driven by an external demultiplexer rather than its own
+/// socket reader. `socket` is the shared bound socket (cloned per flow for sends);
+/// `ssrc` is the flow's demux SSRC (tagged into its reports); `local` is the shared
+/// bound media address (reported as the per-flow receiver's `local_addr`). Returns
+/// the inbound sender the demuxer feeds and the application-facing [`Receiver`].
+pub(crate) fn build_injected_simple(
+    socket: crate::socket::SimpleSocket,
+    cfg: &Config,
+    ssrc: u32,
+    local: SocketAddr,
+) -> (mpsc::Sender<SimpleInbound>, crate::receiver::Receiver) {
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, ssrc, 0));
+    let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    let (in_tx, data_out, close, stats, task) = Driver::spawn_injected_receiver(
+        flow,
+        socket,
+        peer,
+        ssrc,
+        cname_of(cfg),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        build_lqm_emitter(cfg),
+    );
+    let receiver = crate::receiver::Receiver::from_parts(
+        cfg.clone(),
+        local,
+        data_out,
+        None,
+        close,
+        stats,
+        task,
+    );
+    (in_tx, receiver)
 }
 
 /// Rejects a reversed-role session on a profile/feature it does not support.

@@ -274,6 +274,60 @@ impl Driver {
         (rx, close, stats, tokio::spawn(driver.run()))
     }
 
+    /// Builds and spawns an **injected** Simple receiver driver: it owns no socket
+    /// reader — a [`MultiReceiver`](crate::multi) demultiplexer feeds its inbound
+    /// channel (the returned [`SimpleInbound`] sender) from one shared socket read,
+    /// while this driver decodes, recovers, and writes its feedback back out the
+    /// shared socket to its own learned peer. `ssrc` is the flow's demux SSRC (tagged
+    /// into its reports). Returns the inbound sender plus the usual receiver handles.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_injected_receiver(
+        flow: Flow,
+        socket: SimpleSocket,
+        peer: Peer,
+        ssrc: u32,
+        cname: String,
+        bitmask: bool,
+        keepalive: Duration,
+        lqm: Option<LqmEmitter>,
+    ) -> (
+        mpsc::Sender<SimpleInbound>,
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = Driver {
+            sender: false,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            close: close.clone(),
+            stats: stats.clone(),
+            app_in: None,
+            highest_sent: 0,
+            ssrc,
+            cname,
+            bitmask,
+            data_out: Some(tx),
+            mdec: MediaDecoder::new(),
+            learned_ssrc: None,
+            lqm,
+            rate: None,
+            fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
+            inbound: Some(in_rx),
+            reader: None, // the demultiplexer feeds `inbound`
+        };
+        (in_tx, rx, close, stats, tokio::spawn(driver.run()))
+    }
+
     /// The current session-relative instant.
     #[allow(clippy::cast_possible_truncation)] // session durations fit u64 micros
     fn now(&self) -> Timestamp {

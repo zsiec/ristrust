@@ -127,6 +127,12 @@ pub struct Stats {
     /// (counted instead of panicking so additive wire variants can never crash
     /// the core).
     pub ignored_feedback: u64,
+    /// Flow-id changes: a fresh (non-retransmit) packet whose flow id (SSRC with
+    /// the retransmit LSB masked) differed from the one the flow anchored on, so
+    /// the receiver discarded its buffered state and re-anchored on the new flow
+    /// rather than merging two distinct flows into one ring (libRIST's "Detected
+    /// flow id change ... resetting state").
+    pub flow_resets: u64,
 
     // --- Sender half ---
     /// First-transmission media packets emitted by `push_app`.

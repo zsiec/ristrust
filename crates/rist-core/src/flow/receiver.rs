@@ -194,6 +194,21 @@ impl Flow {
     /// mapping, too-late shedding, `(seq, source_time)` dedup, insert, missing
     /// detection, then timer scheduling — following `receiver_enqueue`.
     pub(crate) fn recv_feed(&mut self, now: Timestamp, path: u8, pkt: MediaPacket) {
+        // Flow-id change (libRIST "Detected flow id change ... resetting state"): a
+        // started flow receiving a fresh packet whose flow id (the SSRC with the
+        // retransmit LSB masked) differs from the one it anchored on is seeing a new
+        // source flow — a sender restart with a new SSRC, or a different sender taking
+        // over the tuple. Discard the buffered state and re-anchor on the new flow
+        // rather than merging two distinct flows into one ring (which would corrupt
+        // dedup and playout). A retransmit cannot anchor a flow, so it never triggers
+        // a reset.
+        if self.receiver.started
+            && !pkt.retransmit
+            && (pkt.ssrc & !0x1) != (self.receiver.ssrc & !0x1)
+        {
+            self.reset_receiver();
+            self.stats.flow_resets += 1;
+        }
         if !self.receiver.started {
             // A flow cannot start on a retransmit.
             if pkt.retransmit {
@@ -298,6 +313,25 @@ impl Flow {
 
         self.arm_playout(output_time);
         self.schedule_nack(now);
+    }
+
+    /// Discards all buffered receiver state on a flow-id change (libRIST clears
+    /// `receiver_queue_has_items`), so the next packet re-anchors a fresh flow via
+    /// [`start`](Self::start). It clears the ring (no stale slot from the old flow
+    /// can be delivered or deduped against the new one), drops the missing queue,
+    /// clears `started`, and disarms the playout/NACK timer flags so `start` re-arms
+    /// them at the new flow's deadlines (`start` also re-seeds every cursor, so the
+    /// stale cursors need no explicit reset). It preserves what is a property of the
+    /// link, not the flow: the ring allocation, the RTT estimator, and the
+    /// (auto-scaled) recovery buffer.
+    fn reset_receiver(&mut self) {
+        let r = &mut self.receiver;
+        r.ring.fill(Slot::default());
+        r.missing.clear();
+        r.started = false;
+        r.pending_discontinuity = false;
+        r.playout_armed = false;
+        r.nack_armed = false;
     }
 
     /// First-packet initialization (libRIST `receiver_enqueue` empty-queue
@@ -679,6 +713,61 @@ mod tests {
         let mut p = mk_pkt(seq, src_us, payload);
         p.retransmit = true;
         p
+    }
+
+    /// A media packet on a specific flow (SSRC), for the flow-id-change tests.
+    fn pkt_on(seq: u32, src_us: u64, ssrc: u32) -> crate::wire::MediaPacket {
+        let mut p = mk_pkt(seq, src_us, b"x");
+        p.ssrc = ssrc;
+        p
+    }
+
+    #[test]
+    fn flow_id_change_resets_and_reanchors() {
+        const FLOW_A: u32 = 0x1000_0000;
+        const FLOW_B: u32 = 0x2000_0000;
+        let mut f = recv();
+
+        // Anchor on flow A and buffer two packets.
+        f.feed(ts(10_000), 0, pkt_on(100, 0, FLOW_A));
+        f.feed(ts(17_000), 0, pkt_on(101, 7_000, FLOW_A));
+        assert_eq!(f.receiver.ssrc, FLOW_A);
+        assert_eq!(f.stats().flow_resets, 0);
+
+        // A fresh packet whose SSRC differs only in the retransmit LSB is the SAME
+        // flow id (the `& !0x1` mask), so it must NOT reset.
+        f.feed(ts(18_000), 0, pkt_on(102, 11_000, FLOW_A | 0x1));
+        assert_eq!(
+            f.stats().flow_resets,
+            0,
+            "a same-flow-id packet (LSB only) wrongly reset"
+        );
+
+        // A retransmit bearing a different flow id must NOT reset (a retransmit
+        // cannot anchor a flow).
+        let mut rt = pkt_on(100, 0, FLOW_B);
+        rt.retransmit = true;
+        f.feed(ts(18_500), 0, rt);
+        assert_eq!(f.stats().flow_resets, 0, "a retransmit triggered a reset");
+
+        // A fresh packet on flow B is a genuine flow-id change: reset + re-anchor.
+        f.feed(ts(30_000), 0, pkt_on(5000, 23_000, FLOW_B));
+        assert_eq!(f.stats().flow_resets, 1, "flow-id change not counted");
+        assert_eq!(f.receiver.ssrc, FLOW_B, "did not re-anchor on flow B");
+        assert!(f.receiver.started && f.receiver.deliver_next == 5000);
+        assert!(
+            f.receiver.missing.is_empty(),
+            "missing queue not cleared on reset"
+        );
+        // Flow A's buffered slot was cleared (when it does not alias flow B's slot).
+        let ring_idx = |seq: u32| seq & f.receiver.mask;
+        if ring_idx(100) != ring_idx(5000) {
+            assert_eq!(
+                slot_of(&f, 100).state,
+                SlotState::Empty,
+                "flow A ring slot survived the reset"
+            );
+        }
     }
 
     #[test]

@@ -85,14 +85,41 @@ fn dur_to_micros(d: Duration) -> Micros {
     Micros::from_micros(d.as_micros().min(i64::MAX as u128) as i64)
 }
 
+/// The effective `[rtt_min, rtt_max]` clamp handed to the flow core, applying
+/// libRIST's "rtt_min is too small for the buffer" floor from `store_peer_settings`:
+/// the effective `rtt_min` is raised to `buffer_min / max_retries` whenever the
+/// configured value is below it. With the defaults (buffer_min 1000 ms, max_retries
+/// 20) that floor is 50 ms, not the configured 5 ms. The floor keeps the NACK retry
+/// cadence (1.1× the clamped RTT) and the `max_retries` abandon budget commensurate
+/// with the playout buffer; without it, a low-RTT link re-NACKs an order of magnitude
+/// too often and exhausts `max_retries` in a fraction of the buffer, giving up on
+/// recoverable loss far sooner than a libRIST receiver. `rtt_max` is raised to the
+/// floored `rtt_min` if a degenerate config left it lower (matching libRIST). The
+/// configured `cfg.rtt_min` is left untouched (it stays the reported value); only the
+/// value handed to the core is floored — exactly as libRIST computes the effective
+/// `recovery_rtt_min` once rather than mutating the user's setting. (The hard 3 ms
+/// RIST floor is applied separately inside the core's RTT estimator.)
+fn effective_rtt_bounds(cfg: &Config) -> (Micros, Micros) {
+    let mut rtt_min = dur_to_micros(cfg.rtt_min).as_micros();
+    if cfg.max_retries > 0 {
+        let floor = dur_to_micros(cfg.buffer_min).as_micros() / i64::from(cfg.max_retries);
+        if floor > rtt_min {
+            rtt_min = floor;
+        }
+    }
+    let rtt_max = dur_to_micros(cfg.rtt_max).as_micros().max(rtt_min);
+    (Micros::from_micros(rtt_min), Micros::from_micros(rtt_max))
+}
+
 /// Derives the flow core's `Config` from the public `Config`.
 fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
+    let (rtt_min, rtt_max) = effective_rtt_bounds(cfg);
     FlowConfig {
         recovery_buffer_min: dur_to_micros(cfg.buffer_min),
         recovery_buffer_max: dur_to_micros(cfg.buffer_max),
         reorder_buffer: dur_to_micros(cfg.reorder_buffer),
-        rtt_min: dur_to_micros(cfg.rtt_min),
-        rtt_max: dur_to_micros(cfg.rtt_max),
+        rtt_min,
+        rtt_max,
         min_retries: cfg.min_retries,
         max_retries: cfg.max_retries,
         ring_size: 0, // 0 selects the default 2^16 ring

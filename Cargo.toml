@@ -50,6 +50,10 @@ aes-gcm = "0.10"
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "alloc", "pem"] }
 rand_core = "0.6"
 x509-cert = { version = "0.2", default-features = false, features = ["builder"] }
+# RSA certificate/signature path (ECDHE_RSA suites) and RSA key transport with the
+# Bleichenbacher countermeasure (RSA_WITH_NULL_SHA256) for the full TR-06-2 §6.2
+# DTLS suite set. `sha2` wires the SHA-256/384 PKCS#1 v1.5 schemes. Pure RustCrypto.
+rsa = { version = "0.9", features = ["sha2"] }
 # OS CSPRNG for the PSK nonce (the only non-determinism in the crypto layer).
 getrandom = "0.3"
 # SRP-6a (Main-profile EAP auth): big-integer modular exponentiation over the

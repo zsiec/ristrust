@@ -60,6 +60,14 @@ fn openssl() -> Option<String> {
     None
 }
 
+/// A process-unique token, so parallel tests that generate certificates do not
+/// share (and race to delete) the same temp-file paths.
+fn unique_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    (u64::from(std::process::id()) << 20) | N.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A free loopback UDP port.
 fn free_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0")
@@ -168,8 +176,8 @@ impl Drop for TempFiles {
 /// paths (kept alive by the guard), or `None` on failure.
 fn gen_ecdsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
     let dir = std::env::temp_dir();
-    let cert = dir.join(format!("ristrust-dtls-{}-cert.pem", std::process::id()));
-    let key = dir.join(format!("ristrust-dtls-{}-key.pem", std::process::id()));
+    let cert = dir.join(format!("ristrust-dtls-{}-cert.pem", unique_token()));
+    let key = dir.join(format!("ristrust-dtls-{}-key.pem", unique_token()));
     let ok = Command::new(openssl)
         .args([
             "req",
@@ -237,4 +245,260 @@ fn interop_ecdhe_client_to_openssl_server() {
         conn.cipher_suite(),
         rist_codec::dtls::suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
     );
+}
+
+/// Generates a self-signed RSA-2048 cert + key with `openssl`, returning their paths.
+fn gen_rsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
+    let dir = std::env::temp_dir();
+    let cert = dir.join(format!("ristrust-dtls-rsa-{}-cert.pem", unique_token()));
+    let key = dir.join(format!("ristrust-dtls-rsa-{}-key.pem", unique_token()));
+    let ok = Command::new(openssl)
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key.to_str()?,
+            "-out",
+            cert.to_str()?,
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=ristrust-interop-rsa",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        return None;
+    }
+    let guard = TempFiles(vec![cert.clone(), key.clone()]);
+    Some((cert, key, guard))
+}
+
+/// Spawns `openssl s_server -dtls1_2` constrained to one `cipher`, presenting
+/// `cert`/`key`, listening on `port`.
+fn openssl_cert_server(
+    openssl: &str,
+    port: u16,
+    cipher: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> ChildGuard {
+    let accept = format!("127.0.0.1:{port}");
+    let mut cmd = Command::new(openssl);
+    cmd.args([
+        "s_server",
+        "-dtls1_2",
+        "-listen",
+        "-cert",
+        cert.to_str().unwrap(),
+        "-key",
+        key.to_str().unwrap(),
+        "-cipher",
+        cipher,
+        "-accept",
+        &accept,
+        "-quiet",
+    ]);
+    spawn(&mut cmd)
+}
+
+/// Runs a ristrust DTLS client against an OpenSSL `s_server` pinned to one `cipher`
+/// with the given `cert`/`key`, asserting the negotiated suite. Mirrors the existing
+/// ECDHE-ECDSA-128 interop for the remaining TR-06-2 §6.2 suites.
+fn run_client_interop(
+    openssl: &str,
+    cipher: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    cfg: Config,
+    expect_suite: u16,
+) {
+    let port = free_udp_port();
+    let _server = openssl_cert_server(openssl, port, cipher, cert, key);
+    std::thread::sleep(Duration::from_millis(600));
+    let mut conn = client(port, cfg);
+    conn.handshake()
+        .unwrap_or_else(|e| panic!("handshake with openssl ({cipher}): {e}"));
+    assert_eq!(conn.cipher_suite(), expect_suite, "negotiated {cipher}");
+}
+
+/// ristrust client → OpenSSL server, ECDHE-ECDSA-AES256-GCM-SHA384 (AES-256 +
+/// SHA-384 PRF over the ECDSA path).
+#[test]
+fn interop_ecdhe_ecdsa_aes256_client_to_openssl() {
+    let Some(openssl) = openssl() else {
+        eprintln!("dtls interop: openssl not found; skipping");
+        return;
+    };
+    let Some((cert, key, _files)) = gen_ecdsa_cert(&openssl) else {
+        eprintln!("dtls interop: could not generate an ECDSA cert; skipping");
+        return;
+    };
+    run_client_interop(
+        &openssl,
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        &cert,
+        &key,
+        Config::ecdhe_client_insecure(),
+        rist_codec::dtls::suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    );
+}
+
+/// ristrust client → OpenSSL server, ECDHE-RSA-AES128-GCM-SHA256 (the RSA
+/// certificate / RSA-signed ServerKeyExchange path).
+#[test]
+fn interop_ecdhe_rsa_aes128_client_to_openssl() {
+    let Some(openssl) = openssl() else {
+        eprintln!("dtls interop: openssl not found; skipping");
+        return;
+    };
+    let Some((cert, key, _files)) = gen_rsa_cert(&openssl) else {
+        eprintln!("dtls interop: could not generate an RSA cert; skipping");
+        return;
+    };
+    run_client_interop(
+        &openssl,
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        &cert,
+        &key,
+        Config::ecdhe_client_insecure(),
+        rist_codec::dtls::suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    );
+}
+
+/// ristrust client → OpenSSL server, ECDHE-RSA-AES256-GCM-SHA384 (RSA auth +
+/// AES-256 + SHA-384 PRF together).
+#[test]
+fn interop_ecdhe_rsa_aes256_client_to_openssl() {
+    let Some(openssl) = openssl() else {
+        eprintln!("dtls interop: openssl not found; skipping");
+        return;
+    };
+    let Some((cert, key, _files)) = gen_rsa_cert(&openssl) else {
+        eprintln!("dtls interop: could not generate an RSA cert; skipping");
+        return;
+    };
+    run_client_interop(
+        &openssl,
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        &cert,
+        &key,
+        Config::ecdhe_client_insecure(),
+        rist_codec::dtls::suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    );
+}
+
+/// ristrust client → OpenSSL server, RSA_WITH_NULL_SHA256 (RSA key transport + the
+/// NULL-cipher-with-HMAC record layer). The client encrypts the pre-master to
+/// OpenSSL's RSA key; integrity-only records carry the Finished. OpenSSL needs
+/// `@SECLEVEL=0` to enable the NULL cipher at all.
+#[test]
+fn interop_rsa_null_client_to_openssl() {
+    let Some(openssl) = openssl() else {
+        eprintln!("dtls interop: openssl not found; skipping");
+        return;
+    };
+    let Some((cert, key, _files)) = gen_rsa_cert(&openssl) else {
+        eprintln!("dtls interop: could not generate an RSA cert; skipping");
+        return;
+    };
+    let cfg = Config {
+        insecure_skip_verify: true,
+        allow_null_cipher: true,
+        ..Config::default()
+    };
+    run_client_interop(
+        &openssl,
+        "NULL-SHA256:@SECLEVEL=0",
+        &cert,
+        &key,
+        cfg,
+        rist_codec::dtls::suites::TLS_RSA_WITH_NULL_SHA256,
+    );
+}
+
+/// A blocking UDP transport for a DTLS *server*: it learns the single client's
+/// address from the first datagram and sends back to it.
+struct UdpServerTransport {
+    sock: UdpSocket,
+    peer: Option<std::net::SocketAddr>,
+}
+
+impl Transport for UdpServerTransport {
+    fn send(&mut self, datagram: &[u8]) -> io::Result<usize> {
+        match self.peer {
+            Some(p) => self.sock.send_to(datagram, p),
+            None => Err(io::Error::new(io::ErrorKind::NotConnected, "no peer yet")),
+        }
+    }
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (n, addr) = self.sock.recv_from(buf)?;
+        self.peer.get_or_insert(addr);
+        Ok(n)
+    }
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
+/// OpenSSL `s_client -dtls1_2` → ristrust DTLS *server* (RSA_WITH_NULL_SHA256). This
+/// is the server-role interop that validates the RSA key-transport DECRYPT path (the
+/// Bleichenbacher countermeasure) against a real OpenSSL client — the one suite path
+/// reachable only on the server side.
+#[test]
+fn interop_rsa_null_openssl_client_to_server() {
+    let Some(openssl) = openssl() else {
+        eprintln!("dtls interop: openssl not found; skipping");
+        return;
+    };
+    // ristrust presents an RSA identity and opts into the NULL cipher.
+    let Ok(identity) = rist_codec::dtls::cert::Identity::generate_rsa("ristrust-rsa-server") else {
+        eprintln!("dtls interop: could not generate an RSA identity; skipping");
+        return;
+    };
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind server");
+    let port = sock.local_addr().expect("addr").port();
+    let cfg = short(Config {
+        certificate: Some(std::sync::Arc::new(identity)),
+        allow_null_cipher: true,
+        // Force the NULL suite: disable the ECDHE_RSA suites this RSA cert could serve.
+        disabled_suites: vec![
+            rist_codec::dtls::suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            rist_codec::dtls::suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        ],
+        ..Config::default()
+    });
+
+    let server = std::thread::spawn(move || {
+        let mut conn = Conn::server(UdpServerTransport { sock, peer: None }, cfg);
+        conn.handshake().map(|()| conn.cipher_suite())
+    });
+
+    // Give the server a moment to start listening, then connect OpenSSL.
+    std::thread::sleep(Duration::from_millis(200));
+    let connect = format!("127.0.0.1:{port}");
+    let mut client = spawn(Command::new(&openssl).args([
+        "s_client",
+        "-dtls1_2",
+        "-connect",
+        &connect,
+        "-cipher",
+        "NULL-SHA256:@SECLEVEL=0",
+        "-quiet",
+    ]));
+    // The handshake completes on connect; feed a newline so s_client does not block
+    // on stdin and the guard can reap it.
+    if let Some(stdin) = client.0.stdin.take() {
+        drop(stdin);
+    }
+
+    match server.join().expect("server thread") {
+        Ok(suite) => assert_eq!(suite, rist_codec::dtls::suites::TLS_RSA_WITH_NULL_SHA256),
+        Err(e) => panic!("ristrust server handshake with openssl s_client: {e}"),
+    }
 }

@@ -498,6 +498,23 @@ pub fn parse_client_key_exchange_ecdhe(body: &[u8]) -> Result<Vec<u8>, DtlsError
     Ok(Reader::new(body).u8_vec()?.to_vec())
 }
 
+/// Encodes an RSA-key-transport ClientKeyExchange body: a `u16`-length-prefixed
+/// `EncryptedPreMasterSecret` (RFC 5246 §7.4.7.1, TLS 1.2's explicit length).
+#[must_use]
+pub fn client_key_exchange_rsa(encrypted_premaster: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16_vec(|w| w.bytes(encrypted_premaster));
+    w.into_bytes()
+}
+
+/// Decodes an RSA-key-transport ClientKeyExchange's `EncryptedPreMasterSecret`.
+///
+/// # Errors
+/// [`DtlsError::Malformed`] on truncation.
+pub fn parse_client_key_exchange_rsa(body: &[u8]) -> Result<Vec<u8>, DtlsError> {
+    Ok(Reader::new(body).u16_vec()?.to_vec())
+}
+
 /// The fixed CertificateRequest body this implementation sends: `certificate_types
 /// = [ecdsa_sign(64)]`, `supported_signature_algorithms = [ecdsa_secp256r1_sha256]`,
 /// no certificate authorities (RFC 5246 §7.4.4).

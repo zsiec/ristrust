@@ -9,6 +9,20 @@ all-features = true
 # Fail on any RUSTSEC advisory for a crate in the graph.
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": a timing sidechannel in the `rsa`
+    # crate's PKCS#1 v1.5 decryption (no fixed upstream release). It is pulled in
+    # ONLY by the optional `--features dtls` RSA suites, which are not in the
+    # default build and not a libRIST interop gate. The exposure is narrow and
+    # bounded: an attacker needs precise local timing of repeated RSA *decryptions*
+    # to recover a key. The only suite performing RSA decryption is
+    # RSA_WITH_NULL_SHA256, which is OFF by default (gated behind allow_null_cipher);
+    # the ECDHE_RSA suites only *verify* RSA signatures (not affected by Marvin) and
+    # are forward-secret. TR-06-2 §6.2 mandates these suites, so DTLS conformance
+    # requires the dependency; the risk is accepted for the off-by-default,
+    # feature-gated DTLS layer.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2

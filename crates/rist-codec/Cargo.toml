@@ -40,8 +40,11 @@ aes-gcm = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 x509-cert = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
 
 [features]
-# Pure-Rust DTLS 1.2 (PSK + ECDHE-ECDSA-AES-128-GCM). Off by default; not an
-# interop gate (the bar is OpenSSL `s_server`/`s_client -dtls1_2`).
-dtls = ["dep:hmac", "dep:aes-gcm", "dep:p256", "dep:rand_core", "dep:x509-cert"]
+# Pure-Rust DTLS 1.2: the full TR-06-2 §6.2 mandatory suite set (ECDHE-ECDSA and
+# ECDHE-RSA AES-128/256-GCM, RSA_WITH_NULL_SHA256) plus the PSK suite RIST uses.
+# Off by default; not an interop gate (the bar is OpenSSL `s_server`/`s_client
+# -dtls1_2`).
+dtls = ["dep:hmac", "dep:aes-gcm", "dep:p256", "dep:rand_core", "dep:x509-cert", "dep:rsa"]

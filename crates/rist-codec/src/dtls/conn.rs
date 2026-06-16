@@ -5,35 +5,39 @@
 //! The connection drives a caller-supplied datagram [`Transport`] synchronously:
 //! [`Conn::handshake`] runs the full flight exchange (with RFC 6347 §4.2.4
 //! retransmission on read timeout), then [`Conn::write`]/[`Conn::read`] carry
-//! AES-128-GCM-protected application data. This module wires the PSK suite
-//! end-to-end; the ECDHE-ECDSA suite layers its extra flight-4/5 messages on the
-//! same machinery.
+//! record-protected application data. Cipher-suite selection is table-driven (see
+//! [`super::suiteinfo`]): the PSK suite needs no flight-4 certificate messages, the
+//! ECDHE suites add a Certificate + signed ServerKeyExchange, and the RSA
+//! key-transport suite adds a Certificate the client encrypts the pre-master to.
 
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::cert::{self, Identity};
+use super::cert::{self, Identity, PeerKey};
 use super::cipher::{ConnKeys, derive_keys};
 use super::handshake::{FragmentHeader, HANDSHAKE_HEADER_LEN, Reassembler, full_message_bytes};
-use super::keyexchange::{ecdhe_premaster, generate_ecdhe};
+use super::keyexchange::{
+    decrypt_rsa_premaster, ecdhe_premaster, encrypt_rsa_premaster, generate_ecdhe,
+    new_rsa_premaster,
+};
 use super::messages::{
     CertificateMsg, ClientHello, HandshakeType, HelloVerifyRequest, ServerHello, ServerKeyExchange,
-    client_key_exchange_ecdhe, client_key_exchange_psk, parse_client_key_exchange_ecdhe,
-    parse_client_key_exchange_psk,
+    client_key_exchange_ecdhe, client_key_exchange_psk, client_key_exchange_rsa,
+    parse_client_key_exchange_ecdhe, parse_client_key_exchange_psk, parse_client_key_exchange_rsa,
 };
 use super::prf::{
-    LABEL_CLIENT_FINISHED, LABEL_SERVER_FINISHED, extended_master_secret, finished_verify_data,
-    master_secret,
+    LABEL_CLIENT_FINISHED, LABEL_SERVER_FINISHED, PrfHash, extended_master_secret,
+    finished_verify_data, master_secret,
 };
 use super::record::{ContentType, Record, VERSION_DTLS_1_0, VERSION_DTLS_1_2, split_records};
 use super::replay::ReplayWindow;
+use super::suiteinfo::{AuthMethod, KeyExchange, SUITE_TABLE, SuiteInfo, lookup_suite};
 use super::suites::{
-    NAMED_GROUP_SECP256R1, RANDOM_LEN, SIG_SCHEME_ECDSA_P256_SHA256,
-    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_PSK_WITH_AES_128_GCM_SHA256,
+    NAMED_GROUP_SECP256R1, OFFERED_SIGNATURE_ALGORITHMS, RANDOM_LEN,
+    TLS_PSK_WITH_AES_128_GCM_SHA256,
 };
 
 /// The cookie length the server issues (RFC 6347 §4.2.1 recommends ≤ 32).
@@ -68,28 +72,37 @@ pub trait Transport {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
 }
 
-/// DTLS connection configuration. At least one authentication method (a PSK, or —
-/// for ECDHE-ECDSA — a certificate) must be set.
+/// DTLS connection configuration. At least one authentication method (a PSK, or a
+/// certificate for the ECDHE / RSA-transport suites) must be set.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The pre-shared key enabling `TLS_PSK_WITH_AES_128_GCM_SHA256`.
     pub psk: Option<Vec<u8>>,
     /// The PSK identity (sent by the client, expected by the server).
     pub psk_identity: Vec<u8>,
-    /// The local certificate/key for `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`: a
-    /// server presents it; a client offers the suite when it can verify the peer
-    /// (via `insecure_skip_verify` or `peer_cert_fingerprint`).
+    /// The local certificate/key for the certificate suites: a server presents it
+    /// (its key type — ECDSA P-256 or RSA — selects which `ECDHE_*` / RSA-transport
+    /// suites it can serve); a client offers the certificate suites when it can
+    /// verify the peer (via `insecure_skip_verify` or `peer_cert_fingerprint`).
     pub certificate: Option<Arc<Identity>>,
     /// Accept any peer certificate (test/insecure). When set, the client offers the
-    /// ECDHE suite.
+    /// certificate suites.
     pub insecure_skip_verify: bool,
     /// Accept only a peer leaf whose SHA-256 fingerprint matches this pin. When set,
-    /// the client offers the ECDHE suite.
+    /// the client offers the certificate suites.
     pub peer_cert_fingerprint: Option<[u8; 32]>,
     /// Require the peer to confirm `extended_master_secret` (RFC 7627). When
     /// `false` (the default) EMS is offered and used when the peer agrees, but its
     /// omission is tolerated for interop.
     pub require_extended_master_secret: bool,
+    /// Cipher-suite ids the user has disabled (the TR-06-2 §6.2 per-suite disable
+    /// knob). A disabled suite is neither offered (client) nor selected (server).
+    pub disabled_suites: Vec<u16>,
+    /// Allow the integrity-only `TLS_RSA_WITH_NULL_SHA256` suite, which provides NO
+    /// confidentiality. OFF by default: an RSA certificate configured for the
+    /// encrypted suites cannot silently enable a cleartext session — the NULL suite
+    /// is reachable only when this is explicitly set.
+    pub allow_null_cipher: bool,
     /// The overall handshake deadline.
     pub handshake_timeout: Duration,
     /// The initial retransmission timer (doubles per timeout, capped at 60 s).
@@ -105,6 +118,8 @@ impl Default for Config {
             insecure_skip_verify: false,
             peer_cert_fingerprint: None,
             require_extended_master_secret: false,
+            disabled_suites: Vec::new(),
+            allow_null_cipher: false,
             handshake_timeout: Duration::from_secs(30),
             retransmit_timeout: Duration::from_secs(1),
         }
@@ -122,7 +137,10 @@ impl Config {
         }
     }
 
-    /// An ECDHE-ECDSA server config presenting `identity`.
+    /// A certificate server config presenting `identity`. The identity's key type
+    /// selects the suites served: an ECDSA P-256 leaf serves the `ECDHE_ECDSA_*`
+    /// suites, an RSA leaf the `ECDHE_RSA_*` suites (and, with
+    /// [`allow_null_cipher`](Config::allow_null_cipher), `RSA_WITH_NULL_SHA256`).
     #[must_use]
     pub fn ecdhe_server(identity: Identity) -> Config {
         Config {
@@ -131,8 +149,9 @@ impl Config {
         }
     }
 
-    /// An ECDHE-ECDSA client config that accepts only a peer leaf matching `pin`
-    /// (its SHA-256 fingerprint).
+    /// A certificate client config that accepts only a peer leaf matching `pin` (its
+    /// SHA-256 fingerprint). It offers the certificate suites; the server's leaf key
+    /// type decides which one is negotiated.
     #[must_use]
     pub fn ecdhe_client_pinned(pin: [u8; 32]) -> Config {
         Config {
@@ -141,8 +160,8 @@ impl Config {
         }
     }
 
-    /// An ECDHE-ECDSA client config that accepts any peer certificate (insecure;
-    /// for tests / fingerprint-out-of-band deployments).
+    /// A certificate client config that accepts any peer certificate (insecure; for
+    /// tests / fingerprint-out-of-band deployments).
     #[must_use]
     pub fn ecdhe_client_insecure() -> Config {
         Config {
@@ -151,9 +170,41 @@ impl Config {
         }
     }
 
-    /// Whether this config can verify a peer certificate (and so may offer ECDHE).
+    /// Whether this config can verify a peer certificate (and so may offer the
+    /// certificate suites).
     fn can_verify_cert(&self) -> bool {
         self.insecure_skip_verify || self.peer_cert_fingerprint.is_some()
+    }
+
+    /// Whether the client may OFFER `suite`: it can perform the key exchange and
+    /// authenticate the result, and the user has not disabled it. A certificate
+    /// suite needs a verification policy; the NULL suite additionally needs the
+    /// cleartext opt-in.
+    fn client_can_offer(&self, suite: SuiteInfo) -> bool {
+        if self.disabled_suites.contains(&suite.id) {
+            return false;
+        }
+        if suite.kx == KeyExchange::Psk {
+            return self.psk.is_some();
+        }
+        self.can_verify_cert() && (suite.aead || self.allow_null_cipher)
+    }
+
+    /// Whether the server may SELECT `suite` with its configured credentials, and the
+    /// user has not disabled it. A certificate suite needs a leaf whose key type
+    /// matches the suite's auth method; the NULL suite additionally needs the
+    /// cleartext opt-in.
+    fn server_can_serve(&self, suite: SuiteInfo) -> bool {
+        if self.disabled_suites.contains(&suite.id) {
+            return false;
+        }
+        if suite.kx == KeyExchange::Psk {
+            return self.psk.is_some();
+        }
+        let Some(identity) = &self.certificate else {
+            return false;
+        };
+        identity.auth_method() == suite.auth && (suite.aead || self.allow_null_cipher)
     }
 }
 
@@ -189,6 +240,9 @@ pub struct Conn<T: Transport> {
     // Cipher state once keys are derived.
     keys: Option<ConnKeys>,
     cipher_suite: u16,
+    /// The negotiated suite descriptor (its hash drives the PRF / transcript /
+    /// Finished / key schedule). Defaults to a SHA-256 suite until negotiated.
+    suite: SuiteInfo,
 
     // Handshake state.
     transcript: Vec<u8>,
@@ -225,6 +279,7 @@ impl<T: Transport> Conn<T> {
             replay: [ReplayWindow::new(), ReplayWindow::new()],
             keys: None,
             cipher_suite: 0,
+            suite: lookup_suite(TLS_PSK_WITH_AES_128_GCM_SHA256).expect("PSK suite in table"),
             transcript: Vec::new(),
             reasm: Reassembler::new(),
             send_msg_seq: 0,
@@ -322,16 +377,28 @@ impl<T: Transport> Conn<T> {
         let sh =
             ServerHello::parse(&body_of(&f4, HandshakeType::ServerHello)?).map_err(dtls_err)?;
         self.cipher_suite = sh.cipher_suite;
+        self.suite = lookup_suite(sh.cipher_suite)
+            .ok_or_else(|| proto("server selected an unsupported suite"))?;
         let server_random = sh.random;
         let ems = sh.ext_master_secret;
         if self.cfg.require_extended_master_secret && !ems {
             return Err(proto("server omitted extended_master_secret"));
         }
 
+        // This implementation never performs client authentication, so a
+        // CertificateRequest is unexpected (and would otherwise prompt a client
+        // certificate, which a PSK handshake must never emit in the clear).
+        if f4
+            .iter()
+            .any(|m| m.typ == HandshakeType::CertificateRequest)
+        {
+            return Err(proto("unexpected CertificateRequest"));
+        }
+
         // Flight 5: derive the premaster and the ClientKeyExchange body per the
-        // selected suite (PSK identity, or verified ECDHE key agreement).
-        let (pre_master, cke) = match sh.cipher_suite {
-            TLS_PSK_WITH_AES_128_GCM_SHA256 => {
+        // negotiated suite's key exchange.
+        let (pre_master, cke) = match self.suite.kx {
+            KeyExchange::Psk => {
                 let psk = self
                     .cfg
                     .psk
@@ -342,24 +409,33 @@ impl<T: Transport> Conn<T> {
                     client_key_exchange_psk(&self.cfg.psk_identity),
                 )
             }
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
-                self.client_ecdhe(&f4, &client_random, &server_random)?
-            }
-            _ => return Err(proto("server selected an unsupported suite")),
+            KeyExchange::Ecdhe => self.client_ecdhe(&f4, &client_random, &server_random)?,
+            KeyExchange::Rsa => self.client_rsa(&f4)?,
         };
         let cke_spec = self.emit_handshake(HandshakeType::ClientKeyExchange, &cke, 0, true);
         let session_hash = self.transcript_hash();
         let master = derive_master(
+            self.suite.hash,
             ems,
             &pre_master,
             &session_hash,
             &client_random,
             &server_random,
         );
-        self.keys = Some(derive_keys(&master, &client_random, &server_random));
+        self.keys = Some(derive_keys(
+            self.suite,
+            &master,
+            &client_random,
+            &server_random,
+        ));
         self.drain_pending()?;
 
-        let client_fin = finished_verify_data(&master, LABEL_CLIENT_FINISHED, &session_hash);
+        let client_fin = finished_verify_data(
+            self.suite.hash,
+            &master,
+            LABEL_CLIENT_FINISHED,
+            &session_hash,
+        );
         let ccs = RecordSpec {
             typ: ContentType::ChangeCipherSpec,
             epoch: 0,
@@ -377,15 +453,19 @@ impl<T: Transport> Conn<T> {
     }
 
     fn build_client_hello(&self, random: &[u8; RANDOM_LEN], cookie: &[u8]) -> Vec<u8> {
-        let ecdhe = self.cfg.can_verify_cert();
-        let psk = self.cfg.psk.is_some();
-        let mut cipher_suites = Vec::new();
-        if ecdhe {
-            cipher_suites.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256); // preferred
-        }
-        if psk {
-            cipher_suites.push(TLS_PSK_WITH_AES_128_GCM_SHA256);
-        }
+        // The offered suites are the table entries this config can offer, in
+        // server-preference (strongest-first) order.
+        let cipher_suites: Vec<u16> = SUITE_TABLE
+            .iter()
+            .filter(|s| self.cfg.client_can_offer(**s))
+            .map(|s| s.id)
+            .collect();
+        let any_ecdhe = SUITE_TABLE
+            .iter()
+            .any(|s| s.kx == KeyExchange::Ecdhe && cipher_suites.contains(&s.id));
+        let any_cert = SUITE_TABLE
+            .iter()
+            .any(|s| s.auth != AuthMethod::None && cipher_suites.contains(&s.id));
         ClientHello {
             version: VERSION_DTLS_1_2,
             random: *random,
@@ -393,16 +473,18 @@ impl<T: Transport> Conn<T> {
             cookie: cookie.to_vec(),
             cipher_suites,
             ext_master_secret: true,
-            // Offer the EC parameters only when offering the ECDHE suite.
-            supported_groups: if ecdhe {
+            // Offer the EC parameters only when offering an ECDHE suite.
+            supported_groups: if any_ecdhe {
                 vec![NAMED_GROUP_SECP256R1]
             } else {
                 Vec::new()
             },
-            point_formats: if ecdhe { vec![0] } else { Vec::new() },
-            point_formats_offered: ecdhe,
-            signature_algorithms: if ecdhe {
-                vec![SIG_SCHEME_ECDSA_P256_SHA256]
+            point_formats: if any_ecdhe { vec![0] } else { Vec::new() },
+            point_formats_offered: any_ecdhe,
+            // Offer signature_algorithms (ECDSA + RSA, SHA-256/384) when offering any
+            // certificate suite, so the server may authenticate with either key type.
+            signature_algorithms: if any_cert {
+                OFFERED_SIGNATURE_ALGORITHMS.to_vec()
             } else {
                 Vec::new()
             },
@@ -411,9 +493,11 @@ impl<T: Transport> Conn<T> {
         .marshal_body()
     }
 
-    /// The client's ECDHE-ECDSA key agreement: verify the server's certificate and
-    /// ServerKeyExchange signature (from flight 4), generate the client ephemeral,
-    /// and return the premaster secret and ClientKeyExchange body.
+    /// The client's ECDHE key agreement (ECDSA- or RSA-authenticated): verify the
+    /// server's certificate and ServerKeyExchange signature (from flight 4), generate
+    /// the client ephemeral, and return the premaster secret and ClientKeyExchange
+    /// body. Rejecting a ServerKeyExchange whose Certificate is absent falls out of
+    /// `body_of` (it errors), so the signature is never checked without a leaf key.
     fn client_ecdhe(
         &self,
         flight4: &[Incoming],
@@ -430,12 +514,18 @@ impl<T: Transport> Conn<T> {
             self.cfg.peer_cert_fingerprint,
         )
         .map_err(dtls_err)?;
+        // The presented leaf's key type must match the negotiated suite's auth method.
+        if leaf_key.auth_method() != self.suite.auth {
+            return Err(proto(
+                "server leaf key type does not match the negotiated suite",
+            ));
+        }
         // The signature covers client_random || server_random || signed ECDHE params.
         let mut signed = Vec::with_capacity(64 + ske.public_key.len());
         signed.extend_from_slice(client_random);
         signed.extend_from_slice(server_random);
         signed.extend_from_slice(&ske.signed_params());
-        if !cert::verify(&leaf_key, &signed, &ske.signature) {
+        if !cert::verify_handshake_signature(&leaf_key, ske.sig_scheme, &signed, &ske.signature) {
             return Err(proto("bad ServerKeyExchange signature"));
         }
         let (client_secret, client_point) = generate_ecdhe();
@@ -443,22 +533,47 @@ impl<T: Transport> Conn<T> {
         Ok((pre_master, client_key_exchange_ecdhe(&client_point)))
     }
 
-    /// Selects the server's cipher suite from the client's offer: ECDHE-ECDSA is
-    /// preferred when a certificate is configured and offered, else PSK.
-    fn select_server_suite(&self, ch: &ClientHello) -> Option<u16> {
-        if self.cfg.certificate.is_some()
-            && ch
-                .cipher_suites
-                .contains(&TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+    /// The client's RSA key transport (`RSA_WITH_NULL_SHA256`): verify the server's
+    /// RSA certificate, then encrypt a fresh pre-master under its public key. No
+    /// ServerKeyExchange is sent for RSA key transport — one arriving is a protocol
+    /// violation.
+    fn client_rsa(&self, flight4: &[Incoming]) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        if flight4
+            .iter()
+            .any(|m| m.typ == HandshakeType::ServerKeyExchange)
         {
-            Some(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
-        } else if self.cfg.psk.is_some()
-            && ch.cipher_suites.contains(&TLS_PSK_WITH_AES_128_GCM_SHA256)
-        {
-            Some(TLS_PSK_WITH_AES_128_GCM_SHA256)
-        } else {
-            None
+            return Err(proto("unexpected ServerKeyExchange for RSA key transport"));
         }
+        let cert_msg = CertificateMsg::parse(&body_of(flight4, HandshakeType::Certificate)?)
+            .map_err(dtls_err)?;
+        let leaf_key = cert::verify_peer(
+            &cert_msg.chain,
+            self.cfg.insecure_skip_verify,
+            self.cfg.peer_cert_fingerprint,
+        )
+        .map_err(dtls_err)?;
+        let pub_key = match &leaf_key {
+            PeerKey::Rsa(_) if leaf_key.auth_method() == self.suite.auth => leaf_key
+                .rsa_public_key()
+                .ok_or_else(|| proto("missing RSA public key"))?,
+            _ => {
+                return Err(proto(
+                    "RSA key transport requires an RSA server certificate",
+                ));
+            }
+        };
+        let pms = new_rsa_premaster().map_err(dtls_err)?;
+        let ct = encrypt_rsa_premaster(pub_key, &pms).map_err(dtls_err)?;
+        Ok((pms, client_key_exchange_rsa(&ct)))
+    }
+
+    /// Selects the server's cipher suite: the first table entry (strongest first)
+    /// the client offered that this config can serve and the user has not disabled.
+    fn select_server_suite(&self, ch: &ClientHello) -> Option<u16> {
+        SUITE_TABLE
+            .iter()
+            .find(|s| ch.cipher_suites.contains(&s.id) && self.cfg.server_can_serve(**s))
+            .map(|s| s.id)
     }
 
     // --- server handshake ---
@@ -497,7 +612,9 @@ impl<T: Transport> Conn<T> {
             .select_server_suite(&ch3)
             .ok_or_else(|| proto("no common cipher suite"))?;
         self.cipher_suite = suite;
-        let ecdhe = suite == TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256;
+        self.suite = lookup_suite(suite).expect("selected suite is in the table");
+        let is_ecdhe = self.suite.kx == KeyExchange::Ecdhe;
+        let cert_suite = self.suite.auth != AuthMethod::None;
         let client_random = ch3.random;
         let ems = ch3.ext_master_secret;
 
@@ -508,13 +625,13 @@ impl<T: Transport> Conn<T> {
             session_id: Vec::new(),
             cipher_suite: suite,
             ext_master_secret: ems,
-            point_formats: ecdhe && ch3.point_formats_offered,
+            point_formats: is_ecdhe && ch3.point_formats_offered,
             secure_renegotiation: ch3.secure_renegotiation,
         }
         .marshal_body();
         let mut f4 = vec![self.emit_handshake(HandshakeType::ServerHello, &sh, 0, true)];
         let mut server_secret = None;
-        if ecdhe {
+        if cert_suite {
             let identity = self
                 .cfg
                 .certificate
@@ -529,25 +646,32 @@ impl<T: Transport> Conn<T> {
                 0,
                 true,
             ));
-            let (secret, point) = generate_ecdhe();
-            let mut ske = ServerKeyExchange {
-                curve: NAMED_GROUP_SECP256R1,
-                public_key: point,
-                sig_scheme: SIG_SCHEME_ECDSA_P256_SHA256,
-                signature: Vec::new(),
-            };
-            let mut signed = Vec::with_capacity(64 + ske.public_key.len());
-            signed.extend_from_slice(&client_random);
-            signed.extend_from_slice(&server_random);
-            signed.extend_from_slice(&ske.signed_params());
-            ske.signature = cert::sign(identity.signing_key(), &signed);
-            f4.push(self.emit_handshake(
-                HandshakeType::ServerKeyExchange,
-                &ske.marshal_body(),
-                0,
-                true,
-            ));
-            server_secret = Some(secret);
+            // ECDHE sends a signed ServerKeyExchange; RSA key transport sends none
+            // (the client encrypts the pre-master to the certificate's public key).
+            if is_ecdhe {
+                let (secret, point) = generate_ecdhe();
+                let mut ske = ServerKeyExchange {
+                    curve: NAMED_GROUP_SECP256R1,
+                    public_key: point,
+                    sig_scheme: 0,
+                    signature: Vec::new(),
+                };
+                let mut signed = Vec::with_capacity(64 + ske.public_key.len());
+                signed.extend_from_slice(&client_random);
+                signed.extend_from_slice(&server_random);
+                signed.extend_from_slice(&ske.signed_params());
+                // Sign with the certificate's key type (ECDSA or RSA), SHA-256.
+                let (sig_scheme, signature) = cert::sign_handshake(&identity, &signed);
+                ske.sig_scheme = sig_scheme;
+                ske.signature = signature;
+                f4.push(self.emit_handshake(
+                    HandshakeType::ServerKeyExchange,
+                    &ske.marshal_body(),
+                    0,
+                    true,
+                ));
+                server_secret = Some(secret);
+            }
         }
         f4.push(self.emit_handshake(HandshakeType::ServerHelloDone, &[], 0, true));
         self.send_flight(&f4)?;
@@ -557,32 +681,55 @@ impl<T: Transport> Conn<T> {
         // until the keys derived from this ClientKeyExchange exist.
         let f5 = self.read_flight(HandshakeType::ClientKeyExchange, &f4)?;
         let cke_in = single(&f5, HandshakeType::ClientKeyExchange)?;
-        let pre_master = if ecdhe {
-            let point = parse_client_key_exchange_ecdhe(&cke_in.body).map_err(dtls_err)?;
-            let secret = server_secret.ok_or_else(|| proto("missing ECDHE secret"))?;
-            ecdhe_premaster(&secret, &point).map_err(dtls_err)?
-        } else {
-            let identity = parse_client_key_exchange_psk(&cke_in.body).map_err(dtls_err)?;
-            if identity != self.cfg.psk_identity {
-                return Err(proto("unknown PSK identity"));
+        let pre_master = match self.suite.kx {
+            KeyExchange::Ecdhe => {
+                let point = parse_client_key_exchange_ecdhe(&cke_in.body).map_err(dtls_err)?;
+                let secret = server_secret.ok_or_else(|| proto("missing ECDHE secret"))?;
+                ecdhe_premaster(&secret, &point).map_err(dtls_err)?
             }
-            let psk = self
-                .cfg
-                .psk
-                .clone()
-                .ok_or_else(|| proto("PSK not configured"))?;
-            psk_premaster(&psk)
+            KeyExchange::Rsa => {
+                let ct = parse_client_key_exchange_rsa(&cke_in.body).map_err(dtls_err)?;
+                let identity = self
+                    .cfg
+                    .certificate
+                    .clone()
+                    .ok_or_else(|| proto("no certificate configured"))?;
+                let rsa_key = identity
+                    .rsa_private_key()
+                    .ok_or_else(|| proto("RSA key transport requires an RSA certificate"))?;
+                // The Bleichenbacher countermeasure yields a random pre-master on any
+                // failure, so the handshake fails uniformly at Finished.
+                decrypt_rsa_premaster(rsa_key, &ct).map_err(dtls_err)?
+            }
+            KeyExchange::Psk => {
+                let identity = parse_client_key_exchange_psk(&cke_in.body).map_err(dtls_err)?;
+                if identity != self.cfg.psk_identity {
+                    return Err(proto("unknown PSK identity"));
+                }
+                let psk = self
+                    .cfg
+                    .psk
+                    .clone()
+                    .ok_or_else(|| proto("PSK not configured"))?;
+                psk_premaster(&psk)
+            }
         };
         self.hash_incoming(cke_in);
         let session_hash = self.transcript_hash();
         let master = derive_master(
+            self.suite.hash,
             ems,
             &pre_master,
             &session_hash,
             &client_random,
             &server_random,
         );
-        self.keys = Some(derive_keys(&master, &client_random, &server_random));
+        self.keys = Some(derive_keys(
+            self.suite,
+            &master,
+            &client_random,
+            &server_random,
+        ));
         self.drain_pending()?; // decrypt the buffered Finished now that keys exist
 
         // Flight 5b: the client's Finished (epoch 1).
@@ -590,8 +737,12 @@ impl<T: Transport> Conn<T> {
         self.verify_peer_finished(&fin_flight, &master, LABEL_CLIENT_FINISHED)?;
 
         // Flight 6: ChangeCipherSpec, Finished (server).
-        let server_fin =
-            finished_verify_data(&master, LABEL_SERVER_FINISHED, &self.transcript_hash());
+        let server_fin = finished_verify_data(
+            self.suite.hash,
+            &master,
+            LABEL_SERVER_FINISHED,
+            &self.transcript_hash(),
+        );
         let ccs = RecordSpec {
             typ: ContentType::ChangeCipherSpec,
             epoch: 0,
@@ -615,7 +766,7 @@ impl<T: Transport> Conn<T> {
         if fin.epoch != 1 {
             return Err(proto("Finished not under epoch 1"));
         }
-        let expect = finished_verify_data(master, label, &self.transcript_hash());
+        let expect = finished_verify_data(self.suite.hash, master, label, &self.transcript_hash());
         if fin.body.ct_eq(&expect).unwrap_u8() != 1 {
             return Err(proto("Finished verify_data mismatch"));
         }
@@ -823,27 +974,28 @@ impl<T: Transport> Conn<T> {
             .extend_from_slice(&full_message_bytes(m.typ, m.message_seq, &m.body));
     }
 
-    fn transcript_hash(&self) -> [u8; 32] {
-        let digest = Sha256::digest(&self.transcript);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&digest);
-        out
+    /// The handshake transcript hash under the negotiated suite's hash (32 bytes for
+    /// SHA-256, 48 for SHA-384). Before negotiation it uses the SHA-256 default, but
+    /// it is only consulted after the suite is fixed.
+    fn transcript_hash(&self) -> Vec<u8> {
+        self.suite.hash.digest(&self.transcript)
     }
 }
 
-/// Derives the master secret, using the extended scheme (RFC 7627) when both peers
-/// agreed, else the classic randoms-based scheme (RFC 5246).
+/// Derives the master secret under the suite `hash`, using the extended scheme (RFC
+/// 7627) when both peers agreed, else the classic randoms-based scheme (RFC 5246).
 fn derive_master(
+    hash: PrfHash,
     ems: bool,
     pre_master: &[u8],
-    session_hash: &[u8; 32],
+    session_hash: &[u8],
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> [u8; 48] {
     if ems {
-        extended_master_secret(pre_master, session_hash)
+        extended_master_secret(hash, pre_master, session_hash)
     } else {
-        master_secret(pre_master, client_random, server_random)
+        master_secret(hash, pre_master, client_random, server_random)
     }
 }
 
@@ -917,6 +1069,7 @@ fn single(flight: &[Incoming], typ: HandshakeType) -> io::Result<&Incoming> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384;
     use super::*;
     use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -1000,14 +1153,15 @@ mod tests {
 
         let mut c = Conn::client(cp, short(Config::ecdhe_client_pinned(pin)));
         c.handshake().expect("client handshake");
-        assert_eq!(c.cipher_suite(), TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
+        // An ECDSA certificate negotiates the strongest ECDSA suite the table offers.
+        assert_eq!(c.cipher_suite(), TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
         c.write(b"ecdhe app data").expect("client write");
         let mut buf = vec![0u8; 1500];
         let n = c.read(&mut buf).expect("client read");
         assert_eq!(&buf[..n], b"ecdhe app data");
         assert_eq!(
             server.join().expect("server thread"),
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
         );
     }
 
@@ -1068,6 +1222,161 @@ mod tests {
         assert!(
             client_failed || server_failed,
             "a key mismatch must fail the handshake"
+        );
+    }
+
+    /// Runs a full handshake + one app-data echo over the in-memory pipe, asserting
+    /// both ends agree on the negotiated suite, and returns it.
+    fn run_suite_handshake(client_cfg: Config, server_cfg: Config) -> u16 {
+        let (cp, sp) = pipe();
+        let server = std::thread::spawn(move || {
+            let mut s = Conn::server(sp, short(server_cfg));
+            s.handshake().expect("server handshake");
+            let mut buf = vec![0u8; 1500];
+            let n = s.read(&mut buf).expect("server read");
+            s.write(&buf[..n]).expect("server write");
+            s.cipher_suite()
+        });
+        let mut c = Conn::client(cp, short(client_cfg));
+        c.handshake().expect("client handshake");
+        c.write(b"all-suites app data").expect("client write");
+        let mut buf = vec![0u8; 1500];
+        let n = c.read(&mut buf).expect("client read");
+        assert_eq!(&buf[..n], b"all-suites app data", "app data round-trips");
+        let server_suite = server.join().expect("server thread");
+        assert_eq!(
+            c.cipher_suite(),
+            server_suite,
+            "both sides agree on the suite"
+        );
+        c.cipher_suite()
+    }
+
+    /// Every TR-06-2 §6.2 mandatory suite (plus PSK) negotiates end to end. Each is
+    /// pinned by disabling the stronger same-credential suites, exercising the
+    /// table-driven selection, both AES key sizes, both PRF hashes, the ECDSA and RSA
+    /// certificate paths, RSA key transport, and the NULL-cipher record layer.
+    #[test]
+    fn all_mandatory_suites_handshake() {
+        use super::super::suites::{
+            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_RSA_WITH_NULL_SHA256,
+        };
+
+        let ecdsa = Identity::generate("ecdsa-leaf").unwrap();
+        let ecdsa_pin = cert::fingerprint(ecdsa.der());
+        let rsa = Identity::generate_rsa("rsa-leaf").unwrap();
+        let rsa_pin = cert::fingerprint(rsa.der());
+
+        let cert_client = |pin: [u8; 32], disabled: Vec<u16>, allow_null: bool| Config {
+            peer_cert_fingerprint: Some(pin),
+            disabled_suites: disabled,
+            allow_null_cipher: allow_null,
+            ..Config::default()
+        };
+        let cert_server = |id: Identity, disabled: Vec<u16>, allow_null: bool| Config {
+            certificate: Some(Arc::new(id)),
+            disabled_suites: disabled,
+            allow_null_cipher: allow_null,
+            ..Config::default()
+        };
+
+        // ECDHE_ECDSA: AES-256-GCM-SHA384 (table default) and AES-128-GCM-SHA256.
+        assert_eq!(
+            run_suite_handshake(
+                cert_client(ecdsa_pin, vec![], false),
+                cert_server(ecdsa.clone(), vec![], false)
+            ),
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+        assert_eq!(
+            run_suite_handshake(
+                cert_client(ecdsa_pin, vec![], false),
+                cert_server(
+                    ecdsa.clone(),
+                    vec![TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384],
+                    false
+                )
+            ),
+            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        );
+
+        // ECDHE_RSA: AES-256-GCM-SHA384 and AES-128-GCM-SHA256.
+        assert_eq!(
+            run_suite_handshake(
+                cert_client(rsa_pin, vec![], false),
+                cert_server(rsa.clone(), vec![], false)
+            ),
+            TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        );
+        assert_eq!(
+            run_suite_handshake(
+                cert_client(rsa_pin, vec![], false),
+                cert_server(
+                    rsa.clone(),
+                    vec![TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384],
+                    false
+                )
+            ),
+            TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        );
+
+        // RSA_WITH_NULL_SHA256 (integrity only) — both ends opt into the NULL cipher
+        // and the ECDHE_RSA suites are disabled so it is the only RSA option.
+        assert_eq!(
+            run_suite_handshake(
+                cert_client(rsa_pin, vec![], true),
+                cert_server(
+                    rsa.clone(),
+                    vec![
+                        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                    ],
+                    true
+                )
+            ),
+            TLS_RSA_WITH_NULL_SHA256
+        );
+
+        // PSK.
+        assert_eq!(
+            run_suite_handshake(
+                Config::psk(b"id".to_vec(), b"key".to_vec()),
+                Config::psk(b"id".to_vec(), b"key".to_vec())
+            ),
+            TLS_PSK_WITH_AES_128_GCM_SHA256
+        );
+    }
+
+    /// The NULL cipher is OFF by default: a server with an RSA certificate but no
+    /// `allow_null_cipher` must NOT fall back to the cleartext suite even when it is
+    /// the only suite the client offers — it has no common suite and fails.
+    #[test]
+    fn null_cipher_refused_without_optin() {
+        let rsa = Identity::generate_rsa("rsa-leaf").unwrap();
+        let rsa_pin = cert::fingerprint(rsa.der());
+        // The client offers ONLY the NULL suite (every other RSA suite disabled).
+        let client = Config {
+            peer_cert_fingerprint: Some(rsa_pin),
+            allow_null_cipher: true,
+            disabled_suites: vec![
+                super::super::suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                super::super::suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ],
+            ..Config::default()
+        };
+        // The server has the RSA cert but did NOT opt into the NULL cipher.
+        let server = Config {
+            certificate: Some(Arc::new(rsa)),
+            allow_null_cipher: false,
+            ..Config::default()
+        };
+        let (cp, sp) = pipe();
+        let srv = std::thread::spawn(move || Conn::server(sp, short(server)).handshake().is_err());
+        let client_failed = Conn::client(cp, short(client)).handshake().is_err();
+        assert!(
+            client_failed || srv.join().expect("server thread"),
+            "the NULL cipher must not be selectable without the opt-in"
         );
     }
 }

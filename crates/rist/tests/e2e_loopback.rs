@@ -127,6 +127,98 @@ async fn stats_reflect_a_clean_transfer() {
     receiver.close().await.expect("close receiver");
 }
 
+#[tokio::test]
+async fn one_way_delivers_without_feedback() {
+    const N: usize = 30;
+    // Both ends run one-way: no ARQ, no control egress.
+    let cfg = Config::default()
+        .with_buffer(Duration::from_millis(100))
+        .with_one_way(true);
+    let (mut receiver, port) = listen_free(&cfg).await;
+    let sender = dial(&format!("127.0.0.1:{port}"), cfg.clone())
+        .await
+        .expect("dial");
+
+    let send_task = tokio::spawn(async move {
+        for i in 0..N {
+            sender
+                .send(format!("ow-{i:03}").as_bytes())
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        sender
+    });
+    for i in 0..N {
+        let got = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session stayed open");
+        assert_eq!(got.as_ref(), format!("ow-{i:03}").as_bytes());
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sender = send_task.await.expect("send task");
+    // No ARQ ran in either direction on this clean one-way link.
+    assert_eq!(sender.stats().retransmitted, 0);
+    let rx = receiver.stats();
+    assert_eq!((rx.nacks_sent, rx.recovered, rx.lost), (0, 0, 0));
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
+async fn one_way_does_not_recover_loss() {
+    const N: usize = 50;
+    const FLUSH: usize = 10;
+    let body = "x".repeat(160); // >128 so each datagram is loss-eligible
+    let cfg = Config::default()
+        .with_buffer(Duration::from_millis(150))
+        .with_one_way(true);
+    let (mut receiver, port) = listen_free(&cfg).await;
+    let lossy = LossyRuntime {
+        loss: 0.30,
+        next_seed: AtomicU64::new(0x0BAD_F00D),
+    };
+    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &lossy)
+        .await
+        .expect("dial with the lossy runtime");
+
+    let payload = move |i: usize| format!("ow-{i:04}-{body}").into_bytes();
+    let send_task = tokio::spawn(async move {
+        for i in 0..N + FLUSH {
+            sender.send(&payload(i)).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        sender
+    });
+
+    // Drain whatever arrives; a one-way receiver reclaims a hole by playout-skip
+    // (it never blocks on a gap), so this terminates once the stream ends.
+    let mut delivered = 0usize;
+    while delivered < N + FLUSH {
+        match tokio::time::timeout(Duration::from_millis(500), receiver.recv()).await {
+            Ok(Ok(_)) => delivered += 1,
+            _ => break,
+        }
+    }
+
+    let sender = send_task.await.expect("send task");
+    let rx = receiver.stats();
+    // One-way never NACKs and never recovers, even though media was dropped — the
+    // loss surfaces as unrecoverable, skipped at playout.
+    assert_eq!(rx.nacks_sent, 0, "one-way receiver sent NACKs");
+    assert_eq!(rx.recovered, 0, "one-way receiver recovered via ARQ");
+    assert!(rx.lost > 0, "loss path not exercised (lost == 0)");
+    assert_eq!(
+        sender.stats().retransmitted,
+        0,
+        "one-way sender retransmitted"
+    );
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
 /// A [`Runtime`] whose UDP sockets drop a fraction of *forward media* datagrams
 /// (those larger than [`MEDIA_THRESHOLD`]). RTCP compounds — NACKs, echoes,
 /// reports — are small and pass through losslessly, so the receiver's NACK

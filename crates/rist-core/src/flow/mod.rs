@@ -103,6 +103,11 @@ pub struct Config {
     pub ssrc: u32,
     /// The first sequence number assigned to `push_app` packets.
     pub start_seq: u32,
+    /// Disables ARQ recovery for a one-way / no-return-channel transport: the
+    /// sender retains no retransmit history and originates no RTT echo; the
+    /// receiver queues no missing entries (so requests no NACKs) and originates no
+    /// RTT echo, reclaiming an unrecoverable hole by playout-skip rather than ARQ.
+    pub no_recovery: bool,
 }
 
 impl Config {
@@ -123,6 +128,7 @@ impl Config {
             congestion_control: CongestionMode::Normal,
             ssrc: 0,
             start_seq: 0,
+            no_recovery: false,
         }
     }
 

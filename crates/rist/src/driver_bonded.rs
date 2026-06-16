@@ -468,6 +468,9 @@ impl BondedDriver {
     /// Sends one GRE-framed RTCP compound (the SR/RR lead + SDES, no feedback) on
     /// path `i` — the handshake libRIST gates inbound media on.
     async fn send_handshake(&mut self, i: usize, now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.paths[i].peer.media() else {
             return;
         };
@@ -480,6 +483,9 @@ impl BondedDriver {
 
     /// Sends a GRE keepalive (MAC + standard capabilities) on path `i`.
     async fn send_keepalive(&mut self, i: usize, _now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.paths[i].peer.media() else {
             return;
         };

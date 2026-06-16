@@ -436,6 +436,9 @@ impl AdvDriver {
     /// Sends the raw Main GRE RTCP (SR/RR + SDES) handshake — the substrate that
     /// authenticates this peer to libRIST and ungates its media.
     async fn send_handshake(&mut self, now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.peer.media() else { return };
         let lead = self.feedback_lead(now);
         let sock = self.socket.clone();
@@ -446,6 +449,9 @@ impl AdvDriver {
 
     /// Sends the Advanced keep-alive (Type=4, I-bit), the capability/liveness beacon.
     async fn send_keepalive(&mut self, now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.peer.media() else { return };
         let sock = self.socket.clone();
         if let Ok(bytes) = self.adv.keepalive_datagram(adv_ctrl_ts(now)) {

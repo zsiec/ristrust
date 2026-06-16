@@ -123,6 +123,12 @@ pub struct Config {
     /// RIST NPD RTP extension, saving the bandwidth of transmitting stuffing; the
     /// receiver reconstructs them. Main profile only. Default: off.
     pub null_packet_deletion: bool,
+    /// Run as a one-way / no-return-channel transport: the sender keeps no
+    /// retransmit history and emits no control traffic; the receiver requests no
+    /// retransmission and sends nothing back (reclaiming unrecoverable loss by
+    /// playout-skip). Set it on **both** ends. Incompatible with EAP-SRP (the
+    /// handshake needs a return channel). Default: off.
+    pub one_way: bool,
     /// Make a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
     /// or an Advanced control message (index `0x0002`). Default: off.
@@ -182,6 +188,7 @@ impl Default for Config {
             srp_password: None,
             compression: false,
             null_packet_deletion: false,
+            one_way: false,
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
@@ -307,6 +314,15 @@ impl Config {
         self
     }
 
+    /// Runs the session as a one-way / no-return-channel transport (no ARQ, no
+    /// control egress). Set it on both the sender and the receiver. Incompatible
+    /// with EAP-SRP authentication.
+    #[must_use]
+    pub fn with_one_way(mut self, on: bool) -> Config {
+        self.one_way = on;
+        self
+    }
+
     /// Makes a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1).
     #[must_use]
@@ -418,6 +434,10 @@ impl Config {
         }
         if self.max_bitrate_kbps == 0 {
             return Err(ConfigError::MaxBitrateZero);
+        }
+        // One-way mode has no return channel, so the EAP-SRP handshake cannot run.
+        if self.one_way && (self.srp_username.is_some() || self.srp_password.is_some()) {
+            return Err(ConfigError::OneWayWithAuth);
         }
         // Fail closed: reject features a profile would silently ignore.
         let unsupported =
@@ -583,6 +603,27 @@ mod tests {
             Config::default()
                 .with_profile(Profile::Main)
                 .with_null_packet_deletion(true)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_one_way_with_auth() {
+        // One-way has no return channel, so EAP-SRP cannot run.
+        assert_eq!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_one_way(true)
+                .with_srp_credentials("u", "p")
+                .validate(),
+            Err(ConfigError::OneWayWithAuth)
+        );
+        // One-way alone (no auth) is fine.
+        assert!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_one_way(true)
                 .validate()
                 .is_ok()
         );

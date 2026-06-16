@@ -329,16 +329,27 @@ impl Flow {
         self.stats.received += 1;
 
         self.arm_playout(output_time);
-        self.outputs.push_back(Output::SetTimer {
-            id: TimerId::RttEcho,
-            deadline: now + RTT_ECHO_INTERVAL,
-        });
+        // A no-recovery (one-way) transport has no return channel, so the receiver
+        // originates no RTT echo requests.
+        if !self.cfg.no_recovery {
+            self.outputs.push_back(Output::SetTimer {
+                id: TimerId::RttEcho,
+                deadline: now + RTT_ECHO_INTERVAL,
+            });
+        }
     }
 
     /// Queues missing entries for every sequence in `(last_found, current)`,
     /// following `receiver_mark_missing`: the per-entry nack time is interpolated
     /// linearly between the two known packet times (assuming CBR).
     fn mark_missing(&mut self, now: Timestamp, path: u8, current: u32, packet_time_now: Timestamp) {
+        // A no-recovery (one-way) transport has no return channel: never queue
+        // missing entries, so no NACKs are ever requested. The `last_found` cursor
+        // still advances at the call site and the playout timer reclaims the hole
+        // at its deadline (recovery by playout-skip, not ARQ).
+        if self.cfg.no_recovery {
+            return;
+        }
         let last_found = self.receiver.last_found;
         let gap = u64::from(current.wrapping_sub(last_found));
         // Wraparound guard pinned to seq::MAX_GAP_16 (32768) for flows widened
@@ -700,6 +711,62 @@ mod tests {
             drain_outputs(&mut f).is_empty(),
             "steady state emits nothing"
         );
+    }
+
+    #[test]
+    fn no_recovery_receiver_never_nacks_but_still_delivers() {
+        let mut c = Config::librist_defaults();
+        c.no_recovery = true;
+        let mut f = Flow::new(Role::Receiver, c);
+
+        // First packet arms playout only — no RTT-echo cadence.
+        f.feed(ts(10_000), 0, mk_pkt(100, 0, b"a"));
+        assert_eq!(
+            drain_outputs(&mut f),
+            vec![Output::SetTimer {
+                id: TimerId::Playout,
+                deadline: ts(1_010_000),
+            }],
+            "one-way first packet must arm only the playout timer"
+        );
+
+        // A gap (101 never arrives): a normal receiver would queue a missing entry
+        // and arm TimerNack. One-way does neither — no recovery output of any kind.
+        f.feed(ts(24_000), 0, mk_pkt(102, 14_000, b"c"));
+        let outs = drain_outputs(&mut f);
+        assert!(
+            !outs.iter().any(|o| {
+                matches!(o, Output::SetTimer { id, .. }
+                    if *id == TimerId::Nack || *id == TimerId::RttEcho)
+                    || matches!(o, Output::SendFeedback { .. })
+            }),
+            "one-way receiver requested recovery on a gap: {outs:?}"
+        );
+        assert!(
+            f.receiver.missing.is_empty(),
+            "one-way receiver queued a missing entry"
+        );
+
+        // Playout still drives in-order delivery and skips the hole at its deadline.
+        f.handle_timer(ts(1_010_000), TimerId::Playout);
+        assert_eq!(delivered_seqs(&drain_events(&mut f)), vec![100]);
+        drain_outputs(&mut f);
+        f.handle_timer(ts(1_024_000), TimerId::Playout);
+        let evs = drain_events(&mut f);
+        assert_eq!(delivered_seqs(&evs), vec![102]);
+        assert!(
+            matches!(
+                evs[0],
+                Event::Deliver {
+                    discontinuity: true,
+                    ..
+                }
+            ),
+            "delivery after a skipped hole must flag a discontinuity"
+        );
+
+        let st = f.stats();
+        assert_eq!((st.delivered, st.lost), (2, 1));
     }
 
     #[test]

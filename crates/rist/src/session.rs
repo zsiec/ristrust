@@ -87,6 +87,7 @@ fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
         congestion_control: cfg.congestion_control,
         ssrc,
         start_seq,
+        no_recovery: cfg.one_way,
     }
 }
 
@@ -104,7 +105,9 @@ fn bitmask_of(cfg: &Config) -> bool {
 /// enabled (TR-06-4 Part 1): one report per keepalive period, tagging each with the
 /// recovery (NACK) window. `None` when adaptation is off.
 fn build_lqm_emitter(cfg: &Config) -> Option<LqmEmitter> {
-    if !cfg.source_adaptation {
+    // A one-way receiver sends nothing back, so it emits no Link Quality Messages
+    // even when source adaptation is requested.
+    if !cfg.source_adaptation || cfg.one_way {
         return None;
     }
     let nack_window_ms = u32::try_from(cfg.buffer_min.as_millis()).unwrap_or(u32::MAX);

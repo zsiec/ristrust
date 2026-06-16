@@ -474,6 +474,9 @@ impl MainDriver {
     /// the peer. libRIST gates inbound media on authenticating us via this SDES, so
     /// it must precede our media; it also keeps the control plane alive while idle.
     async fn send_handshake(&mut self, now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.peer.media() else { return };
         let lead = self.feedback_lead(now);
         let sock = self.socket.clone();
@@ -485,6 +488,9 @@ impl MainDriver {
     /// Sends a GRE keepalive carrying this node's MAC and standard capabilities, to
     /// keep the session alive and advertise the return address.
     async fn send_keepalive(&mut self, _now: Timestamp) {
+        if self.flow.config().no_recovery {
+            return; // one-way: no control egress
+        }
         let Some(dst) = self.peer.media() else { return };
         let ka = gre::Keepalive {
             mac: self.mac,

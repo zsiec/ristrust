@@ -433,6 +433,11 @@ impl Driver {
     /// Sends a bare lead + SDES compound to keep NAT state alive and advertise the
     /// return address; the receiver learns the sender's RTCP source from it.
     async fn send_keepalive(&self, now: Timestamp) {
+        // A one-way transport emits no control traffic (so its peer never sees it
+        // and the sender never learns a return address to time out against).
+        if self.flow.config().no_recovery {
+            return;
+        }
         let Some(dst) = self.peer.rtcp() else { return };
         let lead = self.feedback_lead(now);
         if let Ok(bytes) =

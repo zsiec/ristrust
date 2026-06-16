@@ -127,11 +127,14 @@ impl Flow {
             // precondition, so origination is intentionally ungated. End-to-end
             // this matches libRIST, whose receiver originates echoes
             // unconditionally and flips the sender's `echo_enabled` within one
-            // cadence.
-            self.outputs.push_back(Output::SetTimer {
-                id: TimerId::RttEcho,
-                deadline: now + RTT_ECHO_INTERVAL,
-            });
+            // cadence. A no-recovery (one-way) transport has no return channel, so
+            // there is no RTT to measure and no retransmits to gate: no echo.
+            if !self.cfg.no_recovery {
+                self.outputs.push_back(Output::SetTimer {
+                    id: TimerId::RttEcho,
+                    deadline: now + RTT_ECHO_INTERVAL,
+                });
+            }
         }
 
         let seqn = self.sender.next_seq;
@@ -139,8 +142,11 @@ impl Flow {
         let source_time = Ntp64::from_timestamp(now).bits();
         let wire_n = wire_bytes(payload.len());
 
-        let idx = (seqn & self.sender.mask) as usize;
-        {
+        // A no-recovery (one-way) transport never retransmits, so retaining the
+        // packet in the history ring would only waste memory: emit and forget. A
+        // later (stray) NACK finds an empty slot and is reported unserviceable.
+        if !self.cfg.no_recovery {
+            let idx = (seqn & self.sender.mask) as usize;
             // Lazy eviction: a new sequence reusing this slot overwrites the stale
             // entry, exactly as libRIST's ring overwrites aged packets. A later
             // NACK for the overwritten sequence finds a mismatched slot and is
@@ -372,6 +378,38 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn no_recovery_sender_keeps_no_history_and_never_echoes() {
+        let mut c = sender_config();
+        c.no_recovery = true;
+        let mut f = Flow::new(Role::Sender, c);
+
+        f.push_app(ts(10_000), Bytes::from_static(b"a")); // seq 100
+        let outs = drain_outputs(&mut f);
+        // The first transmission goes out, but with no RTT-echo cadence armed and
+        // no feedback emitted (a one-way transport has no return channel).
+        let ms = media_outputs(&outs);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].seq, 100);
+        assert!(!ms[0].retransmit);
+        assert!(
+            !outs.iter().any(|o| {
+                matches!(o, Output::SetTimer { id, .. } if *id == crate::flow::TimerId::RttEcho)
+                    || matches!(o, Output::SendFeedback { .. })
+            }),
+            "one-way sender armed a recovery timer or emitted feedback: {outs:?}"
+        );
+        // No history retained: the ring slot stays empty.
+        assert_eq!(slot_of(&f, 100).state, SlotState::Empty);
+
+        // A stray NACK for seq 100 finds no history: nothing is retransmitted and
+        // it is counted as skipped (aged out), not suppressed or exhausted.
+        f.feed_feedback(ts(20_000), nack(vec![100]));
+        assert!(media_outputs(&drain_outputs(&mut f)).is_empty());
+        let st = f.stats();
+        assert_eq!((st.retransmitted, st.retransmit_skipped), (0, 1));
     }
 
     #[test]

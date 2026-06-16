@@ -69,6 +69,10 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
     },
+    /// One-way mode was combined with EAP-SRP authentication, which needs a return
+    /// channel for the handshake.
+    #[error("rist: one-way mode is incompatible with EAP-SRP authentication")]
+    OneWayWithAuth,
 }
 
 /// The top-level error type for the host crate.

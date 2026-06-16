@@ -88,6 +88,11 @@ pub(crate) struct AdvCodec {
     ts_base_ticks: i64,
     ts_ref_seq: u32,
     ts_ref_ticks: i64,
+
+    /// Inbound control messages whose Control Index this codec did not recognize
+    /// (TR-06-3 §5.3.10), queued as `(ci, head)` for the host to answer with a
+    /// Control Message Unsupported Response. Drained via [`AdvCodec::take_unsupported`].
+    pending_unsupported: Vec<(u16, [u8; 6])>,
 }
 
 impl AdvCodec {
@@ -116,7 +121,29 @@ impl AdvCodec {
             ts_base_ticks: 0,
             ts_ref_seq: 0,
             ts_ref_ticks: 0,
+            pending_unsupported: Vec::new(),
         }
+    }
+
+    /// Drains the queue of inbound control messages whose Control Index was not
+    /// recognized, each as `(incoming_ci, head)` (the first 48 bits of the offending
+    /// body, zero-padded). The host answers each with a Control Message Unsupported
+    /// Response (TR-06-3 §5.3.10).
+    pub(crate) fn take_unsupported(&mut self) -> Vec<(u16, [u8; 6])> {
+        std::mem::take(&mut self.pending_unsupported)
+    }
+
+    /// Frames a Control Message Unsupported Response echoing `ci` and `head`, stamped
+    /// with `ts` (TR-06-3 §5.3.10).
+    pub(crate) fn encode_unsupported(
+        &mut self,
+        ci: u16,
+        head: [u8; 6],
+        ts: u32,
+    ) -> Result<Vec<u8>, CodecError> {
+        let mut body = Vec::new();
+        adv::build_unsupported(&mut body, self.ctrl_ssrc(), ci, head);
+        self.frame_control(&body, ts)
     }
 
     /// Whether a PSK is configured.
@@ -202,18 +229,49 @@ impl AdvCodec {
     /// no flow input; every other control index maps to normalized feedback.
     fn decode_control_msg(&mut self, payload: &Bytes) -> Result<Decoded, CodecError> {
         let (ci, body) = adv::parse_control(payload)?;
-        if ci == adv::CI_PSK_NONCE {
-            if let (Ok(pn), Some(key)) = (adv::PskNonce::parse(&body), self.recv_key.as_mut()) {
-                let bits = if pn.key_bits == 256 {
-                    crypto::AesKeyBits::Aes256
-                } else {
-                    crypto::AesKeyBits::Aes128
-                };
-                key.precompute(pn.nonce, bits);
+        match ci {
+            adv::CI_PSK_NONCE => {
+                // Pre-derive the announced future nonce's key (a decryptor concern).
+                if let (Ok(pn), Some(key)) = (adv::PskNonce::parse(&body), self.recv_key.as_mut()) {
+                    let bits = if pn.key_bits == 256 {
+                        crypto::AesKeyBits::Aes256
+                    } else {
+                        crypto::AesKeyBits::Aes128
+                    };
+                    key.precompute(pn.nonce, bits);
+                }
+                Ok(Decoded::Ignored)
             }
-            return Ok(Decoded::Ignored);
+            // Recognized control indices that carry normalized feedback.
+            adv::CI_NACK_BITMASK
+            | adv::CI_NACK_RANGE
+            | adv::CI_RTT_ECHO_REQ
+            | adv::CI_RTT_ECHO_RESP
+            | adv::CI_LQM_GLOBAL
+            | adv::CI_LQM_LINK_SPECIFIC
+            | adv::CI_FLOW_ATTR => Ok(Decoded::Feedback(self.decode_control(payload)?)),
+            // Recognized but yielding no flow input: keepalive and SRP-auth are
+            // handled on the substrate; FEC control is consumed before this point;
+            // an inbound Unsupported is logged at the host but never answered (a
+            // reply would loop). None of these triggers an Unsupported response.
+            adv::CI_KEEPALIVE
+            | adv::CI_SRP_AUTH
+            | adv::CI_UNSUPPORTED
+            | adv::CI_FEC_2022_5_ROW
+            | adv::CI_FEC_2022_5_COL
+            | adv::CI_FEC_2022_1_ROW
+            | adv::CI_FEC_2022_1_COL => Ok(Decoded::Ignored),
+            // An unrecognized control index (§5.3.10): queue an Unsupported response
+            // echoing the CI and the first 48 bits of the body, so the peer learns we
+            // did not understand it.
+            _ => {
+                let mut head = [0u8; 6];
+                let n = body.len().min(6);
+                head[..n].copy_from_slice(&body[..n]);
+                self.pending_unsupported.push((ci, head));
+                Ok(Decoded::Ignored)
+            }
         }
-        Ok(Decoded::Feedback(self.decode_control(payload)?))
     }
 
     /// Parses and demultiplexes one Advanced datagram (a convenience over
@@ -665,6 +723,52 @@ mod tests {
         assert_eq!(flags_to_frag(true, false), FragRole::First);
         assert_eq!(flags_to_frag(false, false), FragRole::Middle);
         assert_eq!(flags_to_frag(false, true), FragRole::Last);
+    }
+
+    #[test]
+    fn unknown_control_index_emits_unsupported() {
+        let mut c = AdvCodec::new(None, None, false, 0x10, 0, 0);
+
+        // A recognized no-feedback CI (keepalive) queues no Unsupported.
+        let mut ka = Vec::new();
+        adv::build_control(&mut ka, adv::CI_KEEPALIVE, &[]);
+        let _ = c.decode_control_msg(&Bytes::from(ka)).unwrap();
+        assert!(
+            c.take_unsupported().is_empty(),
+            "a recognized CI must not trigger Unsupported"
+        );
+
+        // An unrecognized CI queues an Unsupported echoing the CI and the first 48
+        // bits of the body.
+        let mut unk = Vec::new();
+        adv::build_control(
+            &mut unk,
+            0x7FFF,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x99],
+        );
+        let _ = c.decode_control_msg(&Bytes::from(unk)).unwrap();
+        let pending = c.take_unsupported();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 0x7FFF, "echoed CI");
+        assert_eq!(
+            pending[0].1,
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            "first 48 bits"
+        );
+
+        // The framed response round-trips to a CI_UNSUPPORTED control echoing both.
+        let dg = c
+            .encode_unsupported(0x7FFF, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 0)
+            .unwrap();
+        let parsed = adv::parse(&Bytes::from(dg)).unwrap();
+        let (ci, body) = adv::parse_control(&parsed.payload).unwrap();
+        assert_eq!(ci, adv::CI_UNSUPPORTED);
+        assert_eq!(&body[4..6], &[0x7F, 0xFF], "incoming CI echoed in the body");
+        assert_eq!(
+            &body[8..14],
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            "head echoed"
+        );
     }
 
     #[test]

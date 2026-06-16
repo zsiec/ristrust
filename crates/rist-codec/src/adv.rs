@@ -763,6 +763,21 @@ pub fn build_control(dst: &mut Vec<u8>, ci: u16, body: &[u8]) {
     dst.extend_from_slice(body);
 }
 
+/// Frames a Control Message Unsupported Response (`CI_UNSUPPORTED`, TR-06-3
+/// §5.3.10): the 16-byte body is Responder SSRC(4), the unrecognized incoming CI(2),
+/// Reserved(2), the first 48 bits of the offending body (`head`, zero-padded), and
+/// Padding(2). (libRIST under-stamps its Length field as 12 while writing 16 bytes;
+/// ristrust stamps the honest 16 via [`build_control`], which libRIST still parses.)
+pub fn build_unsupported(dst: &mut Vec<u8>, responder_ssrc: u32, incoming_ci: u16, head: [u8; 6]) {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&responder_ssrc.to_be_bytes());
+    body.extend_from_slice(&incoming_ci.to_be_bytes());
+    body.extend_from_slice(&[0, 0]); // reserved
+    body.extend_from_slice(&head);
+    body.extend_from_slice(&[0, 0]); // padding to a 32-bit boundary
+    build_control(dst, CI_UNSUPPORTED, &body);
+}
+
 /// Decodes a Type=4 control payload's sub-header, returning the control index and
 /// the body (aliasing `payload`). A Length exceeding the available bytes is an
 /// error; a Length shorter than the trailing bytes is tolerated (the body is

@@ -449,6 +449,9 @@ impl AdvDriver {
             // authentication is disabled (`authed` is then true from the start).
             if self.authed {
                 self.on_adv(now, data);
+                // Answer any control message (including one re-decoded from a FEC
+                // recovery) whose Control Index we did not recognize.
+                self.send_unsupported(now).await;
             }
         } else if let Some(eap_payload) = self.main.peek_eapol(data).map(<[u8]>::to_vec) {
             // Raw Main-profile GRE substrate: EAPOL auth drives the handshake.
@@ -561,6 +564,27 @@ impl AdvDriver {
             Ok(Decoded::BufferNeg(bn)) => self.on_buffer_neg(bn),
             Ok(Decoded::Ignored) => {}
             Err(e) => crate::driver::decode_warn(self.adv.has_psk(), "advanced", &e),
+        }
+    }
+
+    /// Originates a Control Message Unsupported Response for each inbound control
+    /// message whose Control Index this side did not recognize (TR-06-3 §5.3.10),
+    /// echoing the CI and the head of its body. Gated on an authenticated,
+    /// address-known peer so it cannot be turned into a reflection.
+    async fn send_unsupported(&mut self, now: Timestamp) {
+        let pending = self.adv.take_unsupported();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(dst) = self.peer.media() else { return };
+        if !self.authed {
+            return;
+        }
+        let sock = self.socket.clone();
+        for (ci, head) in pending {
+            if let Ok(dg) = self.adv.encode_unsupported(ci, head, adv_ctrl_ts(now)) {
+                let _ = sock.send(&dg, dst).await;
+            }
         }
     }
 

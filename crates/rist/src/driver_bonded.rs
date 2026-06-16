@@ -646,7 +646,7 @@ impl BondedDriver {
                 dst.set_port(media_dst.port().wrapping_add(port_off));
                 let sock = self.paths[i].socket.clone();
                 if let Err(e) = sock.send(&bytes, dst).await {
-                    tracing::debug!(path = i, "rist: bonded send fec failed: {e}");
+                    tracing::debug!(target: crate::logging::SOCKET, path = i, "rist: bonded send fec failed: {e}");
                 }
             }
         }
@@ -703,6 +703,7 @@ impl BondedDriver {
                 let sock = self.paths[i].socket.clone();
                 if let Err(e) = sock.send(&bytes, dst).await {
                     tracing::debug!(
+                        target: crate::logging::SOCKET,
                         seq = pkt.seq,
                         path = i,
                         "rist: bonded send media failed: {e}"
@@ -711,6 +712,7 @@ impl BondedDriver {
             }
             Err(e) => {
                 tracing::debug!(
+                    target: crate::logging::SOCKET,
                     seq = pkt.seq,
                     path = i,
                     "rist: bonded encode media failed: {e}"
@@ -743,10 +745,12 @@ impl BondedDriver {
             Ok(bytes) => {
                 let sock = self.paths[i].socket.clone();
                 if let Err(e) = sock.send(&bytes, dst).await {
-                    tracing::debug!(path = i, "rist: bonded send feedback failed: {e}");
+                    tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded send feedback failed: {e}");
                 }
             }
-            Err(e) => tracing::debug!(path = i, "rist: bonded encode feedback failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded encode feedback failed: {e}");
+            }
         }
     }
 
@@ -835,7 +839,7 @@ impl BondedDriver {
             return;
         };
         if let Err(e) = self.paths[i].codec.set_psk(&key) {
-            tracing::debug!(path = i, "rist: bonded post-auth re-key failed: {e}");
+            tracing::debug!(target: crate::logging::CRYPTO, path = i, "rist: bonded post-auth re-key failed: {e}");
             return;
         }
         let mut wire = Vec::new();

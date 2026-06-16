@@ -69,7 +69,7 @@ impl EapRole {
             EapRole::Authenticator(a) => a.recv(payload),
         };
         if let Some(e) = &reply.error {
-            tracing::debug!("rist: eap: {e}");
+            tracing::debug!(target: crate::logging::CRYPTO, "rist: eap: {e}");
         }
         reply.frame.map(|f| {
             let mut w = Vec::new();
@@ -517,7 +517,7 @@ impl MainDriver {
             }
             Ok(None) => {} // not OOB: fall through to the media/control demux
             Err(e) => {
-                tracing::debug!("rist: main oob decode failed: {e}");
+                tracing::debug!(target: crate::logging::SESSION, "rist: main oob decode failed: {e}");
                 self.drain(now).await;
                 return;
             }
@@ -594,7 +594,7 @@ impl MainDriver {
                     match self.codec.encode_media(&pkt) {
                         Ok(bytes) => {
                             if let Err(e) = sock.send(&bytes, dst).await {
-                                tracing::debug!(seq = pkt.seq, "rist: send media failed: {e}");
+                                tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: send media failed: {e}");
                             }
                             // FEC over the (NPD-canonicalized) inner RTP payload, first
                             // transmissions only, in sequence order.
@@ -602,7 +602,9 @@ impl MainDriver {
                                 self.send_fec_main(&pkt).await;
                             }
                         }
-                        Err(e) => tracing::debug!(seq = pkt.seq, "rist: encode media failed: {e}"),
+                        Err(e) => {
+                            tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: encode media failed: {e}");
+                        }
                     }
                 }
                 Output::SendFeedback { fb, .. } => fbs.push(fb),
@@ -716,7 +718,7 @@ impl MainDriver {
             let mut dst = media_dst;
             dst.set_port(media_dst.port().wrapping_add(port_off));
             if let Err(e) = sock.send(&bytes, dst).await {
-                tracing::debug!("rist: send main separate-port fec failed: {e}");
+                tracing::debug!(target: crate::logging::SOCKET, "rist: send main separate-port fec failed: {e}");
             }
         }
     }
@@ -732,10 +734,12 @@ impl MainDriver {
         match self.codec.encode_feedback(lead, fbs, self.bitmask) {
             Ok(bytes) => {
                 if let Err(e) = sock.send(&bytes, dst).await {
-                    tracing::debug!("rist: send feedback failed: {e}");
+                    tracing::debug!(target: crate::logging::RTCP, "rist: send feedback failed: {e}");
                 }
             }
-            Err(e) => tracing::debug!("rist: encode feedback failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, "rist: encode feedback failed: {e}");
+            }
         }
     }
 
@@ -794,7 +798,9 @@ impl MainDriver {
             Ok(bytes) => {
                 let _ = sock.send(&bytes, dst).await;
             }
-            Err(e) => tracing::debug!("rist: main oob encode failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::SESSION, "rist: main oob encode failed: {e}");
+            }
         }
     }
 
@@ -829,7 +835,9 @@ impl MainDriver {
             Ok(bytes) => {
                 let _ = sock.send(&bytes, dst).await;
             }
-            Err(e) => tracing::debug!("rist: main lqm encode failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, "rist: main lqm encode failed: {e}");
+            }
         }
     }
 
@@ -876,7 +884,7 @@ impl MainDriver {
             return;
         };
         if let Err(e) = self.codec.set_psk(&key) {
-            tracing::debug!("rist: main: post-auth re-key failed: {e}");
+            tracing::debug!(target: crate::logging::CRYPTO, "rist: main: post-auth re-key failed: {e}");
             return;
         }
         let mut wire = Vec::new();

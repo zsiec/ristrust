@@ -464,7 +464,9 @@ impl AdvDriver {
                         let _ = out.send((proto, Bytes::from(payload))).await;
                     }
                 }
-                Err(e) => tracing::debug!("rist: adv oob decode failed: {e}"),
+                Err(e) => {
+                    tracing::debug!(target: crate::logging::SESSION, "rist: adv oob decode failed: {e}");
+                }
                 Ok(None) => {
                     // Keepalive is liveness only; SR/RR/SDES carry no flow input.
                     let (kind, _ka, _ver) = self.main.peek_control(data);
@@ -678,7 +680,7 @@ impl AdvDriver {
                     match self.adv.encode_media(&pkt) {
                         Ok(bytes) => {
                             if let Err(e) = sock.send(&bytes, dst).await {
-                                tracing::debug!(seq = pkt.seq, "rist: adv send media failed: {e}");
+                                tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: adv send media failed: {e}");
                             }
                             // FEC over the full wire datagram (first transmissions
                             // only, in sequence order); frame the resulting FEC
@@ -688,7 +690,7 @@ impl AdvDriver {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!(seq = pkt.seq, "rist: adv encode media failed: {e}");
+                            tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: adv encode media failed: {e}");
                         }
                     }
                 }
@@ -742,11 +744,13 @@ impl AdvDriver {
             Ok(dgs) => {
                 for dg in dgs {
                     if let Err(e) = sock.send(&dg, dst).await {
-                        tracing::debug!("rist: adv send feedback failed: {e}");
+                        tracing::debug!(target: crate::logging::RTCP, "rist: adv send feedback failed: {e}");
                     }
                 }
             }
-            Err(e) => tracing::debug!("rist: adv encode feedback failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, "rist: adv encode feedback failed: {e}");
+            }
         }
     }
 
@@ -773,7 +777,9 @@ impl AdvDriver {
             Ok(bytes) => {
                 let _ = sock.send(&bytes, dst).await;
             }
-            Err(e) => tracing::debug!("rist: adv lqm encode failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, "rist: adv lqm encode failed: {e}");
+            }
         }
     }
 
@@ -812,7 +818,9 @@ impl AdvDriver {
             Ok(bytes) => {
                 let _ = sock.send(&bytes, dst).await;
             }
-            Err(e) => tracing::debug!("rist: adv oob encode failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::SESSION, "rist: adv oob encode failed: {e}");
+            }
         }
     }
 
@@ -825,7 +833,9 @@ impl AdvDriver {
             Ok(bytes) => {
                 let _ = sock.send(&bytes, dst).await;
             }
-            Err(e) => tracing::debug!("rist: adv flow-attr encode failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::SESSION, "rist: adv flow-attr encode failed: {e}");
+            }
         }
     }
 

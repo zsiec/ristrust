@@ -138,7 +138,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
     cfg.validate()?;
     let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
     let spawned = crate::session::build_receiver(rt, &cfg, local)?;
-    tracing::debug!(%local, "rist: receiver listening");
+    tracing::debug!(target: crate::logging::SESSION, %local, "rist: receiver listening");
     Ok(Receiver {
         cfg,
         local: spawned.local,
@@ -180,7 +180,7 @@ pub async fn dial_receiver_with(
     cfg.validate()?;
     let remote: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
     let spawned = crate::session::build_caller_receiver(rt, &cfg, remote)?;
-    tracing::debug!(%remote, "rist: caller-receiver dialed");
+    tracing::debug!(target: crate::logging::SESSION, %remote, "rist: caller-receiver dialed");
     Ok(Receiver {
         cfg,
         local: spawned.local,
@@ -223,7 +223,7 @@ pub async fn listen_bonded_with(
     cfg.validate()?;
     let locals = crate::sender::resolve_bonded_addrs(addrs)?;
     let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals)?;
-    tracing::debug!(paths = locals.len(), "rist: bonded receiver listening");
+    tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening");
     Ok(Receiver {
         cfg,
         local: spawned.local,

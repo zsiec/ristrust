@@ -196,7 +196,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         )));
     }
     let spawned = crate::session::build_sender(rt, &cfg, remote)?;
-    tracing::debug!(%remote, "rist: sender dialed");
+    tracing::debug!(target: crate::logging::SESSION, %remote, "rist: sender dialed");
     Ok(Sender {
         cfg,
         local: spawned.local,
@@ -244,7 +244,7 @@ pub async fn dial_bonded_with(
     // Uniform weight on every path (`cfg.weight`; 0 = full duplication).
     let peers: Vec<(SocketAddr, u32)> = remotes.iter().map(|&a| (a, cfg.weight)).collect();
     let spawned = crate::session::build_bonded_sender(rt, &cfg, &peers)?;
-    tracing::debug!(paths = peers.len(), "rist: bonded sender dialed");
+    tracing::debug!(target: crate::logging::BONDING, paths = peers.len(), "rist: bonded sender dialed");
     Ok(Sender {
         cfg,
         local: spawned.local,
@@ -296,6 +296,7 @@ pub async fn dial_bonded_weighted_with(
         .collect();
     let spawned = crate::session::build_bonded_sender(rt, &cfg, &resolved)?;
     tracing::debug!(
+        target: crate::logging::BONDING,
         paths = resolved.len(),
         "rist: weighted bonded sender dialed"
     );
@@ -343,7 +344,7 @@ pub async fn listen_sender_with(
     cfg.validate()?;
     let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
     let spawned = crate::session::build_listener_sender(rt, &cfg, local)?;
-    tracing::debug!(%local, "rist: listener-sender bound");
+    tracing::debug!(target: crate::logging::SESSION, %local, "rist: listener-sender bound");
     Ok(Sender {
         cfg,
         local: spawned.local,

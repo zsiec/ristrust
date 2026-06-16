@@ -105,9 +105,9 @@ impl CloseFlag {
 /// line noise or a stray datagram, so stay at debug.
 pub(crate) fn decode_warn(has_psk: bool, what: &str, e: &dyn std::fmt::Display) {
     if has_psk {
-        tracing::warn!(target: "rist::crypto", "rist: {what} decode failed (likely PSK/key mismatch): {e}");
+        tracing::warn!(target: crate::logging::CRYPTO, "rist: {what} decode failed (likely PSK/key mismatch): {e}");
     } else {
-        tracing::debug!("rist: {what} decode failed: {e}");
+        tracing::debug!(target: crate::logging::CRYPTO, "rist: {what} decode failed: {e}");
     }
 }
 
@@ -559,10 +559,12 @@ impl Driver {
         match codec::encode_media(pkt) {
             Ok(bytes) => {
                 if let Err(e) = self.socket.send_media(&bytes, dst).await {
-                    tracing::debug!(seq = pkt.seq, "rist: send media failed: {e}");
+                    tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: send media failed: {e}");
                 }
             }
-            Err(e) => tracing::debug!(seq = pkt.seq, "rist: encode media failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: encode media failed: {e}");
+            }
         }
     }
 
@@ -617,7 +619,7 @@ impl Driver {
             let mut dst = media_dst;
             dst.set_port(media_dst.port().wrapping_add(port_off));
             if let Err(e) = sock.send_media(&bytes, dst).await {
-                tracing::debug!("rist: send separate-port fec failed: {e}");
+                tracing::debug!(target: crate::logging::SOCKET, "rist: send separate-port fec failed: {e}");
             }
         }
     }
@@ -632,10 +634,12 @@ impl Driver {
         match codec::encode_feedback(lead, self.local_ssrc(), &self.cname, fbs, self.bitmask) {
             Ok(bytes) => {
                 if let Err(e) = self.socket.send_rtcp(&bytes, dst).await {
-                    tracing::debug!("rist: send rtcp failed: {e}");
+                    tracing::debug!(target: crate::logging::RTCP, "rist: send rtcp failed: {e}");
                 }
             }
-            Err(e) => tracing::debug!("rist: encode feedback failed: {e}"),
+            Err(e) => {
+                tracing::debug!(target: crate::logging::RTCP, "rist: encode feedback failed: {e}");
+            }
         }
     }
 

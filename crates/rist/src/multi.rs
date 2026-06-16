@@ -162,7 +162,7 @@ pub async fn listen_multi_with(
             )
         }
     };
-    tracing::debug!(%bound, "rist: multi-receiver listening");
+    tracing::debug!(target: crate::logging::SESSION, %bound, "rist: multi-receiver listening");
     Ok(MultiReceiver {
         accept_rx,
         demux,
@@ -241,7 +241,7 @@ pub async fn listen_multi_bonded_with(
     })?;
     let (accept_tx, accept_rx) = mpsc::channel(MAX_FLOWS);
     let demux = tokio::spawn(demux_bonded(sockets, cfg, bound, accept_tx));
-    tracing::debug!(%bound, paths = locals.len(), "rist: bonded multi-receiver listening");
+    tracing::debug!(target: crate::logging::BONDING, %bound, paths = locals.len(), "rist: bonded multi-receiver listening");
     Ok(MultiReceiver {
         accept_rx,
         demux,
@@ -370,7 +370,7 @@ async fn demux_main(
             // A per-flow PSK/EAP key derivation failed: drop this source's flow rather
             // than install a broken session; a later datagram retries the build.
             Err(e) => {
-                tracing::warn!(target: "rist::crypto", "rist: multi-flow: drop flow, build failed: {e}");
+                tracing::warn!(target: crate::logging::CRYPTO, "rist: multi-flow: drop flow, build failed: {e}");
             }
         }
     }
@@ -405,7 +405,7 @@ async fn demux_adv(
                 let _ = accept_tx.send(receiver).await;
             }
             Err(e) => {
-                tracing::warn!(target: "rist::crypto", "rist: multi-flow: drop flow, build failed: {e}");
+                tracing::warn!(target: crate::logging::CRYPTO, "rist: multi-flow: drop flow, build failed: {e}");
             }
         }
     }
@@ -454,7 +454,7 @@ async fn demux_bonded(
             // A per-flow PSK/EAP key derivation failed: drop this source's flow rather
             // than install a broken session; a later datagram retries the build.
             Err(e) => {
-                tracing::warn!(target: "rist::crypto", "rist: multi-flow bonded: drop flow, build failed: {e}");
+                tracing::warn!(target: crate::logging::CRYPTO, "rist: multi-flow bonded: drop flow, build failed: {e}");
             }
         }
     }

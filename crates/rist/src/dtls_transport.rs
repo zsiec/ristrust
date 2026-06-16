@@ -257,12 +257,12 @@ fn worker(shared: Shared, sock: UdpSocket, cfg: dtls::Config, is_client: bool, r
         Conn::server(transport, cfg)
     };
     if let Err(e) = conn.handshake() {
-        tracing::warn!(target: "rist::crypto", "rist: dtls handshake failed: {e}");
+        tracing::warn!(target: crate::logging::CRYPTO, "rist: dtls handshake failed: {e}");
         return; // dropping `conn` closes the bridge channels → the session ends
     }
     // Past the handshake: cap the blocking recv so `read` returns between writes.
     done.store(true, Ordering::Relaxed);
-    tracing::debug!(target: "rist::crypto", suite = conn.cipher_suite(), client = is_client, "rist: dtls handshake complete");
+    tracing::debug!(target: crate::logging::CRYPTO, suite = conn.cipher_suite(), client = is_client, "rist: dtls handshake complete");
     relay(&mut conn, &shared);
 }
 

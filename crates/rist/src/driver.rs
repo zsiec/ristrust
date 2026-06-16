@@ -457,7 +457,12 @@ impl Driver {
                 return; // the application Receiver was dropped.
             }
         }
-        self.stats.publish(self.flow.stats());
+        self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
+    fn fec_recovered(&self) -> u64 {
+        self.fec.as_ref().map_or(0, FecState::recovered)
     }
 
     /// Encodes and transmits one media datagram to the peer's media address.
@@ -559,11 +564,12 @@ impl Driver {
         };
         let ssrc = self.local_ssrc();
         let stats = self.flow.stats();
+        let fec = self.fec_recovered();
         let lqm = self
             .lqm
             .as_mut()
             .expect("emitter present (checked above)")
-            .build(now, &stats);
+            .build(now, &stats, fec);
         let lqr = RtcpPacket::LinkQualityReport(rtcp::LinkQualityReport {
             ssrc,
             lqm: lqm.encode(),

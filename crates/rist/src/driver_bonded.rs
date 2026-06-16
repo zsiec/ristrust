@@ -412,7 +412,9 @@ impl BondedDriver {
                 return; // the application Receiver was dropped
             }
         }
-        self.stats.publish(self.flow.stats());
+        // FEC over bonding is not yet wired (the bonded driver carries no FEC engine),
+        // so the FEC-recovered count is 0 here. See the WP18f note.
+        self.stats.publish(self.flow.stats(), 0);
     }
 
     /// Encodes and transmits one media packet on path `i`, if it is addressed and

@@ -208,8 +208,8 @@ impl FecState {
         self.variant
     }
 
-    /// The number of media packets reconstructed by FEC so far.
-    #[allow(dead_code)] // surfaced by stats / LQM in 18f
+    /// The number of media packets reconstructed by FEC so far (surfaced in the
+    /// public `Stats` and folded into the source-adaptation LQM's recovered count).
     pub(crate) fn recovered(&self) -> u64 {
         self.recovered
     }

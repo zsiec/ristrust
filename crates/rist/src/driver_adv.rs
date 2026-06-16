@@ -623,7 +623,12 @@ impl AdvDriver {
                 return;
             }
         }
-        self.stats.publish(self.flow.stats());
+        self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
+    fn fec_recovered(&self) -> u64 {
+        self.fec.as_ref().map_or(0, FecState::recovered)
     }
 
     /// Sends each drained feedback effect as an Advanced Type=4 control datagram.
@@ -657,11 +662,12 @@ impl AdvDriver {
             return;
         };
         let stats = self.flow.stats();
+        let fec = self.fec_recovered();
         let lqm = self
             .lqm
             .as_mut()
             .expect("emitter present (checked above)")
-            .build(now, &stats);
+            .build(now, &stats, fec);
         let sock = self.socket.clone();
         match self.adv.lqm_datagram(&lqm.encode(), adv_ctrl_ts(now)) {
             Ok(bytes) => {

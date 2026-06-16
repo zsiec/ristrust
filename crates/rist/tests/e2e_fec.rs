@@ -320,6 +320,56 @@ async fn main_fec_with_npd_recovers_a_dropped_frame() {
 }
 
 #[tokio::test]
+async fn fec_recovered_count_surfaces_in_stats() {
+    // After FEC reconstructs a dropped packet, the receiver's Stats.fec_recovered
+    // counts it — distinct from the ARQ `recovered` counter, which stays 0 in one-way
+    // mode (no NACK plane). Proves the WP18f Stats wiring end to end.
+    let cfg = Config::default()
+        .with_profile(Profile::Simple)
+        .with_one_way(true)
+        .with_buffer(Duration::from_millis(500))
+        .with_fec(fec_2d());
+    let (mut receiver, port) = listen_free(&cfg).await;
+    let dropped = Arc::new(AtomicU64::new(0));
+    let rt = DropRuntime {
+        pred: port_media_pred(port),
+        dropped: Arc::clone(&dropped),
+    };
+    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &rt)
+        .await
+        .expect("dial");
+    let payloads = text_payloads(64, "stats-fec");
+    let send_payloads = payloads.clone();
+    let send_task = tokio::spawn(async move {
+        for p in &send_payloads {
+            sender.send(p).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sender
+    });
+    for (i, want) in payloads.iter().enumerate() {
+        let got = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session open");
+        assert_eq!(got.as_ref(), want.as_slice(), "payload {i}");
+    }
+    let stats = receiver.stats();
+    assert!(
+        stats.fec_recovered >= 1,
+        "FEC recovery not counted: {stats:?}"
+    );
+    assert_eq!(
+        stats.recovered, 0,
+        "one-way mode has no ARQ recovery: {stats:?}"
+    );
+    let sender = send_task.await.expect("send task");
+    sender.close().await.ok();
+    receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
 async fn fec_clean_loopback_does_not_disturb_the_stream() {
     // FEC enabled, no loss: the extra FEC traffic must not perturb ordinary in-order
     // delivery on any profile.

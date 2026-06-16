@@ -44,6 +44,8 @@ pub(crate) struct LqmEmitter {
     prev_rx_bytes: u64,
     /// `rx_retrans_bytes` at the start of the current period.
     prev_rx_retrans_bytes: u64,
+    /// The cumulative FEC-recovered count at the start of the current period.
+    prev_fec_recovered: u64,
 }
 
 impl LqmEmitter {
@@ -61,6 +63,7 @@ impl LqmEmitter {
             rx_retrans_bytes: 0,
             prev_rx_bytes: 0,
             prev_rx_retrans_bytes: 0,
+            prev_fec_recovered: 0,
         }
     }
 
@@ -80,26 +83,37 @@ impl LqmEmitter {
         (now - self.last_emit).as_micros() >= micros(self.period)
     }
 
-    /// Snapshots the flow `stats` and metered bytes into one Link Quality Message
-    /// for the period ending at `now`, then opens the next period. The counter
-    /// fields are exact deltas; the bandwidth fields are derived from the metered
-    /// RTP bytes (the spec notes NPD makes them uncomputable from packet counts).
-    pub(crate) fn build(&mut self, now: Timestamp, stats: &Stats) -> Lqm {
+    /// Snapshots the flow `stats`, the metered bytes, and the host's cumulative
+    /// `fec_recovered` count into one Link Quality Message for the period ending at
+    /// `now`, then opens the next period. The counter fields are exact deltas; the
+    /// bandwidth fields are derived from the metered RTP bytes (the spec notes NPD
+    /// makes them uncomputable from packet counts).
+    pub(crate) fn build(&mut self, now: Timestamp, stats: &Stats, fec_recovered: u64) -> Lqm {
         let elapsed_us = (now - self.last_emit).as_micros().max(0);
         let period_ms = u32::try_from(elapsed_us / 1000).unwrap_or(u32::MAX);
         self.seq = self.seq.wrapping_add(1);
+
+        // FEC-recovered packets are fed into the flow like any arrival, so the flow
+        // counts them in `received` but not in `recovered` (which is ARQ-only).
+        // TR-06-4 §5.1 requires the LQM's recovered count to include packets recovered
+        // "through retransmission OR FEC", so move this period's FEC recoveries from
+        // source-received into recovered — but only the portion that actually landed in
+        // `received` (a late or duplicate FEC recovery is counted in fec_recovered yet
+        // never lands), keeping the two fields consistent. Ported from ristgo.
+        let fec_delta = delta(fec_recovered, self.prev_fec_recovered);
+        let src_received = delta(stats.received, self.prev.received);
+        let moved_fec = fec_delta.min(src_received);
 
         let lqm = Lqm {
             sequence_number: self.seq,
             reporting_period_ms: period_ms,
             nack_window_ms: self.nack_window_ms,
-            source_received: delta(stats.received, self.prev.received),
+            source_received: src_received - moved_fec,
             original_lost: delta(stats.missing, self.prev.missing),
-            // ristrust has no dedicated "retransmit received" counter; the
-            // recovered count (missing entries filled by a retransmit) is its
-            // closest analog and is not consumed by the controller.
+            // ristrust has no dedicated "retransmit received" counter; the recovered
+            // count (missing entries filled by a retransmit) is its closest analog.
             retransmitted_received: delta(stats.recovered, self.prev.recovered),
-            recovered: delta(stats.recovered, self.prev.recovered),
+            recovered: delta(stats.recovered, self.prev.recovered) + moved_fec,
             unrecovered: delta(stats.lost, self.prev.lost),
             late: delta(stats.too_late, self.prev.too_late),
             data_bandwidth_kbps: bandwidth_kbps(self.rx_bytes - self.prev_rx_bytes, period_ms),
@@ -112,6 +126,7 @@ impl LqmEmitter {
         self.prev = *stats;
         self.prev_rx_bytes = self.rx_bytes;
         self.prev_rx_retrans_bytes = self.rx_retrans_bytes;
+        self.prev_fec_recovered = fec_recovered;
         self.last_emit = now;
         lqm
     }
@@ -165,4 +180,52 @@ fn delta(now: u64, prev: u64) -> u32 {
 /// A `Duration` as whole microseconds (saturating into the core's `i64` domain).
 fn micros(d: Duration) -> i64 {
     i64::try_from(d.as_micros()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(received: u64, recovered: u64) -> Stats {
+        // `flow::Stats` is `#[non_exhaustive]`, so build it via Default + assignment.
+        let mut s = Stats::default();
+        s.received = received;
+        s.recovered = recovered;
+        s
+    }
+
+    #[test]
+    fn lqm_folds_fec_recoveries_into_recovered() {
+        // TR-06-4 §5.1: the LQM `recovered` count includes FEC-recovered packets.
+        // Each period moves this period's FEC recoveries from source-received into
+        // recovered (the deltas are per-period).
+        let mut e = LqmEmitter::new(Duration::from_millis(100), 1000, Timestamp::ZERO);
+        let lqm = e.build(Timestamp::from_micros(100_000), &stats(10, 0), 2);
+        assert_eq!(lqm.recovered, 2, "2 FEC recoveries fold into recovered");
+        assert_eq!(lqm.source_received, 8, "and out of source_received");
+        // Next period: 5 more received, 1 more cumulative FEC recovery.
+        let lqm = e.build(Timestamp::from_micros(200_000), &stats(15, 0), 3);
+        assert_eq!(lqm.recovered, 1);
+        assert_eq!(lqm.source_received, 4);
+    }
+
+    #[test]
+    fn lqm_caps_moved_fec_at_source_received() {
+        // A FEC recovery that never landed in `received` (a late or duplicate
+        // recovery) is not moved, so source_received never underflows: move only the
+        // portion that actually arrived.
+        let mut e = LqmEmitter::new(Duration::from_millis(100), 1000, Timestamp::ZERO);
+        let lqm = e.build(Timestamp::from_micros(100_000), &stats(2, 0), 5);
+        assert_eq!(lqm.source_received, 0);
+        assert_eq!(lqm.recovered, 2, "moved only the 2 that landed, not all 5");
+    }
+
+    #[test]
+    fn lqm_recovered_sums_arq_and_fec() {
+        // ARQ recoveries (the flow's `recovered`) and FEC recoveries both count toward
+        // the LQM recovered total.
+        let mut e = LqmEmitter::new(Duration::from_millis(100), 1000, Timestamp::ZERO);
+        let lqm = e.build(Timestamp::from_micros(100_000), &stats(10, 3), 2);
+        assert_eq!(lqm.recovered, 5, "3 ARQ + 2 FEC");
+    }
 }

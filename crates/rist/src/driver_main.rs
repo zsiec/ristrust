@@ -531,7 +531,12 @@ impl MainDriver {
                 return; // the application Receiver was dropped.
             }
         }
-        self.stats.publish(self.flow.stats());
+        self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
+    fn fec_recovered(&self) -> u64 {
+        self.fec.as_ref().map_or(0, FecState::recovered)
     }
 
     /// Handles one inbound separate-port FEC datagram: strips the RTP wrapper to the
@@ -672,9 +677,13 @@ impl MainDriver {
             return; // one-way: no control egress
         }
         let Some(dst) = self.peer.media() else { return };
+        // Advertise the FEC capability (the P flag) in the keepalive when FEC is
+        // configured (TR-06-2 §8; ristgo `localCaps().P`).
+        let mut caps = gre::Capabilities::standard();
+        caps.p = self.fec.is_some();
         let ka = gre::Keepalive {
             mac: self.mac,
-            caps: gre::Capabilities::standard(),
+            caps,
             ..gre::Keepalive::default()
         };
         let sock = self.socket.clone();
@@ -709,11 +718,12 @@ impl MainDriver {
         };
         let ssrc = self.local_ssrc();
         let stats = self.flow.stats();
+        let fec = self.fec_recovered();
         let lqm = self
             .lqm
             .as_mut()
             .expect("emitter present (checked above)")
-            .build(now, &stats);
+            .build(now, &stats, fec);
         let lqr = LinkQualityReport {
             ssrc,
             lqm: lqm.encode(),

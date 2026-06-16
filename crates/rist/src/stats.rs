@@ -51,15 +51,15 @@ pub struct Stats {
 }
 
 impl From<rist_core::flow::Stats> for Stats {
-    /// Maps the flow core's counters to the curated public snapshot.
+    /// Maps the flow core's counters to the curated public snapshot. The host-tracked
+    /// `fec_recovered` count is layered on when the snapshot is published (the flow
+    /// core has no FEC counter — FEC recovery is a host concern).
     fn from(f: rist_core::flow::Stats) -> Stats {
         Stats {
             received: f.received,
             delivered: f.delivered,
             lost: f.lost,
             recovered: f.recovered,
-            // SMPTE ST 2022-1 FEC is not implemented yet (PARITY WP18); the core has
-            // no FEC-recovered counter to map, so this stays 0 until it lands.
             fec_recovered: 0,
             duplicates: f.duplicates,
             reordered: f.reordered,
@@ -81,9 +81,12 @@ impl From<rist_core::flow::Stats> for Stats {
 pub(crate) struct StatsCell(Arc<Mutex<Stats>>);
 
 impl StatsCell {
-    /// Publishes the flow core's current counters as the latest snapshot.
-    pub(crate) fn publish(&self, core: rist_core::flow::Stats) {
-        *self.0.lock().expect("stats mutex poisoned") = core.into();
+    /// Publishes the flow core's current counters as the latest snapshot, layering on
+    /// the host-tracked SMPTE ST 2022-1 FEC-recovered count (0 when FEC is off).
+    pub(crate) fn publish(&self, core: rist_core::flow::Stats, fec_recovered: u64) {
+        let mut snapshot: Stats = core.into();
+        snapshot.fec_recovered = fec_recovered;
+        *self.0.lock().expect("stats mutex poisoned") = snapshot;
     }
 
     /// Reads the latest published snapshot (all-zero until the first publish).

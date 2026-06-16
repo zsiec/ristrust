@@ -3,11 +3,25 @@
 //! PSK-encrypted (AES-128/256), LZ4-compressed, and authenticated — and every
 //! payload arrives in order with its bytes intact. This proves the Advanced host
 //! (adv header + control codec, LZ4, AES-CTR payload, the GRE-substrate driver)
-//! carries media end to end.
+//! carries media end to end. A final test injects 25% forward-media loss and
+//! proves the Advanced native NACK control plane recovers it byte-exact.
 
-use std::time::Duration;
+// The loss-injecting PRNG takes the top 53 bits before the `f64` cast (exactly
+// representable); the precision-loss lint does not apply to that idiom.
+#![allow(clippy::cast_precision_loss)]
 
-use rist::{AesKeyBits, Config, Profile, Receiver, TokioRuntime, dial_with, listen};
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use rist::{
+    AesKeyBits, AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_with, listen,
+};
 
 /// An Advanced-profile base config with a short recovery buffer.
 fn adv_cfg() -> Config {
@@ -117,4 +131,166 @@ async fn adv_loopback_authenticated_srp() {
         "authenticated",
     )
     .await;
+}
+
+// ---- heavy-loss (25%) Advanced ARQ recovery ----
+//
+// This is the recovery the interop suite cannot prove against libRIST: libRIST's
+// own Advanced sender does not reliably recover 25% loss (libRIST<->libRIST also
+// drops packets at this rate — its Advanced RTT-echo *response* handler mis-scales
+// the round-trip `>>16` instead of `>>32`, inflating its `last_rtt` ~15× and
+// tripping its `delta < rtt` re-NACK suppression gate, so a doubly-dropped packet
+// — common at 25%, rare at 10% — is never re-sent). ristrust sidesteps poisoning a
+// libRIST peer by dropping inbound Advanced RTT-echo requests (see
+// `driver_adv::drops_adv_echo_request`); here, ristrust<->ristrust, the flow core
+// re-NACKs correctly and the sender suppresses duplicate retransmits within one
+// RTT, so the loss/ARQ round trip stays tight and recovery is complete. A 500 ms
+// buffer gives ample room on loopback; a trailing flush gives a dropped tail a
+// delivered successor (pure ARQ cannot recover a lost tail).
+
+/// Datagrams larger than this are treated as media and subject to loss; Advanced
+/// control (Type=4 NACK/echo), keepalives, and the GRE handshake stay below it.
+const MEDIA_THRESHOLD: usize = 128;
+
+/// A [`Runtime`] whose UDP sockets drop a fraction of *forward media* datagrams
+/// (those larger than [`MEDIA_THRESHOLD`]); small control compounds pass through
+/// losslessly so the NACK return path always reaches the sender. Applied only to
+/// the sender's transport. `dropped` counts the media datagrams actually dropped,
+/// so the test can assert the loss/ARQ path was exercised (there is no public
+/// `Stats` API yet — that lands in WP12).
+struct LossyRuntime {
+    loss: f64,
+    next_seed: AtomicU64,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Runtime for LossyRuntime {
+    fn now(&self) -> Instant {
+        TokioRuntime.now()
+    }
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        TokioRuntime.spawn(future);
+    }
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        TokioRuntime.sleep_until(deadline)
+    }
+    fn bind(&self, addr: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let inner = TokioRuntime.bind(addr)?;
+        let seed = self
+            .next_seed
+            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+        Ok(Arc::new(LossySocket {
+            inner,
+            loss: self.loss,
+            rng: Mutex::new(seed),
+            dropped: Arc::clone(&self.dropped),
+        }))
+    }
+}
+
+/// A socket that drops large (media) sends with a seeded probability.
+#[derive(Debug)]
+struct LossySocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    loss: f64,
+    rng: Mutex<u64>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl LossySocket {
+    /// One SplitMix64 draw in `[0, 1)`.
+    fn unit(&self) -> f64 {
+        let mut s = self.rng.lock().expect("rng");
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+impl AsyncUdpSocket for LossySocket {
+    fn poll_send(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        dest: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        if buf.len() > MEDIA_THRESHOLD && self.unit() < self.loss {
+            // Drop: report success without transmitting (the datagram is lost).
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Poll::Ready(Ok(buf.len()));
+        }
+        self.inner.poll_send(cx, buf, dest)
+    }
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr)>> {
+        self.inner.poll_recv(cx, buf)
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+#[tokio::test]
+async fn adv_recovers_heavy_loss_via_arq() {
+    const N: usize = 100; // payloads whose in-order delivery is asserted
+    const FLUSH: usize = 24; // trailing packets so the last asserted payload has a
+    // delivered successor to trigger its NACK (pure ARQ cannot recover a lost tail)
+    // A >128-byte body so each media datagram is loss-eligible; distinct per index.
+    let body = "advanced-heavy-loss-recovery-".repeat(8);
+
+    // A 500 ms buffer leaves ample room for the deeper retransmit chains a quarter
+    // loss produces (a retransmit can itself be dropped, needing a re-NACK).
+    let cfg = adv_cfg().with_buffer(Duration::from_millis(500));
+    let (mut receiver, port) = listen_free(&cfg).await; // lossless receiver
+
+    let dropped = Arc::new(AtomicU64::new(0));
+    let lossy = LossyRuntime {
+        loss: 0.25,
+        next_seed: AtomicU64::new(0x00C0_FFEE),
+        dropped: Arc::clone(&dropped),
+    };
+    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &lossy)
+        .await
+        .expect("dial with the lossy runtime");
+
+    let mk = move |i: usize| format!("adv-{i:05}-{body}").into_bytes();
+    let send_mk = mk.clone();
+    let send_task = tokio::spawn(async move {
+        for i in 0..N + FLUSH {
+            sender.send(&send_mk(i)).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sender
+    });
+
+    for i in 0..N {
+        let got = tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out on payload {i}: 25% ARQ recovery did not converge")
+            })
+            .expect("session stayed open");
+        assert_eq!(
+            got.as_ref(),
+            mk(i).as_slice(),
+            "payload {i} out of order or corrupt under 25% loss"
+        );
+    }
+
+    // The loss/ARQ path must actually have been exercised: at 25% forward media
+    // loss over N+FLUSH datagrams the socket dropped at least one (and every
+    // dropped payload above was recovered byte-exact by the Advanced NACK plane).
+    assert!(
+        dropped.load(Ordering::Relaxed) > 0,
+        "no media dropped — the loss/ARQ path was not exercised"
+    );
+
+    let sender = send_task.await.expect("send task");
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
 }

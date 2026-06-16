@@ -294,14 +294,19 @@ impl AdvDriver {
             }
             Ok(Decoded::Feedback(fbs)) => {
                 for fb in fbs {
-                    // A Link Quality Message is a host-level source-adaptation
-                    // signal: drive the rate controller, never the flow core.
-                    if let Feedback::LinkQuality { lqm } = fb {
-                        if let Some(r) = &mut self.rate {
-                            r.handle(&lqm);
+                    match fb {
+                        // A Link Quality Message is a host-level source-adaptation
+                        // signal: drive the rate controller, never the flow core.
+                        Feedback::LinkQuality { lqm } => {
+                            if let Some(r) = &mut self.rate {
+                                r.handle(&lqm);
+                            }
                         }
-                    } else {
-                        self.flow.feed_feedback(now, fb);
+                        // Drop inbound Advanced RTT-echo *requests* so the flow
+                        // never answers them — see `drops_adv_echo_request` for the
+                        // libRIST interop rationale.
+                        fb if drops_adv_echo_request(&fb) => {}
+                        fb => self.flow.feed_feedback(now, fb),
                     }
                 }
             }
@@ -529,4 +534,52 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 
 fn seq_after(a: u32, b: u32) -> bool {
     Seq32::new(b).less(Seq32::new(a))
+}
+
+/// Whether an inbound Advanced-path feedback item is an RTT-echo *request* that
+/// must be dropped before it reaches the flow core, so the flow never answers it.
+///
+/// Echoing the request verbatim is spec-correct, but libRIST's Advanced-profile
+/// RTT-echo *response* handler mis-scales the NTP-64 round-trip — it shifts the
+/// fractional diff by 16 instead of 32, inflating the measured RTT by 2^16. A
+/// response from us therefore poisons libRIST's peer `last_rtt` to hundreds of
+/// seconds, which jams its own retransmit re-queue gate (it refuses a re-NACK
+/// while `delta < rtt`): a single dropped retransmit is never re-sent and one
+/// packet is permanently lost under loss (observed as unrecovered loss from ~25%).
+/// Not answering keeps libRIST's `last_rtt` at its sane default and recovery
+/// works; ristrust still *originates* its own RTT-echo requests (scaled correctly
+/// by both ends), so its own RTT estimation is unaffected. Advanced-only — the
+/// Main/Simple RTT echo uses libRIST's correct response path and must keep
+/// answering for those estimators to converge (TR-06-3 §5.3, RTT echo).
+fn drops_adv_echo_request(fb: &Feedback) -> bool {
+    matches!(fb, Feedback::RttEchoRequest { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drops_adv_echo_request;
+    use rist_core::wire::Feedback;
+
+    #[test]
+    fn drops_only_advanced_echo_requests() {
+        // The request is dropped so the flow never emits a (libRIST-poisoning) echo.
+        assert!(drops_adv_echo_request(&Feedback::RttEchoRequest {
+            ssrc: 0,
+            timestamp: 1,
+        }));
+        // Everything else still reaches the flow core: echo *responses* (our own
+        // RTT estimation), NACKs (retransmit requests), and SR timing.
+        assert!(!drops_adv_echo_request(&Feedback::RttEchoResponse {
+            ssrc: 7,
+            timestamp: 2,
+            processing_delay: 3,
+        }));
+        assert!(!drops_adv_echo_request(&Feedback::Nack {
+            ssrc: 7,
+            missing: vec![1, 2, 3],
+        }));
+        assert!(!drops_adv_echo_request(&Feedback::LinkQuality {
+            lqm: [0u8; 44]
+        }));
+    }
 }

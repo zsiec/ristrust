@@ -29,7 +29,10 @@ mod stats;
 pub use config::{Config, FlowAttrCallback, NackType, Profile, RateCallback};
 pub use error::{ConfigError, Error};
 pub use fec::{FecCarriage, FecConfig, FecVariant};
-pub use multi::{MAX_FLOWS, MultiReceiver, listen_multi, listen_multi_with};
+pub use multi::{
+    MAX_FLOWS, MultiReceiver, listen_multi, listen_multi_bonded, listen_multi_bonded_with,
+    listen_multi_with,
+};
 pub use receiver::{
     Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_with,
     listen_with,

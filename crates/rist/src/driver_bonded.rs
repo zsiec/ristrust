@@ -48,7 +48,7 @@ const RECV_BUF: usize = 65_536;
 const PASSPHRASE_PUSH_ID: u8 = 0x40;
 
 /// The depth of the shared inbound channel the per-path readers feed.
-const INBOUND_CAPACITY: usize = 256;
+pub(crate) const INBOUND_CAPACITY: usize = 256;
 
 /// Whether an inbound datagram arrived on a path's GRE (media/control) socket or one
 /// of its separate-port FEC sockets.
@@ -61,13 +61,16 @@ enum InboundKind {
 }
 
 /// One inbound datagram, tagged with the path it arrived on and its socket kind.
-struct Inbound {
+/// `pub(crate)` so the multi-flow bonded demultiplexer can route these by source
+/// into per-source bonded sessions, but its fields stay private to this module
+/// (the demultiplexer only reads [`Inbound::src`] and forwards the value opaquely).
+pub(crate) struct Inbound {
     /// The path index (0-based, matching the [`Group`] registration).
     index: u8,
     /// Which of the path's sockets it arrived on.
     kind: InboundKind,
-    /// The datagram's source address.
-    src: SocketAddr,
+    /// The datagram's source address (the bonded demux key — one source per sender).
+    pub(crate) src: SocketAddr,
     /// The datagram bytes.
     data: Bytes,
 }
@@ -122,6 +125,11 @@ pub(crate) struct BondedDriver {
     close: CloseFlag,
     /// The latest stats snapshot published to the handle's `stats()`.
     stats: StatsCell,
+    /// Pre-routed inbound feed for a multi-flow demultiplexed receiver: when `Some`,
+    /// the [`MultiReceiver`](crate::MultiReceiver) demultiplexer owns the path readers
+    /// and routes this flow's datagrams in, so [`run`](Self::run) spawns none itself.
+    /// `None` for a self-driven session (it spawns its own per-path readers).
+    injected: Option<mpsc::Receiver<Inbound>>,
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
@@ -189,6 +197,7 @@ impl BondedDriver {
             bitmask,
             close: close.clone(),
             stats: stats.clone(),
+            injected: None,
             app_in: Some(rx),
             weight_cmd: Some(weight_rx),
             highest_sent: start_seq,
@@ -235,6 +244,7 @@ impl BondedDriver {
             bitmask,
             close: close.clone(),
             stats: stats.clone(),
+            injected: None,
             app_in: None,
             weight_cmd: None,
             highest_sent: 0,
@@ -245,6 +255,58 @@ impl BondedDriver {
             last_weighted: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns an **injected** bonded receiver driver for a multi-flow
+    /// [`MultiReceiver`](crate::MultiReceiver): like [`spawn_receiver`](Self::spawn_receiver)
+    /// but it spawns no path readers of its own. The demultiplexer owns the `N`
+    /// path sockets, reads them, and routes this source's datagrams (tagged with
+    /// their path index) into the returned [`Inbound`] channel; the driver still
+    /// sends its handshakes, keepalives, and feedback out through the [`PathParts`]
+    /// socket clones. Multi-flow demux rejects FEC, so there is no FEC engine.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_injected_receiver(
+        flow: Flow,
+        group: Group,
+        paths: Vec<PathParts>,
+        ssrc: u32,
+        mac: [u8; 6],
+        bitmask: bool,
+        keepalive: Duration,
+    ) -> (
+        mpsc::Sender<Inbound>,
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = BondedDriver {
+            sender: false,
+            flow,
+            group,
+            paths: link_paths(paths),
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            mac,
+            bitmask,
+            close: close.clone(),
+            stats: stats.clone(),
+            injected: Some(in_rx),
+            app_in: None,
+            weight_cmd: None,
+            highest_sent: 0,
+            ssrc,
+            data_out: Some(data_tx),
+            learned_ssrc: None,
+            fec: None,
+            last_weighted: None,
+        };
+        (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -262,12 +324,26 @@ impl BondedDriver {
     /// single channel; the pump selects over that channel, the application input,
     /// the timer wheel, and the keepalive tick.
     async fn run(mut self) {
-        let (in_tx, mut in_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
-        let mut readers = Vec::with_capacity(self.paths.len());
-        for p in &self.paths {
-            readers.push(spawn_reader(p.index, p.socket.clone(), in_tx.clone()));
-        }
-        drop(in_tx); // the driver holds no sender; readers keep the channel open
+        let mut readers = Vec::new();
+        let mut in_rx = if let Some(rx) = self.injected.take() {
+            // Multi-flow demux: the demultiplexer owns the path readers and routes
+            // this source's datagrams (tagged by path index) into `rx`; spawn none.
+            rx
+        } else {
+            let (in_tx, in_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
+            if self.sender {
+                // The sender shares one source socket across all paths: a single reader
+                // funnels its inbound (the path is resolved by source in `on_recv`).
+                readers.push(spawn_reader(0, self.paths[0].socket.clone(), in_tx.clone()));
+            } else {
+                // The receiver binds one socket per path: one reader each, by index.
+                for p in &self.paths {
+                    readers.push(spawn_reader(p.index, p.socket.clone(), in_tx.clone()));
+                }
+            }
+            drop(in_tx); // the driver holds no sender; readers keep the channel open
+            in_rx
+        };
 
         // A sender knows every path's peer up front: greet each (the RTCP SDES that
         // ungates libRIST's media, plus the GRE MAC beacon) and open each path's
@@ -338,14 +414,31 @@ impl BondedDriver {
         }
     }
 
-    /// Handles one inbound datagram from path `inb.index`: learns the path's peer
-    /// and liveness, then routes it as EAP, keepalive, media, or feedback.
+    /// Handles one inbound datagram: learns its path's peer and liveness, then routes
+    /// it as EAP, keepalive, media, or feedback. The receiver tags each datagram with
+    /// the path (its bound socket); the sender shares one source socket across all
+    /// paths, so it resolves the path from the source address (each path's peer is a
+    /// distinct remote).
     async fn on_recv(&mut self, inb: Inbound) {
         let now = self.now();
-        let i = inb.index as usize;
+        let i = if self.sender {
+            match self
+                .paths
+                .iter()
+                .position(|p| p.peer.media() == Some(inb.src))
+            {
+                Some(i) => i,
+                None => return, // a datagram from an unknown source: drop
+            }
+        } else {
+            inb.index as usize
+        };
         if i >= self.paths.len() {
             return;
         }
+        // The `u8` path index (paths are registered with `u8` indices, so `i` — bounded
+        // by `paths.len()` above — always fits); used for the group/flow path arguments.
+        let path_id = u8::try_from(i).unwrap_or(u8::MAX);
         // A separate-port FEC datagram bypasses the GRE demux and feeds the shared FEC
         // decoder directly (liveness rides on the GRE socket's media/control).
         if inb.kind == InboundKind::Fec {
@@ -354,7 +447,7 @@ impl BondedDriver {
         }
         self.paths[i].peer.learn_media(inb.src);
         self.paths[i].peer.observe(now);
-        self.group.observe(inb.index, now);
+        self.group.observe(path_id, now);
 
         // On first learning this path's peer (the receiver's case), greet it so
         // libRIST ungates its media toward us promptly.
@@ -402,7 +495,7 @@ impl BondedDriver {
                     });
                     // Feed on this path's index: the one ring dedups copies from the
                     // other paths by `(seq, source_time)`.
-                    self.flow.feed(now, inb.index, pkt);
+                    self.flow.feed(now, path_id, pkt);
                     if let Some((seq, wts, ssrc, payload)) = fec_input {
                         let recovered = self
                             .fec
@@ -838,7 +931,9 @@ fn link_paths(parts: Vec<PathParts>) -> Vec<PathLink> {
 
 /// Spawns a per-path reader task funnelling inbound datagrams (tagged with the path
 /// index) into the shared channel until the socket errors or the channel closes.
-fn spawn_reader(
+/// `pub(crate)` so the multi-flow demultiplexer can drive the `N` bonded path sockets
+/// with the same reader, then route each datagram by [`Inbound::src`].
+pub(crate) fn spawn_reader(
     index: u8,
     socket: MainSocket,
     tx: mpsc::Sender<Inbound>,

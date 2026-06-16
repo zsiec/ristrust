@@ -629,6 +629,72 @@ pub(crate) fn build_injected_adv(
     Ok((in_tx, receiver))
 }
 
+/// Builds one **injected** SMPTE 2022-7 bonded receiver flow for a multi-flow
+/// [`MultiReceiver`](crate::MultiReceiver), keyed by source address: a per-source
+/// bonded session spanning every demultiplexer path. The demultiplexer owns and
+/// reads the `N` path sockets; this flow gets a clone of each (for its outbound
+/// handshakes, keepalives, and feedback) and a pre-routed [`Inbound`] feed. `local`
+/// is the shared bound address (the per-flow `local_addr`). Multi-flow demux rejects
+/// FEC, so no FEC engine is wired.
+///
+/// # Errors
+/// Returns an I/O error if the profile is not Main, `sockets` is empty, or an invalid
+/// secret prevents PSK key derivation.
+pub(crate) fn build_injected_bonded(
+    sockets: &[MainSocket],
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<(
+    mpsc::Sender<crate::driver_bonded::Inbound>,
+    crate::receiver::Receiver,
+)> {
+    require_main(cfg)?;
+    if sockets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: bonded multi-flow needs at least one path socket",
+        ));
+    }
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, DEFAULT_FLOW_SSRC, 0));
+    let mut group = bonding_group(cfg);
+    let mut paths = Vec::with_capacity(sockets.len());
+    for (i, socket) in sockets.iter().enumerate() {
+        let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+        let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
+        let eap = build_eap_role(cfg, false)?;
+        group.add_path(
+            u8::try_from(i).unwrap_or(u8::MAX),
+            bonding::WEIGHT_DUPLICATE,
+            0,
+        );
+        paths.push(PathParts {
+            socket: socket.clone(),
+            peer,
+            codec,
+            eap,
+        });
+    }
+    let (in_tx, data_out, close, stats, task) = BondedDriver::spawn_injected_receiver(
+        flow,
+        group,
+        paths,
+        DEFAULT_FLOW_SSRC,
+        flow_mac(DEFAULT_FLOW_SSRC),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+    );
+    let receiver = crate::receiver::Receiver::from_parts(
+        cfg.clone(),
+        local,
+        data_out,
+        None,
+        close,
+        stats,
+        task,
+    );
+    Ok((in_tx, receiver))
+}
+
 /// Rejects a reversed-role session on a profile/feature it does not support.
 /// Reversed-role transport currently rides the Main-profile GRE substrate and has
 /// no return channel for the EAP-SRP handshake, so credentials are refused.
@@ -768,9 +834,11 @@ fn require_main(cfg: &Config) -> io::Result<()> {
 }
 
 /// Builds and spawns a bonded Main-profile sender that fans identical media across
-/// every remote in `remotes` (full SMPTE 2022-7 redundancy, weight 0). Each remote
-/// is an independent GRE path with its own ephemeral local socket, peer, codec, and
-/// EAP role; the shared flow assigns one sequence space across them.
+/// every remote in `remotes` (full SMPTE 2022-7 redundancy, weight 0). All paths
+/// share **one** source socket — so a multiplexing receiver sees the sender's paths
+/// as one source (the flow identity) and merges them, while each path keeps its own
+/// peer, codec (independent GRE sequence + PSK), and EAP role over that socket; the
+/// shared flow assigns one sequence space across them.
 ///
 /// # Errors
 /// Returns an I/O error if the profile is not Main, `remotes` is empty, a transport
@@ -781,36 +849,36 @@ pub(crate) fn build_bonded_sender(
     peers: &[(SocketAddr, u32)],
 ) -> io::Result<SenderSpawned> {
     require_main(cfg)?;
+    let &(first_remote, _) = peers.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: bonded sender needs at least one remote",
+        )
+    })?;
     let ssrc = random_even_ssrc();
     let start_seq = random_start_seq();
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     let mut group = bonding_group(cfg);
+    // One shared source socket for every path (the family/egress of the first remote):
+    // the sender's datagrams then carry one source address, which a multiplexing
+    // receiver keys on to group the paths into a single bonded flow.
+    let egress = crate::multicast::sender_egress(cfg, first_remote)?;
+    let socket = MainSocket::dial_ephemeral(rt, first_remote.is_ipv6(), egress.as_ref())?;
+    let local = socket.local()?;
     let mut paths = Vec::with_capacity(peers.len());
-    let mut local = None;
     for (i, &(remote, weight)) in peers.iter().enumerate() {
-        let egress = crate::multicast::sender_egress(cfg, remote)?;
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
-        if local.is_none() {
-            local = Some(socket.local()?);
-        }
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
         // `weight` 0 = full 2022-7 duplication; > 0 = weighted load-share.
         group.add_path(u8::try_from(i).unwrap_or(u8::MAX), weight, 0);
         paths.push(PathParts {
-            socket,
+            socket: socket.clone(),
             peer,
             codec,
             eap,
         });
     }
-    let local = local.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: bonded sender needs at least one remote",
-        )
-    })?;
     // The runtime `set_weight` command channel (rare control traffic, small depth).
     let (weight_tx, weight_rx) = mpsc::channel(16);
     let (app_in, close, stats, task) = BondedDriver::spawn_sender(

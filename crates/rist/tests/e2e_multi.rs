@@ -1,12 +1,17 @@
-//! End-to-end multi-flow multiplexing (WP19b): two Simple-profile senders with
-//! distinct SSRCs stream into ONE bound `MultiReceiver` port, which demultiplexes
-//! them by RTP SSRC into two independent `Receiver`s surfaced via `accept`. Each
-//! flow delivers its own stream, in order and byte-exact — proving the injected-feed
-//! seam (WP19a) carries N flows off one shared socket read.
+//! End-to-end multi-flow multiplexing (WP19): two senders stream into ONE bound
+//! `MultiReceiver`, which demultiplexes them into two independent `Receiver`s
+//! surfaced via `accept`. Each flow delivers its own stream, in order and byte-exact
+//! — proving the injected-feed seam (WP19a) carries N flows off one shared socket
+//! read. Simple keys by RTP SSRC; Main/Advanced key by source address; the bonded
+//! variant keys each SMPTE 2022-7 sender by its single source address, merging the
+//! redundant copies across all its path ports into one flow.
 
 use std::time::Duration;
 
-use rist::{Config, FecCarriage, FecConfig, FecVariant, Profile, Receiver, dial, listen_multi};
+use rist::{
+    Config, FecCarriage, FecConfig, FecVariant, Profile, Receiver, dial, dial_bonded, listen_multi,
+    listen_multi_bonded,
+};
 
 /// Binds a `MultiReceiver` on an OS-chosen free even port.
 async fn listen_multi_free(cfg: Config) -> (rist::MultiReceiver, u16) {
@@ -25,6 +30,29 @@ async fn listen_multi_free(cfg: Config) -> (rist::MultiReceiver, u16) {
         }
     }
     panic!("no free port for the multi-receiver");
+}
+
+/// Binds a bonded `MultiReceiver` on `n` OS-chosen free Main ports, returning it and
+/// the `IP:port` strings a bonded sender dials.
+async fn listen_multi_bonded_free(cfg: Config, n: usize) -> (rist::MultiReceiver, Vec<String>) {
+    'attempt: for _ in 0..64 {
+        let mut ports = Vec::with_capacity(n);
+        for _ in 0..n {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+            let p = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            if p == 0 || ports.contains(&p) {
+                continue 'attempt;
+            }
+            ports.push(p);
+        }
+        let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+        let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        if let Ok(m) = listen_multi_bonded(&refs, cfg.clone()).await {
+            return (m, addrs);
+        }
+    }
+    panic!("no free ports for the bonded multi-receiver");
 }
 
 /// Reads up to `n` payloads from a flow's receiver (stopping early if it closes).
@@ -54,14 +82,23 @@ fn is_stream(got: &[Vec<u8>], tag: &str, n: usize) -> bool {
 /// keys by SSRC (two random sender SSRCs); Main/Advanced key by source address (two
 /// distinct ephemeral source ports).
 async fn run_multi(cfg: Config) {
-    const N: usize = 40;
-    let (mut mrx, port) = listen_multi_free(cfg.clone()).await;
-
+    let (mrx, port) = listen_multi_free(cfg.clone()).await;
     // Two senders dial the one multi-receiver port.
     let addr = format!("127.0.0.1:{port}");
     let sender_a = dial(&addr, cfg.clone()).await.expect("dial A");
     let sender_b = dial(&addr, cfg.clone()).await.expect("dial B");
+    drive_two_flows(mrx, sender_a, sender_b).await;
+}
 
+/// Drives two already-dialed senders with distinct `A`/`B` streams into one
+/// `MultiReceiver`, accepts both flows, and asserts each is demultiplexed to its own
+/// in-order, byte-exact `Receiver`. Shared by the single-path and bonded demux tests.
+async fn drive_two_flows(
+    mut mrx: rist::MultiReceiver,
+    sender_a: rist::Sender,
+    sender_b: rist::Sender,
+) {
+    const N: usize = 40;
     let send_stream = |sender: rist::Sender, tag: &'static str| {
         tokio::spawn(async move {
             for i in 0..N {
@@ -147,6 +184,39 @@ async fn multi_demuxes_two_advanced_flows_by_source() {
             .with_buffer(Duration::from_millis(200)),
     )
     .await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_bonded_flows_by_source() {
+    // Two SMPTE 2022-7 bonded senders, each sourcing all its paths from one socket,
+    // stream into one bonded MultiReceiver across the same two path ports. The demux
+    // keys each sender by its single source address into its own bonded flow, merging
+    // the redundant copies arriving on both paths.
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_buffer(Duration::from_millis(200));
+    let (mrx, addrs) = listen_multi_bonded_free(cfg.clone(), 2).await;
+    let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let sender_a = dial_bonded(&refs, cfg.clone())
+        .await
+        .expect("dial bonded A");
+    let sender_b = dial_bonded(&refs, cfg.clone())
+        .await
+        .expect("dial bonded B");
+    drive_two_flows(mrx, sender_a, sender_b).await;
+}
+
+#[tokio::test]
+async fn listen_multi_bonded_rejects_non_main() {
+    // Bonding rides the Main GRE substrate; a Simple-profile bonded multi-receiver is
+    // rejected up front.
+    let cfg = Config::default().with_buffer(Duration::from_millis(200));
+    assert!(
+        listen_multi_bonded(&["127.0.0.1:5052", "127.0.0.1:5054"], cfg)
+            .await
+            .is_err(),
+        "bonded multi-flow must require the Main profile"
+    );
 }
 
 #[tokio::test]

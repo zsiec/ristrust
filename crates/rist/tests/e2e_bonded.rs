@@ -5,17 +5,22 @@
 //! once, in order). The blackhole test proves full redundancy: with one path's
 //! forward media entirely dropped, the other carries the stream seamlessly. The
 //! packet-level merge itself is proven exhaustively by the rist-core bonding sim.
+//!
+//! The bonded sender sources every path from one shared socket (so a multiplexing
+//! receiver can key the paths into one flow by source address), so the test runtime
+//! attributes each media datagram to a path by its *destination* address — the
+//! per-path remote — not by which socket sent it. [`PathTapRuntime`] is that tap.
 
-// The blackhole runtime takes the top 53 bits before the f64 cast; precision-loss
-// does not apply, and the bind counter casts are bounded.
+// The per-path byte counts are cast to f64 for the ratio asserts; the counts are
+// far below 2^53, so precision-loss does not apply.
 #![allow(clippy::cast_precision_loss)]
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rist::{
@@ -54,11 +59,23 @@ async fn listen_free_bonded(cfg: &Config, n: usize) -> (Receiver, Vec<String>) {
 }
 
 /// Drives `n` distinct payloads over the bonded sender → receiver and asserts each
-/// arrives once, in order, byte-exact. `rt` supplies the sender's path sockets
-/// (a `BlackholePathRuntime` can kill one path).
-async fn run_bonded(cfg: Config, paths: usize, n: usize, body: &str, rt: Arc<dyn Runtime>) {
+/// arrives once, in order, byte-exact. `make_rt` builds the sender's runtime from the
+/// resolved per-path destinations (so a [`PathTapRuntime`] can blackhole one path's
+/// media by its remote address).
+async fn run_bonded(
+    cfg: Config,
+    paths: usize,
+    n: usize,
+    body: &str,
+    make_rt: impl FnOnce(Vec<SocketAddr>) -> Arc<dyn Runtime>,
+) {
     let (mut receiver, addrs) = listen_free_bonded(&cfg, paths).await;
     let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let dests: Vec<SocketAddr> = addrs
+        .iter()
+        .map(|a| a.parse().expect("dest addr"))
+        .collect();
+    let rt = make_rt(dests);
     let sender = dial_bonded_with(&refs, cfg.clone(), rt.as_ref())
         .await
         .expect("dial the bonded receiver");
@@ -94,12 +111,12 @@ async fn run_bonded(cfg: Config, paths: usize, n: usize, body: &str, rt: Arc<dyn
 #[tokio::test]
 async fn bonded_two_paths_clean_merges_and_dedups() {
     // Both paths deliver every packet; the receiver must dedup to deliver each once.
-    run_bonded(bonded_cfg(), 2, 60, "payload", Arc::new(TokioRuntime)).await;
+    run_bonded(bonded_cfg(), 2, 60, "payload", |_| Arc::new(TokioRuntime)).await;
 }
 
 #[tokio::test]
 async fn bonded_three_paths_clean() {
-    run_bonded(bonded_cfg(), 3, 60, "triple", Arc::new(TokioRuntime)).await;
+    run_bonded(bonded_cfg(), 3, 60, "triple", |_| Arc::new(TokioRuntime)).await;
 }
 
 #[tokio::test]
@@ -109,44 +126,90 @@ async fn bonded_two_paths_aes256() {
         2,
         60,
         "encrypted",
-        Arc::new(TokioRuntime),
+        |_| Arc::new(TokioRuntime),
     )
     .await;
 }
 
 #[tokio::test]
 async fn bonded_survives_one_path_blackhole() {
-    // Path 0's forward media is entirely dropped; the redundant copy on path 1 must
-    // carry the whole stream with no loss and no discontinuity (seamless 2022-7).
-    let rt = Arc::new(BlackholePathRuntime::new(0));
-    run_bonded(bonded_cfg(), 2, 60, "redundant", rt).await;
+    // Path 0's forward media (everything sent to its remote) is entirely dropped; the
+    // redundant copy on path 1 must carry the whole stream with no loss and no
+    // discontinuity (seamless 2022-7). The body is padded past MEDIA_THRESHOLD so each
+    // media datagram is actually subject to the blackhole.
+    let body = "x".repeat(200);
+    run_bonded(bonded_cfg(), 2, 60, &body, |dests| {
+        Arc::new(PathTapRuntime::blackholing(dests, 0))
+    })
+    .await;
 }
 
-/// A [`Runtime`] whose `target`-th bound socket silently drops outbound *media*
-/// datagrams (those larger than [`MEDIA_THRESHOLD`]); every other socket and all
-/// small control traffic pass through. Used to blackhole one bonded path's forward
-/// media while its GRE handshake/keepalive still flow, so liveness holds and only
-/// the media redundancy is under test.
-#[derive(Debug)]
-struct BlackholePathRuntime {
-    target: usize,
-    bound: AtomicUsize,
-}
-
-impl BlackholePathRuntime {
-    fn new(target: usize) -> BlackholePathRuntime {
-        BlackholePathRuntime {
-            target,
-            bound: AtomicUsize::new(0),
-        }
-    }
-}
-
-/// Datagrams larger than this are treated as media and subject to the blackhole;
-/// GRE handshakes and keepalives stay well below it.
+/// Datagrams larger than this are treated as media; GRE handshakes and keepalives
+/// stay well below it, so they are never counted nor blackholed.
 const MEDIA_THRESHOLD: usize = 128;
 
-impl Runtime for BlackholePathRuntime {
+/// The per-path tap state shared between a [`PathTapRuntime`] and the sockets it
+/// binds: the ordered per-path destinations, a media-byte counter per path, and an
+/// optional blackhole target. The bonded sender shares one source socket across all
+/// paths, so a datagram's path is identified by its *destination* (the per-path
+/// remote), not by which socket sent it.
+#[derive(Debug)]
+struct PathTap {
+    /// Per-path remote addresses, in path order; `dests[i]` is path `i`.
+    dests: Vec<SocketAddr>,
+    /// Media bytes attributed to each path, parallel to `dests`.
+    counters: Vec<AtomicU64>,
+    /// If `Some(i)`, path `i`'s forward media is silently dropped.
+    blackhole: Option<usize>,
+}
+
+impl PathTap {
+    /// The path index a media datagram bound for `dest` belongs to, if any.
+    fn path_of(&self, dest: SocketAddr) -> Option<usize> {
+        self.dests.iter().position(|d| *d == dest)
+    }
+}
+
+/// A [`Runtime`] that taps the bonded sender's shared socket, attributing each
+/// media-sized datagram to a path by its destination (the per-path remote). It
+/// totals per-path media bytes — the witness that weighted load-share split the
+/// stream across the paths — and can blackhole one path's forward media to prove
+/// 2022-7 redundancy, all while small control traffic flows on every path.
+#[derive(Debug)]
+struct PathTapRuntime {
+    tap: Arc<PathTap>,
+}
+
+impl PathTapRuntime {
+    /// A counting-only tap over the given per-path destinations.
+    fn new(dests: Vec<SocketAddr>) -> PathTapRuntime {
+        PathTapRuntime::with_blackhole(dests, None)
+    }
+    /// A tap that also blackholes path `target`'s forward media.
+    fn blackholing(dests: Vec<SocketAddr>, target: usize) -> PathTapRuntime {
+        PathTapRuntime::with_blackhole(dests, Some(target))
+    }
+    fn with_blackhole(dests: Vec<SocketAddr>, blackhole: Option<usize>) -> PathTapRuntime {
+        let counters = dests.iter().map(|_| AtomicU64::new(0)).collect();
+        PathTapRuntime {
+            tap: Arc::new(PathTap {
+                dests,
+                counters,
+                blackhole,
+            }),
+        }
+    }
+    /// The per-path media byte counts, in path order.
+    fn counts(&self) -> Vec<u64> {
+        self.tap
+            .counters
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
+impl Runtime for PathTapRuntime {
     fn now(&self) -> Instant {
         TokioRuntime.now()
     }
@@ -158,105 +221,46 @@ impl Runtime for BlackholePathRuntime {
     }
     fn bind(&self, addr: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>> {
         let inner = TokioRuntime.bind(addr)?;
-        let nth = self.bound.fetch_add(1, Ordering::Relaxed);
-        if nth == self.target {
-            Ok(Arc::new(BlackholeSocket { inner }))
+        Ok(Arc::new(PathTapSocket {
+            inner,
+            tap: Arc::clone(&self.tap),
+        }))
+    }
+}
+
+/// A socket that, for each media-sized send, attributes the datagram to its
+/// destination path: it totals the bytes and, if that path is blackholed, drops the
+/// datagram (reporting success so the host proceeds). Control traffic and all
+/// receives pass through untouched.
+#[derive(Debug)]
+struct PathTapSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    tap: Arc<PathTap>,
+}
+
+impl AsyncUdpSocket for PathTapSocket {
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        dest: SocketAddr,
+    ) -> std::task::Poll<io::Result<usize>> {
+        let path = if buf.len() > MEDIA_THRESHOLD {
+            self.tap.path_of(dest)
         } else {
-            Ok(inner)
-        }
-    }
-}
-
-/// A socket that drops every media-sized send (the blackholed path's forward
-/// media) but passes control traffic and all receives.
-#[derive(Debug)]
-struct BlackholeSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
-}
-
-impl AsyncUdpSocket for BlackholeSocket {
-    fn poll_send(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-        dest: SocketAddr,
-    ) -> std::task::Poll<io::Result<usize>> {
-        if buf.len() > MEDIA_THRESHOLD {
-            return std::task::Poll::Ready(Ok(buf.len())); // drop, report success
-        }
-        self.inner.poll_send(cx, buf, dest)
-    }
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<io::Result<(usize, SocketAddr)>> {
-        self.inner.poll_recv(cx, buf)
-    }
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-}
-
-/// A [`Runtime`] that totals the media-sized datagrams each bound socket transmits,
-/// one counter per `bind` in call order. The bonded sender binds one socket per path
-/// in path order, so `counters()[i]` is path `i`'s media count — the witness that
-/// weighted load-share split the stream across the paths.
-#[derive(Debug, Default)]
-struct CountingPathRuntime {
-    counters: Mutex<Vec<Arc<AtomicU64>>>,
-}
-
-impl CountingPathRuntime {
-    fn new() -> CountingPathRuntime {
-        CountingPathRuntime::default()
-    }
-    /// The per-path media counters, in path (bind) order.
-    fn counters(&self) -> Vec<Arc<AtomicU64>> {
-        self.counters.lock().expect("counters").clone()
-    }
-}
-
-impl Runtime for CountingPathRuntime {
-    fn now(&self) -> Instant {
-        TokioRuntime.now()
-    }
-    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        TokioRuntime.spawn(future);
-    }
-    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        TokioRuntime.sleep_until(deadline)
-    }
-    fn bind(&self, addr: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        let inner = TokioRuntime.bind(addr)?;
-        let counter = Arc::new(AtomicU64::new(0));
-        self.counters
-            .lock()
-            .expect("counters")
-            .push(Arc::clone(&counter));
-        Ok(Arc::new(CountingPathSocket { inner, counter }))
-    }
-}
-
-/// A socket that adds each media-sized send to its path counter.
-#[derive(Debug)]
-struct CountingPathSocket {
-    inner: Arc<dyn AsyncUdpSocket>,
-    counter: Arc<AtomicU64>,
-}
-
-impl AsyncUdpSocket for CountingPathSocket {
-    fn poll_send(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-        dest: SocketAddr,
-    ) -> std::task::Poll<io::Result<usize>> {
-        let r = self.inner.poll_send(cx, buf, dest);
-        if let std::task::Poll::Ready(Ok(n)) = &r
-            && buf.len() > MEDIA_THRESHOLD
+            None
+        };
+        if let Some(i) = path
+            && self.tap.blackhole == Some(i)
         {
-            self.counter.fetch_add(*n as u64, Ordering::Relaxed);
+            // The load-share scheduler chose this path, so count it, then drop the
+            // datagram on the floor and report success so the host proceeds.
+            self.tap.counters[i].fetch_add(buf.len() as u64, Ordering::Relaxed);
+            return std::task::Poll::Ready(Ok(buf.len()));
+        }
+        let r = self.inner.poll_send(cx, buf, dest);
+        if let (Some(i), std::task::Poll::Ready(Ok(n))) = (path, &r) {
+            self.tap.counters[i].fetch_add(*n as u64, Ordering::Relaxed);
         }
         r
     }
@@ -273,10 +277,10 @@ impl AsyncUdpSocket for CountingPathSocket {
 }
 
 /// Drives a weighted bonded sender (per-path or runtime-set weights) through a
-/// counting runtime, asserts the receiver merges all `N` payloads in order, and
-/// returns the per-path media byte counts.
+/// counting tap runtime, asserts the receiver merges all `N` payloads in order, and
+/// returns the per-path media byte counts (keyed by destination).
 async fn run_weighted(
-    rt: Arc<CountingPathRuntime>,
+    rt: Arc<PathTapRuntime>,
     sender: rist::Sender,
     mut receiver: Receiver,
     n: usize,
@@ -303,11 +307,7 @@ async fn run_weighted(
         );
     }
     let sender = send_task.await.expect("send task");
-    let counts: Vec<u64> = rt
-        .counters()
-        .iter()
-        .map(|c| c.load(Ordering::Relaxed))
-        .collect();
+    let counts = rt.counts();
     sender.close().await.expect("close sender");
     receiver.close().await.expect("close receiver");
     counts
@@ -317,7 +317,8 @@ async fn run_weighted(
 async fn bonded_weighted_load_share_splits_three_to_one() {
     let cfg = bonded_cfg();
     let (receiver, refs) = listen_free_bonded(&cfg, 2).await;
-    let rt = Arc::new(CountingPathRuntime::new());
+    let dests: Vec<SocketAddr> = refs.iter().map(|a| a.parse().expect("dest addr")).collect();
+    let rt = Arc::new(PathTapRuntime::new(dests));
     // Path 0 weight 3, path 1 weight 1: path 0 carries ~three quarters of the stream.
     let peers: Vec<(&str, u32)> = vec![(refs[0].as_str(), 3), (refs[1].as_str(), 1)];
     let sender = dial_bonded_weighted_with(&peers, cfg.clone(), rt.as_ref())
@@ -341,7 +342,8 @@ async fn bonded_weighted_load_share_splits_three_to_one() {
 async fn bonded_set_weight_rebalances_at_runtime() {
     let cfg = bonded_cfg().with_weight(1); // start uniform 1:1
     let (receiver, refs) = listen_free_bonded(&cfg, 2).await;
-    let rt = Arc::new(CountingPathRuntime::new());
+    let dests: Vec<SocketAddr> = refs.iter().map(|a| a.parse().expect("dest addr")).collect();
+    let rt = Arc::new(PathTapRuntime::new(dests));
     let addrs: Vec<&str> = refs.iter().map(String::as_str).collect();
     let sender = dial_bonded_with(&addrs, cfg.clone(), rt.as_ref())
         .await

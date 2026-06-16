@@ -7,8 +7,12 @@
 //! — the injected-feed seam from WP19a. Each flow owns its own recovery, timers, and
 //! feedback (written back out the shared socket to its own learned peer); new flows
 //! surface via [`MultiReceiver::accept`]. The Simple profile keys by the cleartext RTP
-//! SSRC; the single-socket profiles (Main/Advanced) key by source address (added in a
-//! later sub-phase).
+//! SSRC; the single-socket profiles (Main/Advanced) key by source address.
+//!
+//! [`listen_multi_bonded`] extends this to SMPTE 2022-7: the demultiplexer binds `N`
+//! Main-profile path ports and keys by source address, so every bonded sender (each
+//! sourcing all its paths from one socket, per the reversed-role/bonded convention)
+//! becomes one bonded session merging across all `N` paths.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,6 +25,7 @@ use rist_codec::rtp;
 use crate::config::{Config, Profile};
 use crate::driver::SimpleInbound;
 use crate::driver_adv::AdvInbound;
+use crate::driver_bonded::{INBOUND_CAPACITY, Inbound, spawn_reader};
 use crate::driver_main::MainInbound;
 use crate::error::{ConfigError, Error};
 use crate::receiver::Receiver;
@@ -150,6 +155,78 @@ pub async fn listen_multi_with(
         }
     };
     tracing::debug!(%bound, "rist: multi-receiver listening");
+    Ok(MultiReceiver {
+        accept_rx,
+        demux,
+        local: bound,
+    })
+}
+
+/// Binds a multiplexing SMPTE 2022-7 **bonded** receiver across every address in
+/// `addrs` (each a bare `IP:port`): the `N` Main-profile path ports are demultiplexed
+/// by source address into a bonded [`Receiver`] per sender, each merging the redundant
+/// copies arriving on the paths into one in-order, ARQ-recovered stream. `local_addr`
+/// reports the first bound path. Bonding requires the Main profile.
+///
+/// # Errors
+/// Returns [`Error::InvalidAddr`] if `addrs` is empty or an entry is not a valid
+/// `IP:port`, [`Error::Config`] if the profile is not Main or FEC is configured (it
+/// conflicts with per-flow demux), or [`Error::Io`] if a socket cannot be bound.
+pub async fn listen_multi_bonded(addrs: &[&str], cfg: Config) -> Result<MultiReceiver, Error> {
+    listen_multi_bonded_with(addrs, cfg, &TokioRuntime).await
+}
+
+/// Like [`listen_multi_bonded`], but binds every path's transport socket through `rt`.
+///
+/// # Errors
+/// As [`listen_multi_bonded`].
+pub async fn listen_multi_bonded_with(
+    addrs: &[&str],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<MultiReceiver, Error> {
+    if addrs.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded multi-receiver needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    // Bonding rides the Main-profile GRE substrate; reject other profiles up front.
+    if cfg.profile != Profile::Main {
+        let name = if cfg.profile == Profile::Simple {
+            "Simple"
+        } else {
+            "Advanced"
+        };
+        return Err(Error::Config(ConfigError::ProfileFeatureUnsupported {
+            feature: "SMPTE 2022-7 bonding",
+            profile: name,
+        }));
+    }
+    // FEC and per-flow demux conflict (one auxiliary stream, not per-flow).
+    if cfg.fec.is_some() {
+        return Err(Error::Config(ConfigError::FecInvalid {
+            reason: "FEC is not supported with multi-flow receive",
+        }));
+    }
+    let locals = crate::sender::resolve_bonded_addrs(addrs)?;
+    let mut sockets = Vec::with_capacity(locals.len());
+    let mut bound = None;
+    for &local in &locals {
+        let membership = crate::multicast::receiver_membership(&cfg, local)?;
+        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+        let path_local = socket.local()?;
+        if bound.is_none() {
+            bound = Some(path_local);
+        }
+        sockets.push(socket);
+    }
+    let bound = bound.ok_or_else(|| {
+        Error::InvalidAddr("bonded multi-receiver needs at least one address".into())
+    })?;
+    let (accept_tx, accept_rx) = mpsc::channel(MAX_FLOWS);
+    let demux = tokio::spawn(demux_bonded(sockets, cfg, bound, accept_tx));
+    tracing::debug!(%bound, paths = locals.len(), "rist: bonded multi-receiver listening");
     Ok(MultiReceiver {
         accept_rx,
         demux,
@@ -316,5 +393,57 @@ async fn demux_adv(
                 tracing::warn!(target: "rist::crypto", "rist: multi-flow: drop flow, build failed: {e}");
             }
         }
+    }
+}
+
+/// The bonded-profile demultiplexer task: one reader per path socket funnels its
+/// (path-index-tagged) datagrams into a shared channel, and the loop keys each by
+/// source address into a per-source bonded session that merges across all the paths.
+/// Each bonded sender sources every path from one socket, so its source address is
+/// the whole bonded flow's identity (just like [`demux_main`] for a single path).
+async fn demux_bonded(
+    sockets: Vec<MainSocket>,
+    cfg: Config,
+    local: SocketAddr,
+    accept_tx: mpsc::Sender<Receiver>,
+) {
+    let (in_tx, mut in_rx) = mpsc::channel::<Inbound>(INBOUND_CAPACITY);
+    let mut readers = Vec::with_capacity(sockets.len());
+    for (j, sock) in sockets.iter().enumerate() {
+        readers.push(spawn_reader(
+            u8::try_from(j).unwrap_or(u8::MAX),
+            sock.clone(),
+            in_tx.clone(),
+        ));
+    }
+    drop(in_tx); // the demux holds no sender; the readers keep the channel open
+    let mut flows: HashMap<SocketAddr, mpsc::Sender<Inbound>> = HashMap::new();
+    while let Some(inb) = in_rx.recv().await {
+        let src = inb.src;
+        if let Some(tx) = flows.get(&src) {
+            if tx.send(inb).await.is_err() {
+                flows.remove(&src); // the flow's session ended
+            }
+            continue;
+        }
+        flows.retain(|_, tx| !tx.is_closed());
+        if flows.len() >= MAX_FLOWS {
+            continue; // at capacity: drop, keep demultiplexing
+        }
+        match crate::session::build_injected_bonded(&sockets, &cfg, local) {
+            Ok((tx, receiver)) => {
+                let _ = tx.send(inb).await; // feed the datagram that opened the flow
+                flows.insert(src, tx);
+                let _ = accept_tx.send(receiver).await;
+            }
+            // A per-flow PSK/EAP key derivation failed: drop this source's flow rather
+            // than install a broken session; a later datagram retries the build.
+            Err(e) => {
+                tracing::warn!(target: "rist::crypto", "rist: multi-flow bonded: drop flow, build failed: {e}");
+            }
+        }
+    }
+    for r in readers {
+        r.abort();
     }
 }

@@ -20,6 +20,9 @@ bytes = "1"
 [dependencies.rist-codec]
 path = ".."
 
+[dependencies.rist-core]
+path = "../../rist-core"
+
 # Round-trip + no-panic on arbitrary bytes for each wire codec, mirroring ristgo
 # internal/rtp and internal/rtcp fuzz_test.go.
 [[bin]]
@@ -39,6 +42,16 @@ bench = false
 [[bin]]
 name = "lqm_roundtrip"
 path = "fuzz_targets/lqm_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# The FEC header codec: arbitrary bytes must never panic, and a decoded header must
+# re-encode to bytes that re-decode identically (mirrors ristgo internal/fec
+# FuzzParseHeader / FuzzParseHeader5).
+[[bin]]
+name = "fec_header_roundtrip"
+path = "fuzz_targets/fec_header_roundtrip.rs"
 test = false
 doc = false
 bench = false

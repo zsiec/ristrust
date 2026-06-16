@@ -7,6 +7,7 @@ pub mod crypto;
 #[cfg(feature = "dtls")]
 pub mod dtls;
 pub mod eap;
+pub mod fec_header;
 pub mod gre;
 pub mod lpc;
 pub mod npd;

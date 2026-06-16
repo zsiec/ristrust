@@ -206,6 +206,15 @@ pub const CI_LQM_LINK_SPECIFIC: u16 = 0x0003;
 pub const CI_RTT_ECHO_REQ: u16 = 0x0010;
 /// RTT echo response control index.
 pub const CI_RTT_ECHO_RESP: u16 = 0x0011;
+/// SMPTE ST 2022-5 row FEC control index (in-band Advanced FEC carriage, TR-06-3
+/// §5.3.5).
+pub const CI_FEC_2022_5_ROW: u16 = 0x0020;
+/// SMPTE ST 2022-5 column FEC control index.
+pub const CI_FEC_2022_5_COL: u16 = 0x0021;
+/// SMPTE ST 2022-1 row FEC control index.
+pub const CI_FEC_2022_1_ROW: u16 = 0x0022;
+/// SMPTE ST 2022-1 column FEC control index.
+pub const CI_FEC_2022_1_COL: u16 = 0x0023;
 /// Keepalive control index.
 pub const CI_KEEPALIVE: u16 = 0x8000;
 /// Flow-attributes control index.

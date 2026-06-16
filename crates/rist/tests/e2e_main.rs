@@ -94,6 +94,20 @@ async fn main_loopback_cleartext_delivers_in_order() {
 }
 
 #[tokio::test]
+async fn main_windowed_buffer_negotiates_and_delivers() {
+    // A windowed recovery buffer (min != max) turns on GRE-v2 buffer negotiation:
+    // the sender advertises its max recovery buffer, the receiver auto-scales its
+    // playout buffer toward smoothedRTT*multiplier within [min, max]. The stream
+    // must still deliver in order and byte-exact through that path. (Algorithm
+    // correctness is pinned by the rist-core auto-scale KAT; this guards the wire +
+    // session plumbing.)
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_buffer_range(Duration::from_millis(150), Duration::from_millis(400));
+    run_loopback(cfg, &TokioRuntime, 60, 0, "windowed").await;
+}
+
+#[tokio::test]
 async fn main_loopback_aes128_delivers_in_order() {
     run_loopback(
         main_cfg(Some(("hunter2-128", AesKeyBits::Aes128))),

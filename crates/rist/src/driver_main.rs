@@ -453,6 +453,9 @@ impl MainDriver {
                         // separate keepalive timer.
                         self.send_handshake(now).await;
                         self.send_keepalive(now).await;
+                        // Advertise this sender's max recovery buffer so the receiver
+                        // can auto-scale (GRE-v2 buffer negotiation; sender-only).
+                        self.send_buffer_neg(now).await;
                         // Source adaptation: emit a Link Quality Message when a
                         // reporting period has elapsed (receiver only).
                         self.maybe_emit_lqm(now).await;
@@ -569,6 +572,7 @@ impl MainDriver {
                         }
                     }
                 }
+                Ok(Decoded::BufferNeg(bn)) => self.on_buffer_neg(bn),
                 Ok(Decoded::Ignored) => {}
                 Err(e) => crate::driver::decode_warn(self.codec.has_psk(), "main", &e),
             }
@@ -784,8 +788,46 @@ impl MainDriver {
             ..gre::Keepalive::default()
         };
         let sock = self.socket.clone();
-        if let Ok(bytes) = self.codec.encode_keepalive(&ka, gre::VERSION_MIN) {
+        // Advertise GRE v2 (the VSF-wrapped control plane), so the peer learns this
+        // node speaks v2 and runs buffer negotiation. Media stays v1-framed.
+        if let Ok(bytes) = self.codec.encode_keepalive(&ka, gre::VERSION_CUR) {
             let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Advertises this sender's maximum recovery buffer (`recovery_buffer_max +
+    /// 2·rtt_min`, libRIST `sender_recover_min_time`) as a GRE-v2 buffer-negotiation
+    /// message, so the receiver auto-scales its playout buffer without sizing past
+    /// what the sender retains for retransmission. Sender-role, two-way only.
+    async fn send_buffer_neg(&mut self, _now: Timestamp) {
+        if !self.sender || self.flow.config().no_recovery {
+            return;
+        }
+        let Some(dst) = self.peer.media() else { return };
+        let max_ms = {
+            let cfg = self.flow.config();
+            let micros = cfg.recovery_buffer_max.as_micros() + 2 * cfg.rtt_min.as_micros();
+            u16::try_from(micros / 1000).unwrap_or(u16::MAX)
+        };
+        let bn = gre::BufferNegotiation {
+            sender_max_ms: max_ms,
+            ..gre::BufferNegotiation::default()
+        };
+        if let Ok(bytes) = self.codec.encode_buffer_neg(bn) {
+            let sock = self.socket.clone();
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Feeds an inbound buffer-negotiation message to the flow: a non-zero sender-max
+    /// enables (and bounds) the receiver's recovery-buffer auto-scaling. A no-op on a
+    /// sender-role flow (the core guards by role).
+    fn on_buffer_neg(&mut self, bn: gre::BufferNegotiation) {
+        if bn.sender_max_ms != 0 {
+            self.flow
+                .set_sender_max_buffer(rist_core::clock::Micros::from_millis(i64::from(
+                    bn.sender_max_ms,
+                )));
         }
     }
 

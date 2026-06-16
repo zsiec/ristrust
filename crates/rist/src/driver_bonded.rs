@@ -510,6 +510,18 @@ impl BondedDriver {
                         self.flow.feed_feedback(now, fb);
                     }
                 }
+                // A peer's buffer-negotiation feeds the shared flow's auto-scaler (a
+                // non-zero sender-max). ristgo does not originate buffer negotiation
+                // from a bonded sender — the per-path max is ill-defined across paths
+                // — but a bonded receiver still consumes an inbound advert.
+                Ok(Decoded::BufferNeg(bn)) => {
+                    if bn.sender_max_ms != 0 {
+                        self.flow
+                            .set_sender_max_buffer(rist_core::clock::Micros::from_millis(
+                                i64::from(bn.sender_max_ms),
+                            ));
+                    }
+                }
                 Ok(Decoded::Ignored) => {}
                 Err(e) => {
                     crate::driver::decode_warn(self.paths[i].codec.has_psk(), "bonded main", &e);

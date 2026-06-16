@@ -81,8 +81,12 @@ pub(crate) enum Decoded {
     Media(MediaPacket),
     /// A compound-RTCP datagram, decoded into normalized feedback.
     Feedback(Vec<Feedback>),
+    /// A VSF buffer-negotiation control message (GRE v2): the peer's advertised
+    /// sender-max / receiver-current recovery buffer. A host concern, not flow
+    /// input — the driver feeds the sender-max to the flow's auto-scaler.
+    BufferNeg(gre::BufferNegotiation),
     /// A well-formed datagram with nothing for the flow core (e.g. a VSF
-    /// keepalive/buffer-negotiation subtype).
+    /// keepalive subtype).
     Ignored,
 }
 
@@ -512,6 +516,24 @@ impl MainCodec {
         )
     }
 
+    /// Frames a VSF buffer-negotiation control message (GRE v2 only — the VSF
+    /// wrapper carries the subtype). Each peer uses it to advertise the recovery
+    /// buffer it allows as a sender / uses as a receiver (libRIST
+    /// `rist_buffer_negotiation`).
+    pub(crate) fn encode_buffer_neg(
+        &mut self,
+        bn: gre::BufferNegotiation,
+    ) -> Result<Vec<u8>, CodecError> {
+        let mut body = Vec::new();
+        bn.append_to(&mut body);
+        self.frame_control(
+            &body,
+            gre::VERSION_CUR,
+            gre::PROTO_VSF,
+            gre::VSF_SUBTYPE_BUFFER_NEGOTIATION,
+        )
+    }
+
     /// Frames an EAP-over-GRE authentication payload: the GRE header (version 1,
     /// sequence present, protocol type EAPOL) followed by the EAP frame, never
     /// encrypted (libRIST excludes EAPOL from PSK). Increments the GRE sequence once.
@@ -630,6 +652,13 @@ impl MainCodec {
         // without action rather than dropped.
         if is_vsf {
             let (vsf, vn) = gre::VsfProto::parse(&region)?;
+            if vsf.subtype == gre::VSF_SUBTYPE_BUFFER_NEGOTIATION {
+                // The peer's recovery-buffer advertisement (GRE v2); surfaced to the
+                // host, which feeds the sender-max to the flow's auto-scaler.
+                return Ok(Decoded::BufferNeg(gre::BufferNegotiation::parse(
+                    &region[vn..],
+                )?));
+            }
             if vsf.subtype != gre::VSF_SUBTYPE_REDUCED {
                 return Ok(Decoded::Ignored);
             }
@@ -1343,6 +1372,25 @@ mod tests {
                 .unwrap();
             let (kind, _, _) = dec.peek_control(&md);
             assert_eq!(kind, ControlKind::None, "{bits:?} media not keepalive");
+        }
+    }
+
+    #[test]
+    fn buffer_neg_round_trip() {
+        // Cleartext and PSK: a buffer-negotiation message frames as a GRE-v2 VSF
+        // control datagram and decodes back to its advertised sender max.
+        for bits in [None, Some(AesKeyBits::Aes128)] {
+            let (mut enc, mut dec) = codec_pair(bits, false, 0x0BAD_F010);
+            let bn = gre::BufferNegotiation {
+                sender_max_ms: 1050,
+                receiver_cur_ms: 0,
+                proto_type: 0,
+            };
+            let dg = enc.encode_buffer_neg(bn).unwrap();
+            let Decoded::BufferNeg(got) = dec.decode(&dg, 0).unwrap() else {
+                panic!("{bits:?}: expected a BufferNeg decode");
+            };
+            assert_eq!(got, bn, "{bits:?} buffer-negotiation round-trip");
         }
     }
 }

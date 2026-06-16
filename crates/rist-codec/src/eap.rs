@@ -722,6 +722,20 @@ impl Authenticatee {
         start_frame()
     }
 
+    /// Resets the client to the unauthenticated state so a fresh handshake can re-run
+    /// (EAP re-authentication — e.g. after a NAT source-port rebind). Credentials and
+    /// the `use_key_passphrase` keying mode are preserved, so a successful re-auth
+    /// *rolls* the data-channel keys rather than resetting them; the host re-emits the
+    /// EAPOL-START after calling this.
+    pub fn restart(&mut self) {
+        self.state = State::Unauth;
+        self.id = 0; // the next IDENTITY REQUEST re-bootstraps it; a stale value widens the gate
+        self.id_valid = false;
+        self.client = None;
+        self.salt = Vec::new();
+        self.session = None;
+    }
+
     /// Processes one received EAPOL frame and returns the reply to transmit (and
     /// any terminal error). Never panics on arbitrary input.
     pub fn recv(&mut self, payload: &[u8]) -> Reply {
@@ -741,13 +755,31 @@ impl Authenticatee {
     )]
     fn handle(&mut self, f: Frame) -> Reply {
         if f.kind == Kind::Failure {
-            // Drop a stale/spoofed FAILURE whose identifier does not match the
-            // in-flight request, so it cannot force-fail an active session.
-            if self.state != State::Unauth && f.identifier != self.id {
+            // Honor a FAILURE only while a handshake is actually in flight (InProgress)
+            // and only when its identifier matches the in-flight request. In Success a
+            // FAILURE is stale or forged — a live session is re-proven via a fresh
+            // IDENTITY REQUEST (the Success gate below), never torn down by an injected
+            // FAILURE, so a replay echoing the last identifier cannot knock us out of
+            // Success. (Unauth has no exchange to fail; Failed is already terminal.)
+            if self.state != State::InProgress || f.identifier != self.id {
                 return Reply::none();
             }
             self.state = State::Failed;
             return Reply::err(EapError::AuthFailed);
+        }
+        // Re-authentication gate: a re-auth MUST begin with a fresh IDENTITY REQUEST.
+        // Once Success has been reached, a CHALLENGE/SERVER_KEY/SERVER_VALIDATOR with
+        // no intervening IDENTITY REQUEST is stale or forged — ignore it so a replayed
+        // frame cannot knock a live session out of Success and restart its SRP state. A
+        // genuine IDENTITY REQUEST in Success is the authenticator driving a re-auth:
+        // reset to a clean slate so the re-auth runs (and `done`/`authenticated` report
+        // it in progress) rather than answering from stale state while still in Success.
+        if self.state == State::Success {
+            match f.kind {
+                Kind::IdentityRequest => self.restart(),
+                Kind::Challenge | Kind::ServerKey | Kind::ServerValidator => return Reply::none(),
+                _ => {}
+            }
         }
         // Identifier gate: the authenticator drives the SRP exchange with a fresh,
         // per-request incrementing identifier (IDENTITY_REQUEST → CHALLENGE →
@@ -903,6 +935,10 @@ pub struct Authenticator {
     session: Option<[u8; HASH_LEN]>,
     verified: bool,
     use_key_passphrase: bool,
+    /// Records that this authenticator reached `Success` at least once. Once true, a
+    /// spoofed EAPOL-LOGOFF can no longer tear the exchange down even while a re-auth
+    /// is in progress (an established session is only re-proven, never reset).
+    ever_authed: bool,
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -929,7 +965,22 @@ impl Authenticator {
             session: None,
             verified: false,
             use_key_passphrase: true,
+            ever_authed: false,
         }
+    }
+
+    /// Resets the server to the unauthenticated state for a fresh handshake (EAP
+    /// re-authentication). The verifier lookup, advertised version, and keying mode
+    /// are preserved; the EAP identifier advances so the re-auth's requests are
+    /// distinct on the wire. A subsequent [`start`](Self::start) re-opens the
+    /// exchange. A failed re-auth is non-fatal at the host: the previously installed
+    /// keys remain until a new Success rolls them.
+    pub fn restart(&mut self) {
+        self.state = State::Unauth;
+        self.server = None;
+        self.session = None;
+        self.verified = false;
+        self.id = self.id.wrapping_add(1);
     }
 
     /// Selects how the role answers a peer's passphrase request: push "use the SRP
@@ -1018,19 +1069,29 @@ impl Authenticator {
         }
         match f.kind {
             Kind::Start => {
-                // Ignore a further START once the SRP exchange has begun.
-                if self.server.is_some() {
+                // Ignore a further START while a handshake is in progress, so a
+                // spoofed mid-handshake START cannot reset the live exchange. From a
+                // terminal state (Success, or Failed after a prior Success — an
+                // abandoned/failed re-auth) a START is a legitimate re-authentication:
+                // re-run from a clean slate. A forger cannot complete the re-auth (it
+                // fails M1 verification) and a failed re-auth is non-fatal at the host,
+                // so neither a spoofed START nor a failed re-prove tears the session
+                // down; accepting a START from Failed lets the genuine peer recover.
+                if self.state == State::InProgress {
                     return Reply::none();
                 }
-                let out = self.start();
-                Reply::frame(out)
+                if self.state != State::Unauth {
+                    self.restart();
+                }
+                Reply::frame(self.start())
             }
             Kind::Logoff => {
-                // Refuse LOGOFF once the session is established (or terminated): an
-                // injected EAPOL-LOGOFF must not tear down an authenticated session
-                // (an off-path deauth). libRIST honors LOGOFF only during the open
-                // handshake; only an in-progress exchange is reset here.
-                if matches!(self.state, State::Success | State::Failed) {
+                // Refuse LOGOFF once the session is established (or terminated) or has
+                // ever authenticated (so it cannot abort an in-progress re-auth
+                // either): an injected EAPOL-LOGOFF must not tear down an authenticated
+                // session. libRIST honors LOGOFF only during the initial open
+                // handshake; only an in-progress, never-authed exchange is reset here.
+                if matches!(self.state, State::Success | State::Failed) || self.ever_authed {
                     return Reply::none();
                 }
                 self.state = State::Unauth;
@@ -1123,6 +1184,7 @@ impl Authenticator {
                 // the verified M1, does the authenticator reach terminal SUCCESS.
                 if self.verified {
                     self.state = State::Success;
+                    self.ever_authed = true;
                     self.id = self.id.wrapping_add(1);
                 }
                 Reply::none()
@@ -1138,6 +1200,15 @@ impl Authenticator {
             // acknowledge so the peer's exchange completes.
             Kind::PassphraseResponse => Reply::frame(success_ack(f.identifier)),
             Kind::Failure => {
+                // Honor a FAILURE only while a handshake is in flight. In Success it is
+                // stale or forged (EAPOL is unencrypted) and must not tear a live
+                // session down — re-auth is driven by a START/IDENTITY exchange, never
+                // by an injected FAILURE. (The identifier gate above already drops a
+                // mismatched-id FAILURE; this also closes the matching-id FAILURE that
+                // the id-advance on Success would otherwise admit.)
+                if self.state != State::InProgress {
+                    return Reply::none();
+                }
                 self.state = State::Failed;
                 Reply::err(EapError::AuthFailed)
             }
@@ -1406,6 +1477,139 @@ mod tests {
             auth.authenticated(),
             "LOGOFF after success must be refused (off-path deauth)"
         );
+    }
+
+    /// A session can re-authenticate after Success: the client `restart`s and re-opens
+    /// with EAPOL-START, the server (already Success) accepts it as a re-auth and
+    /// re-runs the exchange, and both reach Success again with a FRESH session key (the
+    /// replay-proof identity proof the NAT-rebind re-association relies on).
+    #[test]
+    fn reauth_after_success_rolls_the_session_key() {
+        let (user, pass) = ("rist", "mainprofile");
+        let salt = hx(KAT_SALT);
+        let verifier = srp::make_verifier(&srp::default_group(), user, pass, &salt).unwrap();
+        let mut authee = Authenticatee::new(user, pass).unwrap();
+        let mut auth = Authenticator::new(static_verifier(user, verifier, salt));
+        drive(&mut authee, &mut auth);
+        assert!(
+            authee.authenticated() && auth.authenticated(),
+            "first handshake"
+        );
+        let k1 = authee.session_key().unwrap();
+
+        authee.restart();
+        drive(&mut authee, &mut auth);
+        assert!(
+            authee.authenticated() && auth.authenticated(),
+            "re-auth must re-authenticate both roles"
+        );
+        let k2 = authee.session_key().unwrap();
+        assert_eq!(
+            k2,
+            auth.session_key().unwrap(),
+            "re-auth session keys agree"
+        );
+        assert_ne!(
+            k1, k2,
+            "re-auth must roll the session key (fresh SRP nonces)"
+        );
+    }
+
+    /// The re-auth gate: an authenticatee in Success ignores a CHALLENGE arriving with
+    /// no fresh IDENTITY REQUEST (a replay must not knock a live session out of
+    /// Success), while a genuine IDENTITY REQUEST resets it cleanly for a re-auth.
+    #[test]
+    fn authenticatee_rejects_stale_reauth_frames() {
+        let (user, pass) = ("rist", "mainprofile");
+        let salt = hx(KAT_SALT);
+        let verifier = srp::make_verifier(&srp::default_group(), user, pass, &salt).unwrap();
+        let mut authee = Authenticatee::new(user, pass).unwrap();
+        let mut auth = Authenticator::new(static_verifier(user, verifier, salt.clone()));
+        drive(&mut authee, &mut auth);
+        assert!(authee.authenticated(), "setup");
+
+        // An in-window CHALLENGE injected into Success must be ignored.
+        let mut stale = Vec::new();
+        Frame {
+            version: EAP_VERSION_3,
+            code: Code::Request,
+            identifier: authee.id.wrapping_add(1),
+            kind: Kind::Challenge,
+            salt,
+            ..Frame::default()
+        }
+        .append_to(&mut stale);
+        let r = authee.recv(&stale);
+        assert!(
+            r.frame.is_none() && r.error.is_none(),
+            "stale CHALLENGE must be ignored"
+        );
+        assert!(
+            authee.authenticated(),
+            "stale CHALLENGE knocked us out of Success"
+        );
+
+        // A genuine IDENTITY REQUEST is a re-auth: reset and answered with a RESPONSE.
+        let mut req = Vec::new();
+        Frame {
+            version: EAP_VERSION_3,
+            code: Code::Request,
+            identifier: 9,
+            kind: Kind::IdentityRequest,
+            ..Frame::default()
+        }
+        .append_to(&mut req);
+        let r = authee.recv(&req);
+        assert!(
+            matches!(&r.frame, Some(f) if f.kind == Kind::IdentityResponse),
+            "re-auth IDENTITY REQUEST must be answered with an IDENTITY RESPONSE"
+        );
+        assert!(!authee.authenticated(), "re-auth must leave Success");
+    }
+
+    /// A replayed/forged EAP-FAILURE cannot knock a live session out of Success for
+    /// EITHER role, even echoing the last identifier — EAPOL is unencrypted, so a
+    /// FAILURE is trivially forgeable.
+    #[test]
+    fn replayed_failure_cannot_tear_down_success() {
+        let (user, pass) = ("rist", "mainprofile");
+        let salt = hx(KAT_SALT);
+        let verifier = srp::make_verifier(&srp::default_group(), user, pass, &salt).unwrap();
+        let mut authee = Authenticatee::new(user, pass).unwrap();
+        let mut auth = Authenticator::new(static_verifier(user, verifier, salt));
+        drive(&mut authee, &mut auth);
+        assert!(authee.authenticated() && auth.authenticated(), "setup");
+
+        let fail = |id: u8| {
+            let mut w = Vec::new();
+            Frame {
+                version: EAP_VERSION_3,
+                code: Code::Failure,
+                identifier: id,
+                kind: Kind::Failure,
+                ..Frame::default()
+            }
+            .append_to(&mut w);
+            w
+        };
+        for id in [
+            authee.id,
+            authee.id.wrapping_add(1),
+            authee.id.wrapping_sub(1),
+        ] {
+            assert!(authee.recv(&fail(id)).frame.is_none());
+            assert!(
+                authee.authenticated(),
+                "authenticatee torn down by FAILURE(id={id})"
+            );
+        }
+        for id in [auth.id, auth.id.wrapping_add(1), auth.id.wrapping_sub(1)] {
+            assert!(auth.recv(&fail(id)).frame.is_none());
+            assert!(
+                auth.authenticated(),
+                "authenticator torn down by FAILURE(id={id})"
+            );
+        }
     }
 
     #[test]

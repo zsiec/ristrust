@@ -81,6 +81,15 @@ pub enum ConfigError {
         /// A short description of the violation.
         reason: &'static str,
     },
+    /// The DTLS configuration is invalid: DTLS was combined with a feature it
+    /// excludes (the GRE PSK `secret` or EAP-SRP), or no DTLS authentication method
+    /// (PSK or certificate) was provided.
+    #[cfg(feature = "dtls")]
+    #[error("rist: invalid DTLS configuration: {reason}")]
+    DtlsInvalid {
+        /// A short description of the violation.
+        reason: &'static str,
+    },
 }
 
 /// The top-level error type for the host crate.

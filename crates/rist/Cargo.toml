@@ -25,6 +25,10 @@ interop = []
 # the Go toolchain and the ristgo source (via the RISTGO_DIR env var); skips
 # gracefully otherwise. Run with: `cargo test -p rist --features differential`.
 differential = []
+# Optional DTLS 1.2 host-wiring on the Main profile (sender=client, receiver=server),
+# forwarding to the `rist-codec` DTLS codec. Off by default; not an interop gate
+# (libRIST has no DTLS). Run with: `cargo test -p rist --features dtls`.
+dtls = ["rist-codec/dtls"]
 
 [dependencies]
 # The deterministic core (driven by the host) and the profile codecs (run by the

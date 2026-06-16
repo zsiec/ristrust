@@ -53,6 +53,13 @@ pub use rist_codec::crypto::AesKeyBits;
 /// [`Config::with_congestion_control`].
 pub use rist_core::flow::CongestionMode;
 
+/// The DTLS connection configuration (PSK or ECDHE-ECDSA), re-exported for use with
+/// [`Config::with_dtls`]. [`DtlsIdentity`] is the certificate + key an ECDHE server
+/// presents (generate a self-signed one with [`DtlsIdentity::generate`]). (Feature
+/// `dtls`.)
+#[cfg(feature = "dtls")]
+pub use rist_codec::dtls::{Config as DtlsConfig, cert::Identity as DtlsIdentity};
+
 /// The crate version (`CARGO_PKG_VERSION`), e.g. for an SDES tool tag or logging.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

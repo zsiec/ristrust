@@ -189,6 +189,16 @@ pub struct Config {
     /// (the [`FecConfig::carriage`] default). `None` (default) disables FEC. Set the
     /// same matrix on both ends.
     pub fec: Option<FecConfig>,
+    /// Optional DTLS 1.2 record-layer encryption on the Main profile (feature
+    /// `dtls`). When set, the sender is the DTLS client and the receiver the DTLS
+    /// server: a handshake (PSK or ECDHE-ECDSA) runs before media, then every GRE
+    /// datagram travels as a DTLS application record. Main profile only; mutually
+    /// exclusive with the GRE PSK [`secret`](Self::secret) and with EAP-SRP; not
+    /// supported for bonded or reversed-role transports. `None` (default) disables
+    /// DTLS. Not an interop gate (libRIST has no DTLS). Set a matching config on both
+    /// ends.
+    #[cfg(feature = "dtls")]
+    pub dtls: Option<rist_codec::dtls::Config>,
     /// Network interface name for multicast (libRIST `miface`): a sender's egress
     /// interface and a receiver's group-membership interface. `None` (the default)
     /// lets the OS choose. Consulted only when the bind (receiver) or destination
@@ -245,6 +255,8 @@ impl Default for Config {
             on_rate_adapt: None,
             on_flow_attr: None,
             fec: None,
+            #[cfg(feature = "dtls")]
+            dtls: None,
             interface: None,
             multicast_ttl: 0,
             multicast_source: None,
@@ -485,6 +497,18 @@ impl Config {
         self
     }
 
+    /// Enables DTLS 1.2 record-layer encryption on the Main profile with the given
+    /// [`rist_codec::dtls::Config`] (re-exported as [`DtlsConfig`](crate::DtlsConfig)):
+    /// the sender becomes the DTLS client, the receiver the DTLS server. Set a
+    /// matching config (the same PSK, or a pinned/verifiable certificate) on both
+    /// ends. See [`Config::dtls`]. (Feature `dtls`.)
+    #[cfg(feature = "dtls")]
+    #[must_use]
+    pub fn with_dtls(mut self, dtls: rist_codec::dtls::Config) -> Config {
+        self.dtls = Some(dtls);
+        self
+    }
+
     /// Validates the configuration against libRIST's accepted ranges.
     ///
     /// # Errors
@@ -584,6 +608,10 @@ impl Config {
         if let Some(fec) = &self.fec {
             fec.validate(self.profile)?;
         }
+        // DTLS host-wiring rules (Main only, mutually exclusive with PSK/EAP-SRP,
+        // requires an auth method); a no-op without the `dtls` feature.
+        #[cfg(feature = "dtls")]
+        self.validate_dtls()?;
         // Multicast field-level checks (address-dependent checks — e.g. an SSM
         // source on a unicast bind — happen at socket construction, where the
         // bind/destination address is known).
@@ -596,6 +624,48 @@ impl Config {
             && src.parse::<std::net::IpAddr>().is_err()
         {
             return Err(ConfigError::MulticastSourceInvalid { value: src.clone() });
+        }
+        Ok(())
+    }
+
+    /// Validates the optional DTLS host-wiring: Main profile only, mutually exclusive
+    /// with the GRE PSK [`secret`](Self::secret) and EAP-SRP (DTLS provides its own
+    /// confidentiality + authentication), and at least one DTLS authentication method
+    /// (PSK or certificate) configured. A no-op when no DTLS config is set.
+    #[cfg(feature = "dtls")]
+    fn validate_dtls(&self) -> Result<(), ConfigError> {
+        let Some(dtls) = &self.dtls else {
+            return Ok(());
+        };
+        if self.profile != Profile::Main {
+            let name = if self.profile == Profile::Simple {
+                "Simple"
+            } else {
+                "Advanced"
+            };
+            return Err(ConfigError::ProfileFeatureUnsupported {
+                feature: "DTLS",
+                profile: name,
+            });
+        }
+        if self.secret.is_some() {
+            return Err(ConfigError::DtlsInvalid {
+                reason: "DTLS and the GRE PSK secret are mutually exclusive",
+            });
+        }
+        if self.srp_username.is_some() || self.srp_password.is_some() {
+            return Err(ConfigError::DtlsInvalid {
+                reason: "DTLS and EAP-SRP authentication are mutually exclusive",
+            });
+        }
+        if dtls.psk.is_none()
+            && dtls.certificate.is_none()
+            && !dtls.insecure_skip_verify
+            && dtls.peer_cert_fingerprint.is_none()
+        {
+            return Err(ConfigError::DtlsInvalid {
+                reason: "DTLS needs at least one authentication method (PSK or certificate)",
+            });
         }
         Ok(())
     }
@@ -805,5 +875,67 @@ mod tests {
         assert_eq!(c.key_rotation, 2048);
         assert_eq!(c.session_timeout, Duration::from_millis(3000));
         assert_eq!(c.nack_type, NackType::Bitmask);
+    }
+
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_psk_on_main_validates() {
+        let c =
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_dtls(rist_codec::dtls::Config::psk(
+                    b"id".to_vec(),
+                    b"secretkey".to_vec(),
+                ));
+        c.validate().expect("DTLS PSK on Main must validate");
+        assert!(c.dtls.is_some());
+    }
+
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_rejected_off_main() {
+        for profile in [Profile::Simple, Profile::Advanced] {
+            let c = Config::default()
+                .with_profile(profile)
+                .with_dtls(rist_codec::dtls::Config::psk(b"id".to_vec(), b"k".to_vec()));
+            assert!(
+                matches!(
+                    c.validate(),
+                    Err(ConfigError::ProfileFeatureUnsupported {
+                        feature: "DTLS",
+                        ..
+                    })
+                ),
+                "DTLS must be rejected on {profile:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_mutually_exclusive_with_secret_and_srp() {
+        let base = || {
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_dtls(rist_codec::dtls::Config::psk(b"id".to_vec(), b"k".to_vec()))
+        };
+        assert!(matches!(
+            base().with_secret("psk").validate(),
+            Err(ConfigError::DtlsInvalid { .. })
+        ));
+        assert!(matches!(
+            base().with_srp_credentials("user", "pass").validate(),
+            Err(ConfigError::DtlsInvalid { .. })
+        ));
+    }
+
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_requires_an_auth_method() {
+        // A default (empty) DTLS config has no PSK, certificate, pin, or insecure flag.
+        let c = Config::default()
+            .with_profile(Profile::Main)
+            .with_dtls(rist_codec::dtls::Config::default());
+        assert!(matches!(c.validate(), Err(ConfigError::DtlsInvalid { .. })));
     }
 }

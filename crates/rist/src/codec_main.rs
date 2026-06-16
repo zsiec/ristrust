@@ -170,6 +170,42 @@ impl MainCodec {
         Ok(())
     }
 
+    /// The raw on-the-wire RTP timestamp of the last decoded media packet — the value
+    /// the separate-port FEC XOR is keyed on (delegated to the media decoder).
+    pub(crate) fn last_wire_ts(&self) -> u32 {
+        self.dec.last_wire_ts()
+    }
+
+    /// Reconstructs the dedup-stable source time of a FEC-recovered packet from its
+    /// recovered RTP timestamp, without advancing the decoder's reference.
+    pub(crate) fn fec_source_time(&self, wire_ts: u32) -> u64 {
+        self.dec.source_time(wire_ts)
+    }
+
+    /// The payload the FEC must be computed over for this codec (TR-06-2 §8.6.2).
+    /// When null-packet deletion is active the sender transmits the suppressed
+    /// payload but the receiver reconstructs the expanded form, so FEC must be over
+    /// that canonical expanded form: suppress then expand to normalize the nulls. A
+    /// no-op when NPD is off, the payload carries no canonicalizable nulls, or the
+    /// payload is FEC-ineligible — FEC is then over the payload as-is.
+    pub(crate) fn fec_payload(&self, payload: &Bytes) -> Bytes {
+        if !self.npd_enabled {
+            return payload.clone();
+        }
+        let mut reduced = Vec::new();
+        let Ok((bits, suppressed)) = npd::suppress(&mut reduced, payload) else {
+            return payload.clone();
+        };
+        if suppressed == 0 {
+            return payload.clone(); // no canonicalizable nulls
+        }
+        let mut canon = Vec::new();
+        if npd::expand(&mut canon, &reduced, bits).is_err() {
+            return payload.clone();
+        }
+        Bytes::from(canon)
+    }
+
     // ---- encode ----
 
     /// Encodes a normalized [`MediaPacket`] as one Main-profile data datagram. The

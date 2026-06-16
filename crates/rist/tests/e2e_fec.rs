@@ -1,14 +1,15 @@
-//! End-to-end SMPTE ST 2022-1 forward-error-correction loopback (WP18c + WP18d):
+//! End-to-end SMPTE ST 2022-1 forward-error-correction loopback (WP18c–18e):
 //! a real `Sender` carries FEC-protected media to a real `Receiver` and a dropped
 //! media packet is reconstructed by FEC — with NO ARQ round trip.
 //!
 //! Each recovery test runs in **one-way mode** (`with_one_way`), which disables the
 //! NACK/retransmit plane entirely, so the only way a dropped packet can reach the
 //! application is FEC recovery: if the byte-exact in-order stream survives a dropped
-//! media datagram, FEC did it. The Advanced profile carries FEC in-band (Type=Control
-//! messages over the full wire datagram); the Simple profile carries it as standard
-//! ST 2022-1 RTP on the dedicated column (media + 2) / row (media + 4) ports — the
-//! interoperable GStreamer/FFmpeg carriage.
+//! media datagram, FEC did it. Coverage: Advanced in-band (Type=Control, full
+//! datagram, over-MTU fragmented control), Simple separate-port, Main separate-port,
+//! and Main separate-port composed with null-packet deletion (the §8.6.2
+//! canonicalization). FEC is carried as standard ST 2022-1 RTP on the dedicated
+//! column (media + 2) / row (media + 4) ports — the GStreamer/FFmpeg carriage.
 
 use std::future::Future;
 use std::io;
@@ -25,6 +26,10 @@ use rist::{
     dial_with, listen,
 };
 
+/// The media index dropped in every recovery test — a row-interior packet, mid-stream
+/// (matrix 1 of a 4-column matrix), away from the first-matrix anchor and the tail.
+const DROP_AT: u64 = 21;
+
 /// A 2-D FEC matrix that recovers any single loss quickly (the row FEC completes
 /// within `columns` packets).
 fn fec_2d() -> FecConfig {
@@ -37,14 +42,20 @@ fn fec_2d() -> FecConfig {
     }
 }
 
-/// Binds a receiver on an OS-chosen free even port (FEC needs the +2/+4 ports free
-/// too, so a small gap above the candidate is left implicitly by probing).
+/// `n` distinct text payloads built from `body` (sized to control fragmentation).
+fn text_payloads(n: usize, body: &str) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| format!("fec-{i:05}-{body}").into_bytes())
+        .collect()
+}
+
+/// Binds a receiver on an OS-chosen free even port (FEC needs the +2/+4 ports free).
 async fn listen_free(cfg: &Config) -> (Receiver, u16) {
     for _ in 0..64 {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
         let mut candidate = probe.local_addr().expect("probe addr").port();
         drop(probe);
-        // The Simple profile requires an even media port (RTCP at +1, FEC at +2/+4).
+        // Simple/Main FEC needs an even media port (RTCP at +1, FEC at +2/+4).
         if !candidate.is_multiple_of(2) {
             candidate = candidate.wrapping_sub(1);
         }
@@ -61,9 +72,34 @@ async fn listen_free(cfg: &Config) -> (Receiver, u16) {
 /// A predicate deciding whether to drop a given outbound datagram (true = drop).
 type DropPred = Arc<dyn Fn(&[u8], SocketAddr) -> bool + Send + Sync>;
 
-/// A [`Runtime`] whose sockets drop datagrams for which `pred` returns true (used to
-/// drop exactly one media datagram while letting FEC and control through). Applied to
-/// the sender's transport only.
+/// Drops exactly the [`DROP_AT`]-th Advanced DIRECT (Type=5) media datagram, never the
+/// Type=4 FEC control or the Type=8 GRE substrate (identified by encapsulation type).
+fn adv_media_pred() -> DropPred {
+    let seen = Arc::new(AtomicU64::new(0));
+    Arc::new(move |buf: &[u8], _dst| {
+        if let Ok(p) = rist_codec::adv::parse(&Bytes::copy_from_slice(buf))
+            && p.enc_type == rist_codec::adv::TYPE_DIRECT
+        {
+            return seen.fetch_add(1, Ordering::Relaxed) == DROP_AT;
+        }
+        false
+    })
+}
+
+/// Drops exactly the [`DROP_AT`]-th datagram sent to the media `port` (Simple/Main
+/// media), never the FEC on +2/+4 or the RTCP on +1.
+fn port_media_pred(port: u16) -> DropPred {
+    let seen = Arc::new(AtomicU64::new(0));
+    Arc::new(move |_buf: &[u8], dst: SocketAddr| {
+        if dst.port() == port {
+            return seen.fetch_add(1, Ordering::Relaxed) == DROP_AT;
+        }
+        false
+    })
+}
+
+/// A [`Runtime`] whose sockets drop datagrams for which `pred` returns true (applied
+/// to the sender's transport only).
 struct DropRuntime {
     pred: DropPred,
     dropped: Arc<AtomicU64>,
@@ -126,30 +162,29 @@ impl AsyncUdpSocket for DropSocket {
     }
 }
 
-/// Runs a one-way FEC stream of `n` payloads from a `DropRuntime`-wrapped sender to a
+/// Runs a one-way FEC stream of `payloads` from a `DropRuntime`-wrapped sender to a
 /// lossless receiver, asserting every payload (including the FEC-dropped one) arrives
-/// in order, byte-exact, and that the drop actually fired.
+/// in order, byte-exact, and that the drop actually fired. `make_pred` builds the drop
+/// predicate from the receiver's media port (so a port-targeting predicate can use it).
 async fn run_fec_recovery(
     cfg: Config,
-    n: usize,
-    body: String,
-    pred: DropPred,
-    dropped: Arc<AtomicU64>,
+    payloads: Vec<Vec<u8>>,
+    make_pred: impl FnOnce(u16) -> DropPred,
 ) {
     let (mut receiver, port) = listen_free(&cfg).await;
+    let dropped = Arc::new(AtomicU64::new(0));
     let rt = DropRuntime {
-        pred,
+        pred: make_pred(port),
         dropped: Arc::clone(&dropped),
     };
     let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &rt)
         .await
         .expect("dial with the dropping runtime");
 
-    let mk = move |i: usize| format!("fec-{i:05}-{body}").into_bytes();
-    let send_mk = mk.clone();
+    let send_payloads = payloads.clone();
     let send_task = tokio::spawn(async move {
-        for i in 0..n {
-            sender.send(&send_mk(i)).await.expect("send");
+        for p in &send_payloads {
+            sender.send(p).await.expect("send");
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         // Hold the sender open while the receiver drains (one-way: no close handshake).
@@ -157,14 +192,14 @@ async fn run_fec_recovery(
         sender
     });
 
-    for i in 0..n {
+    for (i, want) in payloads.iter().enumerate() {
         let got = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out on payload {i}: FEC recovery did not converge"))
             .expect("session stayed open");
         assert_eq!(
             got.as_ref(),
-            mk(i).as_slice(),
+            want.as_slice(),
             "payload {i} out of order or corrupt"
         );
     }
@@ -181,103 +216,114 @@ async fn run_fec_recovery(
 
 #[tokio::test]
 async fn adv_in_band_fec_recovers_a_dropped_media_packet() {
-    // Drop exactly one Advanced DIRECT (Type=5) media datagram; the in-band Type=4
-    // FEC control survives and reconstructs it. One-way (no ARQ) proves it was FEC.
-    // The ~1400-byte body makes the full-datagram FEC control exceed the 1400-byte
-    // MTU cap, so each FEC packet is FRAGMENTED across two consecutive control packets
+    // Advanced in-band: drop one DIRECT media datagram; the Type=4 FEC control survives
+    // and reconstructs it. The ~1400-byte body makes the full-datagram FEC control
+    // exceed the MTU cap, so each FEC packet is FRAGMENTED across two control packets
     // and the receiver must reassemble them (the fecCtrlReassembler path).
-    const DROP_AT: u64 = 21; // a row-interior media packet, mid-stream
     let cfg = Config::default()
         .with_profile(Profile::Advanced)
         .with_one_way(true)
         .with_buffer(Duration::from_millis(500))
         .with_fec(fec_2d());
-
-    let seen = Arc::new(AtomicU64::new(0));
-    let seen_p = Arc::clone(&seen);
-    let pred: DropPred = Arc::new(move |buf: &[u8], _dst| {
-        // Identify DIRECT media by the Advanced encapsulation type; never drop the
-        // Type=4 FEC control or the Type=8 GRE substrate.
-        if let Ok(p) = rist_codec::adv::parse(&Bytes::copy_from_slice(buf))
-            && p.enc_type == rist_codec::adv::TYPE_DIRECT
-        {
-            return seen_p.fetch_add(1, Ordering::Relaxed) == DROP_AT;
-        }
-        false
-    });
-    let dropped = Arc::new(AtomicU64::new(0));
-    run_fec_recovery(cfg, 64, "x".repeat(1400), pred, dropped).await;
+    run_fec_recovery(cfg, text_payloads(64, &"x".repeat(1400)), |_port| {
+        adv_media_pred()
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn simple_separate_port_fec_recovers_a_dropped_media_packet() {
-    // Drop exactly one Simple media datagram (sent to the media port); the FEC RTP on
-    // the column/row ports (+2/+4) survives and reconstructs it. One-way (no ARQ).
-    const DROP_AT: u64 = 21;
+    // Simple separate-port: drop one media datagram (media port); the FEC RTP on the
+    // column/row ports (+2/+4) survives and reconstructs it.
     let cfg = Config::default()
         .with_profile(Profile::Simple)
         .with_one_way(true)
         .with_buffer(Duration::from_millis(500))
         .with_fec(fec_2d());
+    run_fec_recovery(cfg, text_payloads(64, "simple-fec"), port_media_pred).await;
+}
 
-    // listen_free binds an even port; capture it so the predicate can target media.
-    let (mut receiver, port) = listen_free(&cfg).await;
-    let seen = Arc::new(AtomicU64::new(0));
-    let seen_p = Arc::clone(&seen);
-    let pred: DropPred = Arc::new(move |_buf: &[u8], dst: SocketAddr| {
-        // Media goes to the media port; FEC goes to +2/+4 (kept), RTCP to +1.
-        if dst.port() == port {
-            return seen_p.fetch_add(1, Ordering::Relaxed) == DROP_AT;
-        }
-        false
-    });
-    let dropped = Arc::new(AtomicU64::new(0));
-    let rt = DropRuntime {
-        pred,
-        dropped: Arc::clone(&dropped),
-    };
-    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &rt)
-        .await
-        .expect("dial with the dropping runtime");
+#[tokio::test]
+async fn main_separate_port_fec_recovers_a_dropped_media_packet() {
+    // Main separate-port: the GRE port carries media (one-way → no handshake), the FEC
+    // RTP rides the +2/+4 ports. Drop one GRE-port media datagram; FEC recovers it.
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_one_way(true)
+        .with_buffer(Duration::from_millis(500))
+        .with_fec(fec_2d());
+    run_fec_recovery(cfg, text_payloads(64, "main-fec"), port_media_pred).await;
+}
 
-    let body = "fec-protected-media-payload-".repeat(6);
-    let mk = move |i: usize| format!("fec-{i:05}-{body}").into_bytes();
-    let send_mk = mk.clone();
-    let send_task = tokio::spawn(async move {
-        for i in 0..64usize {
-            sender.send(&send_mk(i)).await.expect("send");
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        sender
-    });
-    for i in 0..64usize {
-        let got = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("timed out on payload {i}: separate-port FEC did not converge")
-            })
-            .expect("session stayed open");
-        assert_eq!(
-            got.as_ref(),
-            mk(i).as_slice(),
-            "payload {i} out of order or corrupt"
-        );
+// ---- Main FEC composed with null-packet deletion (TR-06-2 §8.6.2) ----
+
+/// Bytes per MPEG-TS packet; TS packets per RTP media frame.
+const TS: usize = 188;
+const PER_FRAME: usize = 7;
+
+/// One MPEG-TS null packet exactly as the receiver reconstructs it, so a payload whose
+/// nulls are already canonical round-trips byte-exact through NPD suppress/expand.
+fn canonical_null_ts() -> [u8; TS] {
+    let mut p = [0xFFu8; TS];
+    p[0] = 0x47;
+    p[1] = 0x1F;
+    p[2] = 0xFF;
+    p[3] = 0x10;
+    p
+}
+
+/// One non-null MPEG-TS packet with a seq-derived fill so distinct frames differ.
+#[allow(clippy::cast_possible_truncation)]
+fn content_ts(seq: usize) -> [u8; TS] {
+    let mut p = [0u8; TS];
+    p[0] = 0x47;
+    p[1] = 0x01;
+    p[2] = 0x00;
+    p[3] = 0x10;
+    for (i, b) in p.iter_mut().enumerate().skip(4) {
+        *b = (seq * 31 + i) as u8;
     }
-    assert!(
-        dropped.load(Ordering::Relaxed) >= 1,
-        "no media dropped — the FEC recovery path was not exercised"
-    );
-    let sender = send_task.await.expect("send task");
-    sender.close().await.ok();
-    receiver.close().await.expect("close receiver");
+    p
+}
+
+/// `frames` MPEG-TS media frames (one content + six canonical-null TS packets each).
+fn ts_frames(frames: usize) -> Vec<Vec<u8>> {
+    (0..frames)
+        .map(|f| {
+            let content = f % PER_FRAME;
+            let mut frame = Vec::with_capacity(TS * PER_FRAME);
+            for i in 0..PER_FRAME {
+                if i == content {
+                    frame.extend_from_slice(&content_ts(f));
+                } else {
+                    frame.extend_from_slice(&canonical_null_ts());
+                }
+            }
+            frame
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn main_fec_with_npd_recovers_a_dropped_frame() {
+    // FEC composes with null-packet deletion: the sender suppresses nulls on the media
+    // wire but computes FEC over the canonicalized (suppress→expand) payload, which is
+    // exactly what the receiver reconstructs (§8.6.2). A dropped media frame is then
+    // recovered byte-exact even though the media and FEC carry different byte counts.
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_one_way(true)
+        .with_null_packet_deletion(true)
+        .with_buffer(Duration::from_millis(500))
+        .with_fec(fec_2d());
+    run_fec_recovery(cfg, ts_frames(64), port_media_pred).await;
 }
 
 #[tokio::test]
 async fn fec_clean_loopback_does_not_disturb_the_stream() {
-    // FEC enabled, no loss: the extra FEC traffic (in-band control / separate-port
-    // RTP) must not perturb ordinary in-order delivery on either profile.
-    for profile in [Profile::Advanced, Profile::Simple] {
+    // FEC enabled, no loss: the extra FEC traffic must not perturb ordinary in-order
+    // delivery on any profile.
+    for profile in [Profile::Advanced, Profile::Main, Profile::Simple] {
         let cfg = Config::default()
             .with_profile(profile)
             .with_buffer(Duration::from_millis(200))

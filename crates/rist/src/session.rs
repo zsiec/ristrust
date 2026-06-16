@@ -296,6 +296,7 @@ pub(crate) fn build_sender(
             eap,
             RateControl::from_config(cfg),
             oob_rx,
+            build_fec(cfg),
         );
         return Ok(SenderSpawned {
             local,
@@ -401,8 +402,15 @@ pub(crate) fn build_receiver(
     let membership = crate::multicast::receiver_membership(cfg, local)?;
 
     if cfg.profile == Profile::Main {
-        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+        let mut socket = MainSocket::listen(rt, local, membership.as_ref())?;
         let bound = socket.local()?;
+        // Separate-port FEC carriage: bind the column (GRE port + 2) and, for 2-D FEC,
+        // the row (+ 4) FEC sockets the receiver reads (ST 2022-1 RTP, not GRE-framed).
+        if let Some(f) = &cfg.fec
+            && f.resolved_separate_ports(cfg.profile)
+        {
+            socket.bind_fec(rt, bound, membership.as_ref(), !f.column_only)?;
+        }
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
@@ -418,6 +426,7 @@ pub(crate) fn build_receiver(
             eap,
             build_lqm_emitter(cfg),
             oob_tx,
+            build_fec(cfg),
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -546,6 +555,7 @@ pub(crate) fn build_listener_sender(
         None, // reversed-role refuses EAP-SRP
         RateControl::from_config(cfg),
         oob_rx,
+        None, // FEC + reversed-role deferred
     );
     Ok(SenderSpawned {
         local: bound,
@@ -592,6 +602,7 @@ pub(crate) fn build_caller_receiver(
         None, // reversed-role refuses EAP-SRP
         build_lqm_emitter(cfg),
         oob_tx,
+        None, // FEC + reversed-role deferred
     );
     Ok(ReceiverSpawned {
         local,

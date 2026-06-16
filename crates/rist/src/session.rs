@@ -25,7 +25,7 @@ use crate::config::{Config, NackType, Profile};
 use crate::driver::{Driver, SimpleInbound};
 use crate::driver_adv::AdvDriver;
 use crate::driver_bonded::{BondedDriver, PathParts};
-use crate::driver_main::{EapRole, MainDriver};
+use crate::driver_main::{EapRole, MainDriver, MainInbound};
 use crate::fec::FecState;
 use crate::peer::Peer;
 use crate::runtime::Runtime;
@@ -534,6 +534,99 @@ pub(crate) fn build_injected_simple(
         task,
     );
     (in_tx, receiver)
+}
+
+/// Builds one **injected** Main-profile receiver flow for a [`MultiReceiver`], keyed
+/// by source address: a per-source [`MainDriver`] with its own GRE substrate, PSK
+/// keys, and EAP-SRP role (so each source decrypts and authenticates independently,
+/// fail-closed). `local` is the shared bound address (the per-flow `local_addr`).
+///
+/// # Errors
+/// Returns an I/O error if an invalid secret prevents PSK key derivation.
+pub(crate) fn build_injected_main(
+    socket: MainSocket,
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<(mpsc::Sender<MainInbound>, crate::receiver::Receiver)> {
+    // Source-keyed flows keep the template reporter SSRC (the SSRC is inside the
+    // encrypted payload); each flow feeds back to its distinct source, the identity
+    // the sender disambiguates on.
+    let ssrc = DEFAULT_FLOW_SSRC;
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, ssrc, 0));
+    let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    let codec = build_main_codec(cfg, ssrc)?;
+    let eap = build_eap_role(cfg, false)?;
+    let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (in_tx, data_out, close, stats, task) = MainDriver::spawn_injected_receiver(
+        flow,
+        socket,
+        peer,
+        codec,
+        ssrc,
+        flow_mac(ssrc),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        eap,
+        build_lqm_emitter(cfg),
+        oob_tx,
+    );
+    let receiver = crate::receiver::Receiver::from_parts(
+        cfg.clone(),
+        local,
+        data_out,
+        Some(oob_rx),
+        close,
+        stats,
+        task,
+    );
+    Ok((in_tx, receiver))
+}
+
+/// Builds one **injected** Advanced-profile receiver flow for a [`MultiReceiver`],
+/// keyed by source address: a per-source [`AdvDriver`] with its own GRE substrate,
+/// PSK, EAP-SRP, and fragment reassembly. `local` is the shared bound address.
+///
+/// # Errors
+/// Returns an I/O error if an invalid secret prevents PSK key derivation.
+pub(crate) fn build_injected_adv(
+    socket: MainSocket,
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<(
+    mpsc::Sender<crate::driver_adv::AdvInbound>,
+    crate::receiver::Receiver,
+)> {
+    let ssrc = DEFAULT_FLOW_SSRC;
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, ssrc, 0));
+    let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    let main = build_main_codec(cfg, ssrc)?;
+    let adv = build_adv_codec(cfg, ssrc)?;
+    let eap = build_eap_role(cfg, false)?;
+    let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (in_tx, data_out, close, stats, task) = AdvDriver::spawn_injected_receiver(
+        flow,
+        socket,
+        peer,
+        main,
+        adv,
+        ssrc,
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        eap,
+        build_lqm_emitter(cfg),
+        cfg.on_flow_attr.clone(),
+        oob_tx,
+    );
+    let receiver = crate::receiver::Receiver::from_parts(
+        cfg.clone(),
+        local,
+        data_out,
+        Some(oob_rx),
+        close,
+        stats,
+        task,
+    );
+    Ok((in_tx, receiver))
 }
 
 /// Rejects a reversed-role session on a profile/feature it does not support.

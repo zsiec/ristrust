@@ -20,10 +20,12 @@ use rist_codec::rtp;
 
 use crate::config::{Config, Profile};
 use crate::driver::SimpleInbound;
+use crate::driver_adv::AdvInbound;
+use crate::driver_main::MainInbound;
 use crate::error::{ConfigError, Error};
 use crate::receiver::Receiver;
 use crate::runtime::{Runtime, TokioRuntime};
-use crate::socket::SimpleSocket;
+use crate::socket::{MainSocket, SimpleSocket};
 
 /// Caps the number of concurrent demultiplexed flows (libRIST `RIST_MAX_FLOWS`), so a
 /// burst of datagrams with spurious SSRCs cannot open unbounded sessions.
@@ -79,14 +81,16 @@ impl Drop for MultiReceiver {
 }
 
 /// Binds a multiplexing RIST receiver to `addr` (a bare `IP:port` or `rist://` URL):
-/// one Simple-profile listen port demultiplexed by RTP SSRC into a [`Receiver`] per
-/// distinct media stream, surfaced via [`MultiReceiver::accept`].
+/// one listen port demultiplexed into a [`Receiver`] per distinct media stream,
+/// surfaced via [`MultiReceiver::accept`]. The Simple profile keys flows by RTP SSRC;
+/// Main and Advanced key by source address (each source authenticates/decrypts as its
+/// own session).
 ///
 /// # Errors
 /// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]
-/// for an invalid configuration (including FEC, which conflicts with SSRC demux),
-/// [`Error::Unimplemented`] for a non-Simple profile, or [`Error::Io`] if the port is
-/// not a positive even number or the sockets cannot be bound.
+/// for an invalid configuration (including FEC, which conflicts with per-flow demux),
+/// or [`Error::Io`] if the port is invalid (Simple needs a positive even port) or the
+/// sockets cannot be bound.
 pub async fn listen_multi(addr: &str, cfg: Config) -> Result<MultiReceiver, Error> {
     listen_multi_with(addr, cfg, &TokioRuntime).await
 }
@@ -106,15 +110,9 @@ pub async fn listen_multi_with(
         (addr.to_string(), cfg)
     };
     cfg.validate()?;
-    // Multi-flow demuxes the Simple profile by the cleartext RTP SSRC. The
-    // single-socket profiles (keyed by source address) land in a later sub-phase.
-    if cfg.profile != Profile::Simple {
-        return Err(Error::Unimplemented(
-            "multi-flow receive currently supports the Simple profile",
-        ));
-    }
-    // Separate-port FEC and SSRC demux conflict: FEC is one auxiliary stream on fixed
-    // ports, not per-flow, so it cannot be routed to a specific flow.
+    // FEC and multi-flow demux conflict: FEC is one auxiliary stream on fixed ports
+    // (separate-port) or in-band control, not per-flow, so it cannot be routed to a
+    // specific flow.
     if cfg.fec.is_some() {
         return Err(Error::Config(ConfigError::FecInvalid {
             reason: "FEC is not supported with multi-flow receive",
@@ -122,10 +120,35 @@ pub async fn listen_multi_with(
     }
     let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
     let membership = crate::multicast::receiver_membership(&cfg, local)?;
-    let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
-    let bound = socket.media_local()?;
     let (accept_tx, accept_rx) = mpsc::channel(MAX_FLOWS);
-    let demux = tokio::spawn(demux_simple(socket, cfg, bound, accept_tx));
+    // Simple keys by the cleartext RTP SSRC (even/odd transport); Main and Advanced
+    // key by source address (the single GRE port — the SSRC may be encrypted).
+    let (demux, bound) = match cfg.profile {
+        Profile::Simple => {
+            let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
+            let bound = socket.media_local()?;
+            (
+                tokio::spawn(demux_simple(socket, cfg, bound, accept_tx)),
+                bound,
+            )
+        }
+        Profile::Main => {
+            let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+            let bound = socket.local()?;
+            (
+                tokio::spawn(demux_main(socket, cfg, bound, accept_tx)),
+                bound,
+            )
+        }
+        Profile::Advanced => {
+            let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+            let bound = socket.local()?;
+            (
+                tokio::spawn(demux_adv(socket, cfg, bound, accept_tx)),
+                bound,
+            )
+        }
+    };
     tracing::debug!(%bound, "rist: multi-receiver listening");
     Ok(MultiReceiver {
         accept_rx,
@@ -220,4 +243,78 @@ fn peek_rtcp_ssrc(b: &[u8]) -> Option<u32> {
     Some(rtp::normalize_ssrc(u32::from_be_bytes([
         b[4], b[5], b[6], b[7],
     ])))
+}
+
+/// The Main-profile demultiplexer task: reads the single GRE socket and keys each
+/// datagram by source address (the SSRC is inside the encrypted payload, so the
+/// source is the flow identity — each source becomes its own session that decrypts
+/// and authenticates independently, as a libRIST peer does).
+async fn demux_main(
+    socket: MainSocket,
+    cfg: Config,
+    local: SocketAddr,
+    accept_tx: mpsc::Sender<Receiver>,
+) {
+    let mut flows: HashMap<SocketAddr, mpsc::Sender<MainInbound>> = HashMap::new();
+    let mut buf = vec![0u8; RECV_BUF];
+    while let Ok((n, src)) = socket.recv(&mut buf).await {
+        let data = Bytes::copy_from_slice(&buf[..n]);
+        if let Some(tx) = flows.get(&src) {
+            if tx.send(MainInbound::Main { data, src }).await.is_err() {
+                flows.remove(&src); // the flow's session ended
+            }
+            continue;
+        }
+        flows.retain(|_, tx| !tx.is_closed());
+        if flows.len() >= MAX_FLOWS {
+            continue; // at capacity: drop, keep demultiplexing
+        }
+        match crate::session::build_injected_main(socket.clone(), &cfg, local) {
+            Ok((in_tx, receiver)) => {
+                let _ = in_tx.send(MainInbound::Main { data, src }).await;
+                flows.insert(src, in_tx);
+                let _ = accept_tx.send(receiver).await;
+            }
+            // A per-flow PSK/EAP key derivation failed: drop this source's flow rather
+            // than install a broken session; a later datagram retries the build.
+            Err(e) => {
+                tracing::warn!(target: "rist::crypto", "rist: multi-flow: drop flow, build failed: {e}");
+            }
+        }
+    }
+}
+
+/// The Advanced-profile demultiplexer task: like [`demux_main`] but each per-source
+/// flow is an Advanced session (the inbound channel carries the raw datagram + source).
+async fn demux_adv(
+    socket: MainSocket,
+    cfg: Config,
+    local: SocketAddr,
+    accept_tx: mpsc::Sender<Receiver>,
+) {
+    let mut flows: HashMap<SocketAddr, mpsc::Sender<AdvInbound>> = HashMap::new();
+    let mut buf = vec![0u8; RECV_BUF];
+    while let Ok((n, src)) = socket.recv(&mut buf).await {
+        let data = Bytes::copy_from_slice(&buf[..n]);
+        if let Some(tx) = flows.get(&src) {
+            if tx.send((data, src)).await.is_err() {
+                flows.remove(&src);
+            }
+            continue;
+        }
+        flows.retain(|_, tx| !tx.is_closed());
+        if flows.len() >= MAX_FLOWS {
+            continue;
+        }
+        match crate::session::build_injected_adv(socket.clone(), &cfg, local) {
+            Ok((in_tx, receiver)) => {
+                let _ = in_tx.send((data, src)).await;
+                flows.insert(src, in_tx);
+                let _ = accept_tx.send(receiver).await;
+            }
+            Err(e) => {
+                tracing::warn!(target: "rist::crypto", "rist: multi-flow: drop flow, build failed: {e}");
+            }
+        }
+    }
 }

@@ -49,13 +49,15 @@ fn is_stream(got: &[Vec<u8>], tag: &str, n: usize) -> bool {
             .all(|(i, p)| p.as_slice() == format!("{tag}-{i:05}").into_bytes().as_slice())
 }
 
-#[tokio::test]
-async fn multi_demuxes_two_simple_flows_by_ssrc() {
+/// Streams two distinct flows into one `MultiReceiver` for the given profile and
+/// asserts each is demultiplexed to its own in-order, byte-exact `Receiver`. Simple
+/// keys by SSRC (two random sender SSRCs); Main/Advanced key by source address (two
+/// distinct ephemeral source ports).
+async fn run_multi(cfg: Config) {
     const N: usize = 40;
-    let cfg = Config::default().with_buffer(Duration::from_millis(200));
     let (mut mrx, port) = listen_multi_free(cfg.clone()).await;
 
-    // Two senders dial the one multi-receiver port; each gets its own random SSRC.
+    // Two senders dial the one multi-receiver port.
     let addr = format!("127.0.0.1:{port}");
     let sender_a = dial(&addr, cfg.clone()).await.expect("dial A");
     let sender_b = dial(&addr, cfg.clone()).await.expect("dial B");
@@ -107,8 +109,49 @@ async fn multi_demuxes_two_simple_flows_by_ssrc() {
 }
 
 #[tokio::test]
+async fn multi_demuxes_two_simple_flows_by_ssrc() {
+    // Simple profile: two senders' distinct RTP SSRCs demultiplex into two flows.
+    run_multi(Config::default().with_buffer(Duration::from_millis(200))).await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_main_flows_by_source() {
+    // Main profile: two senders on distinct ephemeral source ports demultiplex into
+    // two flows by source address (each with its own GRE substrate).
+    run_multi(
+        Config::default()
+            .with_profile(Profile::Main)
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_main_psk_flows_by_source() {
+    // Main + PSK: each per-source flow decrypts independently under its own key.
+    run_multi(
+        Config::default()
+            .with_profile(Profile::Main)
+            .with_secret("multi-psk")
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_advanced_flows_by_source() {
+    // Advanced profile: two senders demultiplex by source address into two flows.
+    run_multi(
+        Config::default()
+            .with_profile(Profile::Advanced)
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn listen_multi_rejects_fec() {
-    // Separate-port FEC and SSRC demux conflict (FEC is one stream on fixed ports).
+    // FEC and multi-flow demux conflict (FEC is one stream, not per-flow).
     let cfg = Config::default().with_fec(FecConfig {
         columns: 4,
         rows: 4,
@@ -119,18 +162,5 @@ async fn listen_multi_rejects_fec() {
     assert!(
         listen_multi("127.0.0.1:5050", cfg).await.is_err(),
         "multi-flow + FEC must be rejected"
-    );
-}
-
-#[tokio::test]
-async fn listen_multi_rejects_non_simple() {
-    // Source-address demux for Main/Advanced lands in a later sub-phase.
-    let cfg = Config::default().with_profile(Profile::Main);
-    assert!(
-        matches!(
-            listen_multi("127.0.0.1:5052", cfg).await,
-            Err(rist::Error::Unimplemented(_))
-        ),
-        "Main-profile multi-flow is not yet supported"
     );
 }

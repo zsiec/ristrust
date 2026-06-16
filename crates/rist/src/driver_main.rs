@@ -30,7 +30,7 @@ use rist_core::wire::{Feedback, FragRole, MediaPacket};
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
+use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY};
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
@@ -38,6 +38,17 @@ use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
 const RECV_BUF: usize = 65_536;
+
+/// One inbound Main-profile datagram, tagged with the socket it arrived on. The pump
+/// drains these from a channel (the injected-feed seam): a single-flow driver fills it
+/// from its own reader task; a multi-flow [`MultiReceiver`](crate::multi) fills many
+/// drivers' channels from one shared read, keyed by source address.
+pub(crate) enum MainInbound {
+    /// A GRE datagram (media / control / keepalive / EAPOL / OOB) and its source.
+    Main { data: Bytes, src: SocketAddr },
+    /// A separate-port FEC datagram (column or row; decoded identically).
+    Fec { data: Bytes },
+}
 
 /// The EAP-SRP authentication role of a Main-profile flow, when authentication is
 /// configured: the sender authenticates (authenticatee), the listener verifies
@@ -163,6 +174,14 @@ pub(crate) struct MainDriver {
     /// payload (NPD-canonicalized, §8.6.2) and sends FEC as RTP on the column/row
     /// ports; the receiver reads those ports and re-injects recoveries into the flow.
     fec: Option<FecState>,
+
+    // --- inbound feed ---
+    /// The channel the pump drains inbound datagrams from. In single-flow mode `reader`
+    /// fills it from the owned socket; in multi-flow mode a demultiplexer fills it.
+    inbound: Option<mpsc::Receiver<MainInbound>>,
+    /// The owned socket-reader task (single-flow); `None` when a demultiplexer feeds
+    /// `inbound`. Aborted when the pump exits.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MainDriver {
@@ -190,6 +209,8 @@ impl MainDriver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -219,6 +240,8 @@ impl MainDriver {
             lqm: None,
             rate,
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -247,6 +270,8 @@ impl MainDriver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -276,8 +301,73 @@ impl MainDriver {
             lqm,
             rate: None,
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns an **injected** Main-profile receiver driver for a
+    /// [`MultiReceiver`](crate::multi): it owns no socket reader — the demultiplexer
+    /// (keyed by source address) feeds its inbound channel (the returned [`MainInbound`]
+    /// sender) — while this driver runs its own GRE substrate, per-flow PSK/EAP, and
+    /// recovery, writing feedback back out the shared socket to its learned peer.
+    /// Returns the inbound sender plus the receiver handles (delivered data + OOB).
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_injected_receiver(
+        flow: Flow,
+        socket: MainSocket,
+        peer: Peer,
+        codec: MainCodec,
+        ssrc: u32,
+        mac: [u8; 6],
+        bitmask: bool,
+        keepalive: Duration,
+        eap: Option<EapRole>,
+        lqm: Option<LqmEmitter>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
+    ) -> (
+        mpsc::Sender<MainInbound>,
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let authed = eap.is_none();
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = MainDriver {
+            sender: false,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            codec,
+            mac,
+            bitmask,
+            close: close.clone(),
+            stats: stats.clone(),
+            app_in: None,
+            highest_sent: 0,
+            ssrc,
+            oob_in: None,
+            data_out: Some(tx),
+            oob_out: Some(oob_out),
+            learned_ssrc: None,
+            greeted: false,
+            eap,
+            authed,
+            lqm,
+            rate: None,
+            fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
+            inbound: Some(in_rx),
+            reader: None, // the demultiplexer feeds `inbound`
+        };
+        (in_tx, rx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -294,10 +384,10 @@ impl MainDriver {
     /// The driver loop. Runs until the application channel closes, the peer expires,
     /// or a socket error occurs.
     async fn run(mut self) {
-        let sock = self.socket.clone();
-        let mut buf = vec![0u8; RECV_BUF];
-        let mut fec_col_buf = vec![0u8; RECV_BUF];
-        let mut fec_row_buf = vec![0u8; RECV_BUF];
+        // Inbound datagrams arrive over a channel (the injected-feed seam): in
+        // single-flow mode `reader` fills it from the owned socket; in multi-flow mode
+        // a demultiplexer keyed by source address fills it.
+        let mut inbound = self.inbound.take().expect("inbound channel set at spawn");
 
         // Greet a peer whose address is known up front: a dialing sender (the RTCP
         // SDES that ungates media + the GRE MAC beacon) and, for reversed-role, a
@@ -319,18 +409,9 @@ impl MainDriver {
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
-                r = sock.recv(&mut buf) => match r {
-                    Ok((n, src)) => self.on_recv(src, &buf[..n]).await,
-                    Err(_) => break,
-                },
-                // Separate-port FEC (receiver only; pending forever without a FEC
-                // socket). A FEC socket error is non-fatal — the GRE port carries the
-                // flow.
-                r = sock.recv_fec_col(&mut fec_col_buf) => if let Ok((n, _)) = r {
-                    self.on_fec_rtp(&fec_col_buf[..n]).await;
-                },
-                r = sock.recv_fec_row(&mut fec_row_buf) => if let Ok((n, _)) = r {
-                    self.on_fec_rtp(&fec_row_buf[..n]).await;
+                msg = inbound.recv() => match msg {
+                    Some(inb) => self.on_inbound(inb).await,
+                    None => break, // the reader exited (socket error) or the demuxer closed
                 },
                 // Hold outbound media until the data channel is unblocked: the
                 // EAP-SRP handshake has authenticated (a no-op when auth is disabled)
@@ -378,6 +459,18 @@ impl MainDriver {
                     }
                 },
             }
+        }
+
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+    }
+
+    /// Dispatches one inbound datagram by the socket it arrived on.
+    async fn on_inbound(&mut self, inb: MainInbound) {
+        match inb {
+            MainInbound::Main { data, src } => self.on_recv(src, &data).await,
+            MainInbound::Fec { data } => self.on_fec_rtp(&data).await,
         }
     }
 
@@ -845,6 +938,37 @@ impl MainDriver {
             self.flow.handle_timer(now, id);
         }
     }
+}
+
+/// Spawns the single-flow socket reader: it reads the one GRE socket and the
+/// separate-port FEC (column / row) sockets and funnels each datagram into the pump's
+/// inbound channel. The loop exits when the GRE socket errors (fatal for the flow) or
+/// the pump drops the channel; the FEC sockets pend forever when unbound.
+fn spawn_reader(socket: MainSocket, tx: mpsc::Sender<MainInbound>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; RECV_BUF];
+        let mut col_buf = vec![0u8; RECV_BUF];
+        let mut row_buf = vec![0u8; RECV_BUF];
+        loop {
+            tokio::select! {
+                r = socket.recv(&mut buf) => match r {
+                    Ok((n, src)) => {
+                        let inb = MainInbound::Main { data: Bytes::copy_from_slice(&buf[..n]), src };
+                        if tx.send(inb).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                },
+                r = socket.recv_fec_col(&mut col_buf) => if let Ok((n, _)) = r {
+                    let inb = MainInbound::Fec { data: Bytes::copy_from_slice(&col_buf[..n]) };
+                    if tx.send(inb).await.is_err() { break; }
+                },
+                r = socket.recv_fec_row(&mut row_buf) => if let Ok((n, _)) = r {
+                    let inb = MainInbound::Fec { data: Bytes::copy_from_slice(&row_buf[..n]) };
+                    if tx.send(inb).await.is_err() { break; }
+                },
+            }
+        }
+    })
 }
 
 /// Awaits the next application payload when the data channel is authenticated;

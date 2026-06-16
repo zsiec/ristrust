@@ -29,7 +29,7 @@ use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_adv::{AdvCodec, flags_to_frag};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::config::FlowAttrCallback;
-use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
+use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_MAX_CTRL_BODY, FecState};
 use crate::peer::Peer;
@@ -39,6 +39,14 @@ use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
 const RECV_BUF: usize = 65_536;
+
+/// One inbound Advanced-profile datagram and its source address. Advanced carries
+/// everything (media, control, in-band FEC, GRE substrate) on the one socket, so a
+/// single tag per datagram suffices. The pump drains these from a channel (the
+/// injected-feed seam): a single-flow driver fills it from its own reader; a
+/// multi-flow [`MultiReceiver`](crate::multi) fills many drivers' channels keyed by
+/// source address.
+pub(crate) type AdvInbound = (Bytes, SocketAddr);
 
 /// The EAP identifier ristrust stamps on its unsolicited passphrase push.
 const PASSPHRASE_PUSH_ID: u8 = 0x40;
@@ -124,6 +132,17 @@ pub(crate) struct AdvDriver {
     /// datagram and frames the resulting FEC packets as Type=Control messages; the
     /// receiver feeds media and FEC into the decoder and re-injects recoveries.
     fec: Option<FecState>,
+
+    // --- inbound feed ---
+    /// The channel the pump drains inbound datagrams (and their source) from. In
+    /// single-flow mode `reader` fills it from the owned socket; in multi-flow mode a
+    /// demultiplexer keyed by source address fills it. Advanced carries everything
+    /// (media, control, in-band FEC, GRE substrate) on the one socket, so there is no
+    /// separate-port FEC arm.
+    inbound: Option<mpsc::Receiver<AdvInbound>>,
+    /// The owned socket-reader task (single-flow); `None` when a demultiplexer feeds
+    /// `inbound`. Aborted when the pump exits.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AdvDriver {
@@ -153,6 +172,8 @@ impl AdvDriver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -186,6 +207,8 @@ impl AdvDriver {
             oob_in: Some(oob_in),
             oob_out: None,
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -213,6 +236,8 @@ impl AdvDriver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -246,8 +271,77 @@ impl AdvDriver {
             oob_in: None,
             oob_out: Some(oob_out),
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns an **injected** Advanced-profile receiver driver for a
+    /// [`MultiReceiver`](crate::multi): it owns no socket reader — the demultiplexer
+    /// (keyed by source address) feeds its inbound channel (the returned sender) —
+    /// while this driver runs its own GRE substrate, per-flow PSK/EAP, fragment
+    /// reassembly, and recovery. Returns the inbound sender plus the receiver handles.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_injected_receiver(
+        flow: Flow,
+        socket: MainSocket,
+        peer: Peer,
+        main: MainCodec,
+        adv: AdvCodec,
+        ssrc: u32,
+        bitmask: bool,
+        keepalive: Duration,
+        eap: Option<EapRole>,
+        lqm: Option<LqmEmitter>,
+        on_flow_attr: Option<FlowAttrCallback>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
+    ) -> (
+        mpsc::Sender<AdvInbound>,
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let authed = eap.is_none();
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = AdvDriver {
+            sender: false,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            main,
+            adv,
+            bitmask,
+            close: close.clone(),
+            stats: stats.clone(),
+            app_in: None,
+            highest_sent: 0,
+            ssrc,
+            frag_size: 0,
+            data_out: Some(tx),
+            learned_ssrc: None,
+            greeted: false,
+            reasm: FragReassembler::default(),
+            eap,
+            authed,
+            lqm,
+            rate: None,
+            on_flow_attr,
+            flow_attr_cmd: None,
+            oob_in: None,
+            oob_out: Some(oob_out),
+            fec: None, // multi-flow rejects separate-port FEC; in-band FEC TBD
+            inbound: Some(in_rx),
+            reader: None, // the demultiplexer feeds `inbound`
+        };
+        (in_tx, rx, close, stats, tokio::spawn(driver.run()))
     }
 
     #[allow(clippy::cast_possible_truncation)] // session durations fit u64 micros
@@ -260,8 +354,10 @@ impl AdvDriver {
     }
 
     async fn run(mut self) {
-        let sock = self.socket.clone();
-        let mut buf = vec![0u8; RECV_BUF];
+        // Inbound datagrams arrive over a channel (the injected-feed seam): in
+        // single-flow mode `reader` fills it from the owned socket; in multi-flow mode
+        // a demultiplexer keyed by source address fills it.
+        let mut inbound = self.inbound.take().expect("inbound channel set at spawn");
 
         if self.sender {
             let now = self.now();
@@ -276,9 +372,9 @@ impl AdvDriver {
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
-                r = sock.recv(&mut buf) => match r {
-                    Ok((n, src)) => self.on_recv(src, &buf[..n]).await,
-                    Err(_) => break,
+                msg = inbound.recv() => match msg {
+                    Some((data, src)) => self.on_recv(src, &data).await,
+                    None => break, // the reader exited (socket error) or the demuxer closed
                 },
                 payload = recv_app_gated(&mut self.app_in, self.authed) => match payload {
                     Some(p) => {
@@ -328,6 +424,10 @@ impl AdvDriver {
                     }
                 },
             }
+        }
+
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
         }
     }
 
@@ -816,6 +916,25 @@ impl AdvDriver {
             self.flow.handle_timer(now, id);
         }
     }
+}
+
+/// Spawns the single-flow socket reader: it reads the one Advanced/GRE-substrate
+/// socket and funnels each datagram (with its source) into the pump's inbound channel
+/// (Advanced FEC is in-band, so there is no separate-port FEC arm). The loop exits
+/// when the socket errors or the pump drops the channel.
+fn spawn_reader(socket: MainSocket, tx: mpsc::Sender<AdvInbound>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; RECV_BUF];
+        while let Ok((n, src)) = socket.recv(&mut buf).await {
+            if tx
+                .send((Bytes::copy_from_slice(&buf[..n]), src))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 /// Awaits the next application payload when authenticated; never resolves while

@@ -190,10 +190,30 @@ impl AdvCodec {
     /// returns media; a CONTROL packet returns feedback; other types are an error.
     pub(crate) fn decode_parsed(&mut self, p: &adv::Parsed) -> Result<Decoded, CodecError> {
         match p.enc_type {
-            adv::TYPE_CONTROL => Ok(Decoded::Feedback(self.decode_control(&p.payload)?)),
+            adv::TYPE_CONTROL => self.decode_control_msg(&p.payload),
             adv::TYPE_DIRECT => Ok(Decoded::Media(self.decode_media_adv(p)?)),
             _ => Err(CodecError::AdvProfile("unsupported encapsulation type")),
         }
+    }
+
+    /// Dispatches one Type=CONTROL payload. A PSK future-nonce announcement
+    /// (TR-06-3 §5.3.9) is a decryptor concern — pre-derive the announced key so the
+    /// first packet under the new nonce decrypts without a PBKDF2 stall — and yields
+    /// no flow input; every other control index maps to normalized feedback.
+    fn decode_control_msg(&mut self, payload: &Bytes) -> Result<Decoded, CodecError> {
+        let (ci, body) = adv::parse_control(payload)?;
+        if ci == adv::CI_PSK_NONCE {
+            if let (Ok(pn), Some(key)) = (adv::PskNonce::parse(&body), self.recv_key.as_mut()) {
+                let bits = if pn.key_bits == 256 {
+                    crypto::AesKeyBits::Aes256
+                } else {
+                    crypto::AesKeyBits::Aes128
+                };
+                key.precompute(pn.nonce, bits);
+            }
+            return Ok(Decoded::Ignored);
+        }
+        Ok(Decoded::Feedback(self.decode_control(payload)?))
     }
 
     /// Parses and demultiplexes one Advanced datagram (a convenience over

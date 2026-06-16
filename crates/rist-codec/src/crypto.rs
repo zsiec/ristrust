@@ -292,6 +292,17 @@ pub struct Decryptor {
     key: Vec<u8>,
     has_nonce: bool,
     used_times: u64,
+    /// A pre-derived "future nonce" slot (PSK Future Nonce Announcement, TR-06-3
+    /// §5.3.9): [`Decryptor::precompute`] derives the AES key for an announced nonce
+    /// ahead of time, so the first packet under it decrypts without the expensive
+    /// PBKDF2 step. [`Decryptor::decrypt`] promotes it to the live slot. Unlike
+    /// libRIST (which overwrites the current key on announcement), caching it
+    /// separately means an out-of-order announcement cannot disturb decryption of
+    /// packets still arriving under the current nonce.
+    next_nonce: [u8; NONCE_SIZE],
+    next_bits: AesKeyBits,
+    next_key: Vec<u8>,
+    has_next: bool,
 }
 
 impl Decryptor {
@@ -308,7 +319,32 @@ impl Decryptor {
             key: Vec::new(),
             has_nonce: false,
             used_times: 0,
+            next_nonce: [0; NONCE_SIZE],
+            next_bits: bits,
+            next_key: Vec::new(),
+            has_next: false,
         })
+    }
+
+    /// Pre-derives and caches the AES key for an announced future nonce (PSK Future
+    /// Nonce Announcement, TR-06-3 §5.3.9) so a later [`decrypt`](Self::decrypt)
+    /// under it promotes the key with no PBKDF2 and no allocation. `keyBits` is the
+    /// announced AES key size. A no-op for a zero nonce, the live nonce, or one
+    /// already cached, and it silently ignores a derivation error (a later `decrypt`
+    /// re-derives inline).
+    pub fn precompute(&mut self, nonce: [u8; NONCE_SIZE], bits: AesKeyBits) {
+        if is_zero_nonce(nonce)
+            || (self.has_nonce && nonce == self.nonce && bits == self.bits)
+            || (self.has_next && nonce == self.next_nonce && bits == self.next_bits)
+        {
+            return;
+        }
+        if let Ok(key) = derive_key(&self.password, &nonce, bits) {
+            self.next_nonce = nonce;
+            self.next_bits = bits;
+            self.next_key = key;
+            self.has_next = true;
+        }
     }
 
     /// Sets the AES key size for subsequent decryptions (the size the GRE H bit
@@ -318,6 +354,7 @@ impl Decryptor {
         if bits != self.bits {
             self.bits = bits;
             self.has_nonce = false; // force re-derivation at the new size
+            self.has_next = false; // a pre-derived future key at the old size is stale
         }
     }
 
@@ -334,8 +371,14 @@ impl Decryptor {
             return Err(CryptoError::ZeroNonce);
         }
         if !self.has_nonce || nonce != self.nonce {
+            if self.has_next && nonce == self.next_nonce && self.bits == self.next_bits {
+                // Promote the pre-derived future-nonce key: no PBKDF2, no allocation.
+                self.key = std::mem::take(&mut self.next_key);
+                self.has_next = false;
+            } else {
+                self.key = derive_key(&self.password, &nonce, self.bits)?;
+            }
             self.nonce = nonce;
-            self.key = derive_key(&self.password, &self.nonce, self.bits)?;
             self.has_nonce = true;
             self.used_times = 0;
         }
@@ -430,6 +473,32 @@ mod tests {
         let k128 = derive_key(pw, &nonce, AesKeyBits::Aes128).unwrap();
         let k256 = derive_key(pw, &nonce, AesKeyBits::Aes256).unwrap();
         assert_eq!(k128, k256[..16]);
+    }
+
+    #[test]
+    fn precompute_promotes_future_nonce_key() {
+        // Two decryptors decode the same ciphertext carried under a never-seen nonce:
+        // one with the key pre-derived (precompute -> promote, no inline PBKDF2), one
+        // deriving inline. Both must recover the identical plaintext, proving the
+        // promoted future-nonce key equals the freshly-derived one.
+        let pw = b"rotate-me";
+        let bits = AesKeyBits::Aes128;
+        let nonce = [0x12u8, 0x34, 0x56, 0x78];
+        let key = derive_key(pw, &nonce, bits).unwrap();
+        let mut ct = b"media-payload-cells".to_vec();
+        aes_ctr_apply(&key, &build_iv(7), &mut ct);
+
+        let mut d_pre = Decryptor::new(pw, bits).unwrap();
+        d_pre.precompute(nonce, bits);
+        let mut d_plain = Decryptor::new(pw, bits).unwrap();
+
+        let from_pre = d_pre.decrypt(nonce, 7, &ct).unwrap();
+        let from_plain = d_plain.decrypt(nonce, 7, &ct).unwrap();
+        assert_eq!(from_pre, b"media-payload-cells");
+        assert_eq!(
+            from_pre, from_plain,
+            "promotion must equal inline derivation"
+        );
     }
 
     #[test]

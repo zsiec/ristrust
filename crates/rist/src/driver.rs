@@ -26,6 +26,7 @@ use rist_core::wire::{Feedback, MediaPacket};
 
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self, MediaDecoder};
+use crate::error::Error;
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
 
@@ -37,6 +38,56 @@ pub(crate) const COMMAND_CAPACITY: usize = 256;
 
 /// Capacity of the driver → application delivered-data channel (receiver side).
 pub(crate) const DATA_CAPACITY: usize = 1024;
+
+/// Why a session's driver task exited, shared with the public [`Sender`](crate::Sender)
+/// / [`Receiver`](crate::Receiver) handle so a closed channel can surface a specific
+/// [`Error`] (peer timeout, auth failure) instead of a bare [`Error::Closed`]. A
+/// driver records it just before it breaks its loop; the handle reads it once its
+/// channel closes. The default (`0`) is a clean close — the application dropped or
+/// closed the handle, or an unremarkable socket error ended the task.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CloseFlag(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl CloseFlag {
+    const SESSION_TIMEOUT: u8 = 1;
+    const AUTH: u8 = 2;
+
+    /// Records that the peer's liveness timeout (`session_timeout`) elapsed.
+    pub(crate) fn set_session_timeout(&self) {
+        self.0
+            .store(Self::SESSION_TIMEOUT, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records that the EAP-SRP handshake failed (bad credentials / refused proof).
+    pub(crate) fn set_auth(&self) {
+        self.0
+            .store(Self::AUTH, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The error a closed handle should return given the recorded reason.
+    pub(crate) fn error(&self) -> Error {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::SESSION_TIMEOUT => Error::SessionTimeout,
+            Self::AUTH => Error::Auth,
+            _ => Error::Closed,
+        }
+    }
+}
+
+/// Logs an inbound media/control decode failure. With a PSK configured this almost
+/// always means an encryption mismatch — a wrong secret or key size: the GRE/adv
+/// PSK is AES-CTR with no authentication tag, so a mis-keyed datagram decrypts to
+/// garbage and fails framing here, which to the application otherwise looks like
+/// total packet loss with no error reported. Warn (under the `rist::crypto` target)
+/// in that case so the misconfiguration is visible; in the clear it is more likely
+/// line noise or a stray datagram, so stay at debug.
+pub(crate) fn decode_warn(has_psk: bool, what: &str, e: &dyn std::fmt::Display) {
+    if has_psk {
+        tracing::warn!(target: "rist::crypto", "rist: {what} decode failed (likely PSK/key mismatch): {e}");
+    } else {
+        tracing::debug!("rist: {what} decode failed: {e}");
+    }
+}
 
 /// The Simple-profile session driver, run as one detached task per flow.
 pub(crate) struct Driver {
@@ -50,6 +101,8 @@ pub(crate) struct Driver {
     /// Declarative timers the flow has requested, by id.
     timers: HashMap<TimerId, Timestamp>,
     keepalive: Duration,
+    /// Records why the task exited, read by the handle once its channel closes.
+    close: CloseFlag,
 
     // --- sender half ---
     /// Application payloads to transmit (`None` on a receiver).
@@ -91,8 +144,9 @@ impl Driver {
         keepalive: Duration,
         start_seq: u32,
         rate: Option<RateControl>,
-    ) -> (mpsc::Sender<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let close = CloseFlag::default();
         let driver = Driver {
             sender: true,
             flow,
@@ -101,6 +155,7 @@ impl Driver {
             epoch: Instant::now(),
             timers: HashMap::new(),
             keepalive,
+            close: close.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
@@ -112,7 +167,7 @@ impl Driver {
             lqm: None,
             rate,
         };
-        (tx, tokio::spawn(driver.run()))
+        (tx, close, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns a receiver driver that learns the sender's return
@@ -128,8 +183,13 @@ impl Driver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
-    ) -> (mpsc::Receiver<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let close = CloseFlag::default();
         let driver = Driver {
             sender: false,
             flow,
@@ -138,6 +198,7 @@ impl Driver {
             epoch: Instant::now(),
             timers: HashMap::new(),
             keepalive,
+            close: close.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
@@ -149,7 +210,7 @@ impl Driver {
             lqm,
             rate: None,
         };
-        (rx, tokio::spawn(driver.run()))
+        (rx, close, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -209,6 +270,7 @@ impl Driver {
                 _ = keepalive.tick() => {
                     let now = self.now();
                     if self.peer.expired(now) {
+                        self.close.set_session_timeout();
                         break;
                     }
                     // Fill idle gaps only, so the flow's own RTT-echo cadence on

@@ -28,7 +28,7 @@ use rist_core::wire::Feedback;
 
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::driver::{COMMAND_CAPACITY, DATA_CAPACITY};
+use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
 
@@ -71,6 +71,15 @@ impl EapRole {
         }
     }
 
+    /// Whether the handshake reached a terminal failure (the credentials were
+    /// rejected): the role is done but not authenticated.
+    pub(crate) fn failed(&self) -> bool {
+        match self {
+            EapRole::Authenticatee(a) => a.done() && !a.authenticated(),
+            EapRole::Authenticator(a) => a.done() && !a.authenticated(),
+        }
+    }
+
     /// The 32-byte SRP session key K derived during a successful handshake.
     pub(crate) fn session_key(&self) -> Option<[u8; 32]> {
         match self {
@@ -104,6 +113,8 @@ pub(crate) struct MainDriver {
     /// The 48-bit MAC advertised in outbound GRE keepalives (informational).
     mac: [u8; 6],
     bitmask: bool,
+    /// Records why the task exited, read by the handle once its channel closes.
+    close: CloseFlag,
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
@@ -152,9 +163,10 @@ impl MainDriver {
         start_seq: u32,
         eap: Option<EapRole>,
         rate: Option<RateControl>,
-    ) -> (mpsc::Sender<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let authed = eap.is_none();
+        let close = CloseFlag::default();
         let driver = MainDriver {
             sender: true,
             flow,
@@ -166,6 +178,7 @@ impl MainDriver {
             codec,
             mac,
             bitmask,
+            close: close.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
@@ -177,7 +190,7 @@ impl MainDriver {
             lqm: None,
             rate,
         };
-        (tx, tokio::spawn(driver.run()))
+        (tx, close, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns a Main-profile receiver driver that learns the sender's
@@ -195,9 +208,14 @@ impl MainDriver {
         keepalive: Duration,
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
-    ) -> (mpsc::Receiver<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let authed = eap.is_none();
+        let close = CloseFlag::default();
         let driver = MainDriver {
             sender: false,
             flow,
@@ -209,6 +227,7 @@ impl MainDriver {
             codec,
             mac,
             bitmask,
+            close: close.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
@@ -220,7 +239,7 @@ impl MainDriver {
             lqm,
             rate: None,
         };
-        (rx, tokio::spawn(driver.run()))
+        (rx, close, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -278,7 +297,12 @@ impl MainDriver {
                 },
                 _ = keepalive.tick() => {
                     let now = self.now();
+                    if self.eap.as_ref().is_some_and(EapRole::failed) {
+                        self.close.set_auth();
+                        break;
+                    }
                     if self.peer.expired(now) {
+                        self.close.set_session_timeout();
                         break;
                     }
                     if self.peer.media().is_some() {
@@ -354,7 +378,7 @@ impl MainDriver {
                     }
                 }
                 Ok(Decoded::Ignored) => {}
-                Err(e) => tracing::debug!("rist: main decode failed: {e}"),
+                Err(e) => crate::driver::decode_warn(self.codec.has_psk(), "main", &e),
             }
         }
         self.drain(now).await;

@@ -19,7 +19,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use rist::{
-    AesKeyBits, AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_with, listen,
+    AesKeyBits, AsyncUdpSocket, Config, Error, Profile, Receiver, Runtime, TokioRuntime, dial_with,
+    listen,
 };
 
 /// A Main-profile base config with a short recovery buffer (fast playout) and the
@@ -138,36 +139,70 @@ async fn main_loopback_srp_only_keys_media_from_session_key() {
 }
 
 #[tokio::test]
-async fn main_loopback_srp_wrong_password_blocks_media() {
+async fn main_loopback_srp_wrong_password_surfaces_auth_error() {
     // The sender authenticates with the wrong password: the handshake fails, the
-    // data channel never opens, and no media is delivered (the recv times out).
-    let recv_cfg = main_cfg(None).with_srp_credentials("rist", "right-password");
+    // data channel never opens, no media is delivered, and the session is torn down
+    // with the specific `Error::Auth` (surfaced by `recv`) rather than a bare
+    // timeout. A short keepalive makes the authenticator's failed-handshake check
+    // (which runs on the keepalive tick) surface promptly.
+    let recv_cfg = main_cfg(None)
+        .with_srp_credentials("rist", "right-password")
+        .with_keepalive(Duration::from_millis(100));
     let (mut receiver, port) = listen_free(&recv_cfg).await;
-    let send_cfg = main_cfg(None).with_srp_credentials("rist", "wrong-password");
+    let send_cfg = main_cfg(None)
+        .with_srp_credentials("rist", "wrong-password")
+        .with_keepalive(Duration::from_millis(100));
     let sender = dial_with(&format!("127.0.0.1:{port}"), send_cfg, &TokioRuntime)
         .await
         .expect("dial");
-    let send = tokio::spawn(async move {
-        for i in 0..20 {
-            if sender
-                .send(format!("blocked-{i}").as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        sender
-    });
-    // No payload should ever be delivered; the recv must time out.
-    let got = tokio::time::timeout(Duration::from_millis(800), receiver.recv()).await;
+    // The EAP-SRP handshake runs and fails; the receiver (authenticator) tears the
+    // session down and `recv` reports it as an authentication failure, not a hang.
+    let got = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("a failed handshake must resolve recv, not hang");
     assert!(
-        got.is_err(),
-        "media delivered despite failed authentication"
+        matches!(got, Err(Error::Auth)),
+        "expected Error::Auth on a failed handshake, got {got:?}"
     );
-    send.abort();
+    sender.close().await.ok();
     receiver.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn send_surfaces_session_timeout_after_peer_goes_silent() {
+    // Once the sender has seen the receiver, a peer that falls silent past
+    // `session_timeout` tears the session down, and `send` reports the specific
+    // `Error::SessionTimeout` rather than a bare `Error::Closed`.
+    let cfg = main_cfg(None)
+        .with_keepalive(Duration::from_millis(50))
+        .with_session_timeout(Duration::from_millis(150));
+    let (receiver, port) = listen_free(&cfg).await;
+    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &TokioRuntime)
+        .await
+        .expect("dial");
+
+    // One exchange so the sender observes the receiver (the peer becomes "seen";
+    // an unseen peer never expires).
+    sender.send(b"hello-peer").await.expect("first send");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The receiver goes away; nothing answers the sender from now on.
+    receiver.close().await.expect("close receiver");
+
+    // Within a few session timeouts the sender's peer expires and sends fail with
+    // the specific SessionTimeout error.
+    let mut got = None;
+    for _ in 0..250 {
+        if let Err(e) = sender.send(b"into-the-void").await {
+            got = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        matches!(got, Some(Error::SessionTimeout)),
+        "expected Error::SessionTimeout after peer silence, got {got:?}"
+    );
 }
 
 #[tokio::test]

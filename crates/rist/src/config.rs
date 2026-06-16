@@ -242,6 +242,15 @@ impl Config {
         self
     }
 
+    /// Sets the peer liveness timeout: a session whose peer sends nothing (media,
+    /// control, or keepalive) for this long is torn down. Must be at least
+    /// `keepalive_interval` (enforced by [`Config::validate`]).
+    #[must_use]
+    pub fn with_session_timeout(mut self, timeout: Duration) -> Config {
+        self.session_timeout = timeout;
+        self
+    }
+
     /// Sets the PSK passphrase (enables encryption on Main/Advanced).
     #[must_use]
     pub fn with_secret(mut self, secret: impl Into<String>) -> Config {

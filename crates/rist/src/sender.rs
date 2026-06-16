@@ -18,6 +18,7 @@ pub struct Sender {
     local: SocketAddr,
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
+    close: crate::driver::CloseFlag,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -46,12 +47,13 @@ impl Sender {
     /// when the session's send queue is full.
     ///
     /// # Errors
-    /// Returns [`Error::Closed`] if the session has shut down.
+    /// Returns [`Error::Closed`] if the session has shut down — or the more specific
+    /// [`Error::SessionTimeout`] / [`Error::Auth`] when that was the cause.
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
         self.app_in
             .send(Bytes::copy_from_slice(payload))
             .await
-            .map_err(|_| Error::Closed)
+            .map_err(|_| self.close.error())
     }
 
     /// Closes the sender, stopping its background task and releasing its sockets.
@@ -106,6 +108,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         local: spawned.local,
         remote,
         app_in: spawned.app_in,
+        close: spawned.close,
         task: spawned.task,
     })
 }
@@ -147,6 +150,7 @@ pub async fn dial_bonded_with(
         local: spawned.local,
         remote: remotes[0],
         app_in: spawned.app_in,
+        close: spawned.close,
         task: spawned.task,
     })
 }

@@ -28,7 +28,7 @@ use rist_core::wire::Feedback;
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::driver::{COMMAND_CAPACITY, DATA_CAPACITY};
+use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::peer::Peer;
 use crate::socket::MainSocket;
@@ -71,6 +71,8 @@ pub(crate) struct AdvDriver {
     /// The Advanced media + control codec (Type=5 / Type=4).
     adv: AdvCodec,
     bitmask: bool,
+    /// Records why the task exited, read by the handle once its channel closes.
+    close: CloseFlag,
 
     // --- sender half ---
     app_in: Option<mpsc::Receiver<Bytes>>,
@@ -108,9 +110,10 @@ impl AdvDriver {
         start_seq: u32,
         eap: Option<EapRole>,
         rate: Option<RateControl>,
-    ) -> (mpsc::Sender<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (mpsc::Sender<Bytes>, CloseFlag, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let authed = eap.is_none();
+        let close = CloseFlag::default();
         let driver = AdvDriver {
             sender: true,
             flow,
@@ -122,6 +125,7 @@ impl AdvDriver {
             main,
             adv,
             bitmask,
+            close: close.clone(),
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
@@ -133,7 +137,7 @@ impl AdvDriver {
             lqm: None,
             rate,
         };
-        (tx, tokio::spawn(driver.run()))
+        (tx, close, tokio::spawn(driver.run()))
     }
 
     /// Builds and spawns an Advanced-profile receiver driver.
@@ -149,9 +153,14 @@ impl AdvDriver {
         keepalive: Duration,
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
-    ) -> (mpsc::Receiver<Bytes>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let authed = eap.is_none();
+        let close = CloseFlag::default();
         let driver = AdvDriver {
             sender: false,
             flow,
@@ -163,6 +172,7 @@ impl AdvDriver {
             main,
             adv,
             bitmask,
+            close: close.clone(),
             app_in: None,
             highest_sent: 0,
             ssrc,
@@ -174,7 +184,7 @@ impl AdvDriver {
             lqm,
             rate: None,
         };
-        (rx, tokio::spawn(driver.run()))
+        (rx, close, tokio::spawn(driver.run()))
     }
 
     #[allow(clippy::cast_possible_truncation)] // session durations fit u64 micros
@@ -222,7 +232,12 @@ impl AdvDriver {
                 },
                 _ = keepalive.tick() => {
                     let now = self.now();
+                    if self.eap.as_ref().is_some_and(EapRole::failed) {
+                        self.close.set_auth();
+                        break;
+                    }
                     if self.peer.expired(now) {
+                        self.close.set_session_timeout();
                         break;
                     }
                     if self.peer.media().is_some() {
@@ -311,7 +326,7 @@ impl AdvDriver {
                 }
             }
             Ok(Decoded::Ignored) => {}
-            Err(e) => tracing::debug!("rist: adv decode failed: {e}"),
+            Err(e) => crate::driver::decode_warn(self.adv.has_psk(), "advanced", &e),
         }
     }
 

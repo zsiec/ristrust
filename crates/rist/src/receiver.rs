@@ -16,6 +16,7 @@ pub struct Receiver {
     cfg: Config,
     local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
+    close: crate::driver::CloseFlag,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -37,10 +38,11 @@ impl Receiver {
     /// Reads the next in-order, ARQ-recovered media payload.
     ///
     /// # Errors
-    /// Returns [`Error::Closed`] when the session has shut down (peer timeout or
-    /// the driver exiting) and no further data will arrive.
+    /// Returns [`Error::Closed`] when the session has shut down and no further data
+    /// will arrive — or the more specific [`Error::SessionTimeout`] / [`Error::Auth`]
+    /// when peer silence or a failed handshake was the cause.
     pub async fn recv(&mut self) -> Result<Bytes, Error> {
-        self.data_out.recv().await.ok_or(Error::Closed)
+        self.data_out.recv().await.ok_or_else(|| self.close.error())
     }
 
     /// Closes the receiver, stopping its background task and releasing its sockets.
@@ -85,6 +87,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         cfg,
         local: spawned.local,
         data_out: spawned.data_out,
+        close: spawned.close,
         task: spawned.task,
     })
 }
@@ -125,6 +128,7 @@ pub async fn listen_bonded_with(
         cfg,
         local: spawned.local,
         data_out: spawned.data_out,
+        close: spawned.close,
         task: spawned.task,
     })
 }

@@ -88,11 +88,23 @@ pub enum Error {
     /// query parameter that is not a valid integer or is out of range.
     #[error("rist: invalid url: {0}")]
     Url(String),
-    /// The session has closed: its driver task exited (peer timeout, the peer
-    /// half was dropped, or an unrecoverable socket error), so no further data
-    /// can be sent or received.
+    /// The session has closed: its driver task exited (the local handle was
+    /// dropped/closed or an unrecoverable socket error occurred), so no further
+    /// data can be sent or received. A close caused by peer silence or a failed
+    /// handshake is reported more specifically as [`Error::SessionTimeout`] or
+    /// [`Error::Auth`].
     #[error("rist: session closed")]
     Closed,
+    /// The session was torn down because no traffic (media, control, or keepalive)
+    /// arrived from the peer within `session_timeout`. Surfaced by `send`/`recv`
+    /// once the session ends.
+    #[error("rist: session timed out")]
+    SessionTimeout,
+    /// The Main/Advanced EAP-SRP handshake failed — the configured credentials did
+    /// not authenticate against the peer (or the peer's proof was refused) — and the
+    /// session was torn down. Surfaced by `send`/`recv` once the session ends.
+    #[error("rist: authentication failed")]
+    Auth,
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

@@ -15,6 +15,8 @@ mod driver;
 mod driver_adv;
 mod driver_bonded;
 mod driver_main;
+#[cfg(feature = "dtls")]
+mod dtls_transport;
 mod fec;
 mod multi;
 mod multicast;

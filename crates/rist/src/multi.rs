@@ -123,6 +123,14 @@ pub async fn listen_multi_with(
             reason: "FEC is not supported with multi-flow receive",
         }));
     }
+    // DTLS terminates one connection per peer with its own handshake; per-flow demux
+    // off one shared socket has no place to run it.
+    #[cfg(feature = "dtls")]
+    if cfg.dtls.is_some() {
+        return Err(Error::Config(ConfigError::DtlsInvalid {
+            reason: "DTLS is not supported with multi-flow receive",
+        }));
+    }
     let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
     let membership = crate::multicast::receiver_membership(&cfg, local)?;
     let (accept_tx, accept_rx) = mpsc::channel(MAX_FLOWS);
@@ -207,6 +215,13 @@ pub async fn listen_multi_bonded_with(
     if cfg.fec.is_some() {
         return Err(Error::Config(ConfigError::FecInvalid {
             reason: "FEC is not supported with multi-flow receive",
+        }));
+    }
+    // DTLS is single-peer; bonded multi-flow is many peers across many paths.
+    #[cfg(feature = "dtls")]
+    if cfg.dtls.is_some() {
+        return Err(Error::Config(ConfigError::DtlsInvalid {
+            reason: "DTLS is not supported with multi-flow receive",
         }));
     }
     let locals = crate::sender::resolve_bonded_addrs(addrs)?;

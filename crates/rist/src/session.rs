@@ -255,6 +255,39 @@ fn build_adv_codec(cfg: &Config, ssrc: u32) -> io::Result<AdvCodec> {
     ))
 }
 
+/// The Main-profile sender transport: a DTLS client (the sender dials the receiver,
+/// which is the DTLS server) when DTLS is configured, otherwise a plain ephemeral GRE
+/// socket. Both present the same [`MainSocket`] interface, so the driver is unaware.
+#[cfg_attr(not(feature = "dtls"), allow(unused_variables))]
+fn main_sender_socket(
+    rt: &dyn Runtime,
+    cfg: &Config,
+    remote: SocketAddr,
+    egress: Option<&crate::multicast::Egress>,
+) -> io::Result<MainSocket> {
+    #[cfg(feature = "dtls")]
+    if let Some(dtls) = &cfg.dtls {
+        return crate::dtls_transport::dtls_client(remote, dtls.clone());
+    }
+    MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress)
+}
+
+/// The Main-profile receiver transport: a DTLS server (it learns its peer from the
+/// first datagram) when DTLS is configured, otherwise a plain GRE listen socket.
+#[cfg_attr(not(feature = "dtls"), allow(unused_variables))]
+fn main_receiver_socket(
+    rt: &dyn Runtime,
+    cfg: &Config,
+    local: SocketAddr,
+    membership: Option<&crate::multicast::Membership>,
+) -> io::Result<MainSocket> {
+    #[cfg(feature = "dtls")]
+    if let Some(dtls) = &cfg.dtls {
+        return crate::dtls_transport::dtls_server(local, dtls.clone());
+    }
+    MainSocket::listen(rt, local, membership)
+}
+
 /// Builds and spawns a sender driver transmitting media to `remote`. For the
 /// Simple profile this is the receiver's even media port (RTCP at `+1`); for the
 /// Main profile it is the single GRE port.
@@ -277,7 +310,7 @@ pub(crate) fn build_sender(
     let egress = crate::multicast::sender_egress(cfg, remote)?;
 
     if cfg.profile == Profile::Main {
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
+        let socket = main_sender_socket(rt, cfg, remote, egress.as_ref())?;
         let local = socket.local()?;
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let codec = build_main_codec(cfg, ssrc)?;
@@ -402,10 +435,11 @@ pub(crate) fn build_receiver(
     let membership = crate::multicast::receiver_membership(cfg, local)?;
 
     if cfg.profile == Profile::Main {
-        let mut socket = MainSocket::listen(rt, local, membership.as_ref())?;
+        let mut socket = main_receiver_socket(rt, cfg, local, membership.as_ref())?;
         let bound = socket.local()?;
         // Separate-port FEC carriage: bind the column (GRE port + 2) and, for 2-D FEC,
         // the row (+ 4) FEC sockets the receiver reads (ST 2022-1 RTP, not GRE-framed).
+        // DTLS and FEC are mutually exclusive (validated), so this is skipped for DTLS.
         if let Some(f) = &cfg.fec
             && f.resolved_separate_ports(cfg.profile)
         {
@@ -711,6 +745,15 @@ fn require_reversible_main(cfg: &Config) -> io::Result<()> {
             "rist: reversed-role transport does not support EAP-SRP authentication",
         ));
     }
+    // Reversed-role peer-learning (a sender that waits, or a receiver that dials an
+    // announcer) is not modelled by the DTLS client/server handshake here.
+    #[cfg(feature = "dtls")]
+    if cfg.dtls.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: reversed-role transport does not support DTLS",
+        ));
+    }
     Ok(())
 }
 
@@ -823,14 +866,22 @@ fn bonding_group(cfg: &Config) -> Group {
 /// SMPTE 2022-7 bonding rides the Main-profile GRE transport (matching libRIST and
 /// ristgo); the Simple and Advanced profiles are single-path here.
 fn require_main(cfg: &Config) -> io::Result<()> {
-    if cfg.profile == Profile::Main {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if cfg.profile != Profile::Main {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "rist: SMPTE 2022-7 bonding requires the Main profile",
-        ))
+        ));
     }
+    // Bonding spreads one flow across several paths/peers, which the single-peer DTLS
+    // handshake does not model (ristgo rejects bonded DTLS likewise).
+    #[cfg(feature = "dtls")]
+    if cfg.dtls.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: DTLS is not supported with SMPTE 2022-7 bonding",
+        ));
+    }
+    Ok(())
 }
 
 /// Builds and spawns a bonded Main-profile sender that fans identical media across

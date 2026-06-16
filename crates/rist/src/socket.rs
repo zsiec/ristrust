@@ -331,6 +331,18 @@ impl MainSocket {
         })
     }
 
+    /// Wraps an already-built [`AsyncUdpSocket`] as a Main transport (no FEC sockets).
+    /// Used by the DTLS host-wiring, which presents its plaintext bridge as an
+    /// `AsyncUdpSocket` so the driver is unchanged. (Feature `dtls`.)
+    #[cfg(feature = "dtls")]
+    pub(crate) fn from_async(sock: Arc<dyn AsyncUdpSocket>) -> MainSocket {
+        MainSocket {
+            sock,
+            fec_col: None,
+            fec_row: None,
+        }
+    }
+
     /// The local address the transport is bound to.
     ///
     /// # Errors

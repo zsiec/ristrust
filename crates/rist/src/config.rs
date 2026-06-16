@@ -667,6 +667,13 @@ impl Config {
                 reason: "DTLS needs at least one authentication method (PSK or certificate)",
             });
         }
+        // FEC rides separate UDP ports outside the single GRE socket the DTLS tunnel
+        // wraps, so the two cannot compose.
+        if self.fec.is_some() {
+            return Err(ConfigError::DtlsInvalid {
+                reason: "DTLS and forward error correction are not supported together",
+            });
+        }
         Ok(())
     }
 }

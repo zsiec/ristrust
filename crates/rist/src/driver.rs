@@ -43,6 +43,24 @@ pub(crate) const COMMAND_CAPACITY: usize = 256;
 /// Capacity of the driver → application delivered-data channel (receiver side).
 pub(crate) const DATA_CAPACITY: usize = 1024;
 
+/// Capacity of the inbound channel feeding a driver's pump (the reader, or in
+/// multi-flow a demultiplexer, fills it; the pump drains it). One per flow.
+pub(crate) const INBOUND_CAPACITY: usize = 256;
+
+/// One inbound Simple-profile datagram, tagged with the socket it arrived on. The
+/// pump reads these from a channel rather than owning the socket directly, so a
+/// single-flow driver feeds the channel from its own reader task while a multi-flow
+/// [`MultiReceiver`](crate::multi) feeds many drivers' channels from one shared read
+/// (the injected-feed seam — ported from ristgo's per-flow injected sessions).
+pub(crate) enum SimpleInbound {
+    /// An RTP media datagram (even port) and its source address.
+    Media { data: Bytes, src: SocketAddr },
+    /// A compound RTCP datagram (odd port) and its source address.
+    Rtcp { data: Bytes, src: SocketAddr },
+    /// A separate-port FEC datagram (column or row; decoded identically).
+    Fec { data: Bytes },
+}
+
 /// Why a session's driver task exited, shared with the public [`Sender`](crate::Sender)
 /// / [`Receiver`](crate::Receiver) handle so a closed channel can surface a specific
 /// [`Error`] (peer timeout, auth failure) instead of a bare [`Error::Closed`]. A
@@ -140,6 +158,14 @@ pub(crate) struct Driver {
     /// reads those ports, feeds media + FEC into the decoder, and re-injects
     /// recoveries.
     fec: Option<FecState>,
+
+    // --- inbound feed ---
+    /// The channel the pump drains inbound datagrams from. In single-flow mode `reader`
+    /// fills it from the owned socket; in multi-flow mode a demultiplexer fills it.
+    inbound: Option<mpsc::Receiver<SimpleInbound>>,
+    /// The owned socket-reader task (single-flow); `None` when a demultiplexer feeds
+    /// `inbound` (multi-flow injected mode). Aborted when the pump exits.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Driver {
@@ -165,6 +191,8 @@ impl Driver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let close = CloseFlag::default();
         let stats = StatsCell::default();
         let driver = Driver {
@@ -188,6 +216,8 @@ impl Driver {
             lqm: None,
             rate,
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -213,6 +243,8 @@ impl Driver {
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx);
         let close = CloseFlag::default();
         let stats = StatsCell::default();
         let driver = Driver {
@@ -236,6 +268,8 @@ impl Driver {
             lqm,
             rate: None,
             fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -254,11 +288,10 @@ impl Driver {
     /// The driver loop. Runs until the application channel closes, the peer
     /// expires, or a socket error occurs.
     async fn run(mut self) {
-        let sock = self.socket.clone();
-        let mut media_buf = vec![0u8; RECV_BUF];
-        let mut rtcp_buf = vec![0u8; RECV_BUF];
-        let mut fec_col_buf = vec![0u8; RECV_BUF];
-        let mut fec_row_buf = vec![0u8; RECV_BUF];
+        // Inbound datagrams arrive over a channel (the injected-feed seam): in
+        // single-flow mode `reader` fills it from the owned socket; in multi-flow mode
+        // a demultiplexer does. Either way the pump is identical.
+        let mut inbound = self.inbound.take().expect("inbound channel set at spawn");
 
         // A sender knows the peer's RTCP address up front; an immediate keepalive
         // lets the receiver learn the sender's return address (and so send NACKs)
@@ -275,21 +308,9 @@ impl Driver {
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
-                r = sock.recv_media(&mut media_buf) => match r {
-                    Ok((n, src)) => self.on_media(src, &media_buf[..n]).await,
-                    Err(_) => break,
-                },
-                r = sock.recv_rtcp(&mut rtcp_buf) => match r {
-                    Ok((n, src)) => self.on_rtcp(src, &rtcp_buf[..n]).await,
-                    Err(_) => break,
-                },
-                // Separate-port FEC (receiver only; pending forever without a FEC
-                // socket). A FEC socket error is non-fatal — media/RTCP carry the flow.
-                r = sock.recv_fec_col(&mut fec_col_buf) => if let Ok((n, _)) = r {
-                    self.on_fec_rtp(&fec_col_buf[..n]).await;
-                },
-                r = sock.recv_fec_row(&mut fec_row_buf) => if let Ok((n, _)) = r {
-                    self.on_fec_rtp(&fec_row_buf[..n]).await;
+                msg = inbound.recv() => match msg {
+                    Some(inb) => self.on_inbound(inb).await,
+                    None => break, // the reader exited (socket error) or the demuxer closed
                 },
                 payload = recv_app(&mut self.app_in) => match payload {
                     Some(p) => {
@@ -320,6 +341,19 @@ impl Driver {
                     }
                 },
             }
+        }
+
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+    }
+
+    /// Dispatches one inbound datagram by the socket it arrived on.
+    async fn on_inbound(&mut self, inb: SimpleInbound) {
+        match inb {
+            SimpleInbound::Media { data, src } => self.on_media(src, &data).await,
+            SimpleInbound::Rtcp { data, src } => self.on_rtcp(src, &data).await,
+            SimpleInbound::Fec { data } => self.on_fec_rtp(&data).await,
         }
     }
 
@@ -645,6 +679,49 @@ impl Driver {
             self.flow.handle_timer(now, id);
         }
     }
+}
+
+/// Spawns the single-flow socket reader: it reads the media (even), RTCP (odd), and
+/// separate-port FEC (column / row) sockets and funnels each datagram into the pump's
+/// inbound channel. The loop exits when the media or RTCP socket errors (fatal for the
+/// flow) or the pump drops the channel; the FEC sockets pend forever when unbound, so
+/// those arms are then no-ops.
+fn spawn_reader(
+    socket: SimpleSocket,
+    tx: mpsc::Sender<SimpleInbound>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut media_buf = vec![0u8; RECV_BUF];
+        let mut rtcp_buf = vec![0u8; RECV_BUF];
+        let mut col_buf = vec![0u8; RECV_BUF];
+        let mut row_buf = vec![0u8; RECV_BUF];
+        loop {
+            tokio::select! {
+                r = socket.recv_media(&mut media_buf) => match r {
+                    Ok((n, src)) => {
+                        let inb = SimpleInbound::Media { data: Bytes::copy_from_slice(&media_buf[..n]), src };
+                        if tx.send(inb).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                },
+                r = socket.recv_rtcp(&mut rtcp_buf) => match r {
+                    Ok((n, src)) => {
+                        let inb = SimpleInbound::Rtcp { data: Bytes::copy_from_slice(&rtcp_buf[..n]), src };
+                        if tx.send(inb).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                },
+                r = socket.recv_fec_col(&mut col_buf) => if let Ok((n, _)) = r {
+                    let inb = SimpleInbound::Fec { data: Bytes::copy_from_slice(&col_buf[..n]) };
+                    if tx.send(inb).await.is_err() { break; }
+                },
+                r = socket.recv_fec_row(&mut row_buf) => if let Ok((n, _)) = r {
+                    let inb = SimpleInbound::Fec { data: Bytes::copy_from_slice(&row_buf[..n]) };
+                    if tx.send(inb).await.is_err() { break; }
+                },
+            }
+        }
+    })
 }
 
 /// Awaits the next application payload, or never resolves when there is no

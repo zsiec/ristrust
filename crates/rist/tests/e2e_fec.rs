@@ -59,7 +59,10 @@ async fn listen_free(cfg: &Config) -> (Receiver, u16) {
         if !candidate.is_multiple_of(2) {
             candidate = candidate.wrapping_sub(1);
         }
-        if candidate < 2 {
+        // The caller binds neighbour ports up to +4 (RTCP +1, column FEC +2, row FEC
+        // +4), so +4 must stay a valid port — reject the top of the range, which would
+        // otherwise wrap and fail the neighbour bind with "invalid argument".
+        if !(2..=65_531).contains(&candidate) {
             continue;
         }
         if let Ok(r) = listen(&format!("127.0.0.1:{candidate}"), cfg.clone()).await {
@@ -331,7 +334,9 @@ async fn listen_free_bonded(cfg: &Config, n: usize) -> (Receiver, Vec<String>) {
             if !p.is_multiple_of(2) {
                 p = p.wrapping_sub(1);
             }
-            if p < 2 || ports.contains(&p) {
+            // Each bonded path binds neighbour FEC ports up to +4 (column +2, row +4),
+            // so +4 must stay valid — reject the top of the range.
+            if !(2..=65_531).contains(&p) || ports.contains(&p) {
                 continue 'attempt;
             }
             ports.push(p);

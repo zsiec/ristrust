@@ -165,6 +165,54 @@ mod tests {
     }
 
     #[test]
+    fn st2022_5_header_matches_spec_layout() {
+        // Pins the SMPTE ST 2022-5:2012 §7.3 (Figure 4) 16-octet layout for RIST media
+        // (the RTP padding/extension/CSRC/marker recovery bits are sender-zero), so the
+        // wire format cannot silently regress:
+        //   byte 0      E R P X CC[4]     all zero for RIST media  -> 0x00
+        //   byte 1      M PT[7]           M=0, PT=0x55             -> 0x55
+        //   bytes 2-3   SN Base[16]       0x1234
+        //   bytes 4-7   TS Recovery[32]   0xAABBCCDD
+        //   bytes 8-9   Length Recovery   0x0102
+        //   bytes 10-11 Reserved          0x0000
+        //   bytes 12-13 Offset[10]<<6     0x2AA<<6 = 0xAA80
+        //   bytes 14-15 NA[10]<<6         0x155<<6 = 0x5540
+        let p = fec::Packet {
+            direction: Direction::Column,
+            base: 0x1234,
+            offset: 0x2AA,
+            na: 0x155,
+            length_recovery: 0x0102,
+            pt_recovery: 0x55,
+            ts_recovery: 0xAABB_CCDD,
+            payload: Bytes::new(),
+        };
+        let got = encode(&p, Variant::St20225);
+        let want: [u8; HEADER_SIZE] = [
+            0x00, 0x55, 0x12, 0x34, 0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x00, 0x00, 0xAA, 0x80,
+            0x55, 0x40,
+        ];
+        assert_eq!(&got[..HEADER_SIZE], &want, "ST 2022-5 §7.3 header layout");
+        // The E/R flags and the reserved low bits of Offset/NA must stay clear.
+        assert_eq!(got[0] & 0xC0, 0, "E/R flag bits");
+        assert_eq!(got[13] & 0x3F, 0, "Offset reserved low bits");
+        assert_eq!(got[15] & 0x3F, 0, "NA reserved low bits");
+        // Round-trips back to the same geometry and recovery fields.
+        let back = decode(&got, Variant::St20225).expect("decode");
+        assert_eq!(
+            (
+                back.base,
+                back.offset,
+                back.na,
+                back.length_recovery,
+                back.pt_recovery,
+                back.ts_recovery,
+            ),
+            (0x1234, 0x2AA, 0x155, 0x0102, 0x55, 0xAABB_CCDD),
+        );
+    }
+
+    #[test]
     fn st2022_1_golden_bytes() {
         // Ported from ristgo internal/fec TestHeaderRoundTrip case 1: SNBase 0x1234,
         // SNBaseExt 0x07 (base 0x071234), length 1316, pt 96, ts 0xDEADBEEF, column,

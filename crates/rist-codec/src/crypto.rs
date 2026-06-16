@@ -406,6 +406,24 @@ mod tests {
     }
 
     #[test]
+    fn derive_key_matches_tr06_2_annex_b_vector() {
+        // VSF TR-06-2 Annex B's published PBKDF2-HMAC-SHA256 example: passphrase
+        // "Reliable Internet Stream Transport", the 4-byte nonce/salt 0x52495354
+        // ("RIST"), 1024 iterations -> the spec's documented 128- and 256-bit keys.
+        // Anchors the PSK derivation to the spec itself, not just RFC 7914 + libRIST.
+        let pw = b"Reliable Internet Stream Transport";
+        let nonce = [0x52, 0x49, 0x53, 0x54];
+        assert_eq!(
+            derive_key(pw, &nonce, AesKeyBits::Aes128).unwrap(),
+            hex("1c2b0cfc90ae2638fea78c7fb2977047"),
+        );
+        assert_eq!(
+            derive_key(pw, &nonce, AesKeyBits::Aes256).unwrap(),
+            hex("1c2b0cfc90ae2638fea78c7fb297704718bff7f4052743001a9b7ebb51cc9f1c"),
+        );
+    }
+
+    #[test]
     fn derive_key_128_is_prefix_of_256() {
         let pw = b"ristgo-test-passphrase";
         let nonce = [0x12, 0x34, 0x56, 0x78];

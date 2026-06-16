@@ -7,7 +7,15 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::reassembler::MAX_REASSEMBLY_FRAGMENTS;
 use crate::runtime::{Runtime, TokioRuntime};
+
+/// The most fragments a single [`Sender::send`] may split into when Advanced-profile
+/// fragmentation is enabled, so a payload up to `fragment_size` ×
+/// `MAX_FRAGMENTS_PER_WRITE` bytes is accepted and a larger one is rejected. It
+/// equals the peer reassembler's per-run cap, so a well-behaved sender can never
+/// split a write into more fragments than the receiver will reassemble.
+pub const MAX_FRAGMENTS_PER_WRITE: usize = MAX_REASSEMBLY_FRAGMENTS;
 
 /// An io-native RIST media sender. Created with [`dial`]; reliably transmits
 /// application payloads (Simple-profile RTP or Main-profile GRE), recovering loss
@@ -123,8 +131,19 @@ impl Sender {
     ///
     /// # Errors
     /// Returns [`Error::Closed`] if the session has shut down — or the more specific
-    /// [`Error::SessionTimeout`] / [`Error::Auth`] when that was the cause.
+    /// [`Error::SessionTimeout`] / [`Error::Auth`] when that was the cause. Returns
+    /// [`Error::PayloadTooLarge`] when Advanced-profile fragmentation is enabled and
+    /// the payload exceeds `fragment_size` × [`MAX_FRAGMENTS_PER_WRITE`].
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
+        if self.cfg.fragment_size > 0 {
+            let max = self.cfg.fragment_size * MAX_FRAGMENTS_PER_WRITE;
+            if payload.len() > max {
+                return Err(Error::PayloadTooLarge {
+                    len: payload.len(),
+                    max,
+                });
+            }
+        }
         self.app_in
             .send(Bytes::copy_from_slice(payload))
             .await

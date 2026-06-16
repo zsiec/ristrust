@@ -16,7 +16,7 @@
 use super::congestion::{BitrateEwma, CongestionMode, over_budget, wire_bytes};
 use super::{Flow, Output, RTT_ECHO_INTERVAL, TimerId};
 use crate::clock::{Ntp64, Timestamp};
-use crate::wire::{Feedback, MediaPacket};
+use crate::wire::{Feedback, FragRole, MediaPacket};
 use bytes::Bytes;
 
 /// The occupancy state of one history slot.
@@ -54,6 +54,9 @@ struct SenderSlot {
     /// Whether `last_retry` has been set (libRIST's `last_retry_request != 0`
     /// guard): the first retransmit is never gated.
     retried: bool,
+    /// The fragment role, repeated unchanged on every retransmit so a recovered
+    /// fragment reassembles in its original run.
+    frag: FragRole,
     /// `Empty` or `Filled`.
     state: SlotState,
 }
@@ -115,10 +118,11 @@ impl std::fmt::Debug for SenderState {
 }
 
 impl Flow {
-    /// The sender-role body of [`Flow::push_app`]: assign the next sequence,
-    /// store the packet in the history ring, and emit its first transmission
-    /// (libRIST `rist_sender_enqueue` followed by the data send).
-    pub(crate) fn send_push_app(&mut self, now: Timestamp, payload: Bytes) {
+    /// The sender-role body of [`Flow::push_app`]/[`Flow::push_app_frag`]: assign
+    /// the next sequence, store the packet (and its fragment role) in the history
+    /// ring, and emit its first transmission (libRIST `rist_sender_enqueue` followed
+    /// by the data send).
+    pub(crate) fn send_push_app(&mut self, now: Timestamp, payload: Bytes, frag: FragRole) {
         if !self.sender.started {
             self.sender.started = true;
             // Originate RTT echo requests so the retransmit gate has a real RTT.
@@ -159,6 +163,7 @@ impl Flow {
             sl.transmit_count = 0;
             sl.retried = false;
             sl.last_retry = Timestamp::ZERO;
+            sl.frag = frag;
         }
 
         let ssrc = self.sender.ssrc;
@@ -172,6 +177,7 @@ impl Flow {
                 payload,
                 retransmit: false,
                 path_id: tx_path,
+                frag,
             },
         });
         self.sender.data_bw.feed(now, wire_n); // recovery_maxbitrate data-rate EWMA
@@ -234,12 +240,12 @@ impl Flow {
                 // rate decays (libRIST returns before touching transmit_count).
                 self.stats.bandwidth_skipped += 1;
             } else {
-                let (source_time, payload) = {
+                let (source_time, payload, frag) = {
                     let sl = &mut self.sender.ring[idx];
                     sl.last_retry = now;
                     sl.retried = true;
                     sl.transmit_count += 1;
-                    (sl.source_time, sl.payload.clone())
+                    (sl.source_time, sl.payload.clone(), sl.frag)
                 };
                 let retry_n = wire_bytes(payload.len());
                 self.outputs.push_back(Output::SendMedia {
@@ -251,6 +257,7 @@ impl Flow {
                         payload,
                         retransmit: true,
                         path_id: tx_path,
+                        frag,
                     },
                 });
                 self.sender.retry_bw.feed(now, retry_n);
@@ -292,6 +299,7 @@ mod tests {
     use crate::clock::Timestamp;
     use crate::flow::testutil::{TEST_SSRC, drain_outputs, src_ntp};
     use crate::flow::{Config, CongestionMode, Flow, Output, Role};
+    use crate::wire::FragRole;
     use crate::wire::{Feedback, MediaPacket};
     use bytes::Bytes;
 
@@ -351,6 +359,7 @@ mod tests {
                         payload: Bytes::from_static(b"a"),
                         retransmit: false,
                         path_id: 0,
+                        frag: FragRole::Standalone,
                     },
                 },
             ]
@@ -375,6 +384,7 @@ mod tests {
                     payload: Bytes::from_static(b"b"),
                     retransmit: false,
                     path_id: 0,
+                    frag: FragRole::Standalone,
                 },
             }]
         );
@@ -432,6 +442,7 @@ mod tests {
                 payload: Bytes::from_static(b"b"),
                 retransmit: true,
                 path_id: 0,
+                frag: FragRole::Standalone,
             }]
         );
         let st = f.stats();

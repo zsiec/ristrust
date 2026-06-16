@@ -124,6 +124,17 @@ pub enum Error {
     /// non-reserved EtherType.
     #[error("rist: OOB protocol type 0x{0:04X} is reserved for RIST framing")]
     OobProtocol(u16),
+    /// A [`Sender::send`](crate::Sender::send) payload exceeded the maximum a single
+    /// write may carry. With Advanced-profile fragmentation enabled the limit is
+    /// `fragment_size` × [`MAX_FRAGMENTS_PER_WRITE`](crate::MAX_FRAGMENTS_PER_WRITE);
+    /// chunk the media before submitting it.
+    #[error("rist: payload {len} bytes exceeds the maximum {max}; chunk media before send")]
+    PayloadTooLarge {
+        /// The submitted payload length, in bytes.
+        len: usize,
+        /// The maximum a single write may carry, in bytes.
+        max: usize,
+    },
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

@@ -40,7 +40,7 @@ use bytes::Bytes;
 
 use crate::clock::{Micros, Ntp64, Timestamp};
 use crate::rtt::Estimator;
-use crate::wire::{Feedback, MediaPacket};
+use crate::wire::{Feedback, FragRole, MediaPacket};
 
 use receiver::ReceiverState;
 use sender::SenderState;
@@ -327,11 +327,22 @@ impl Flow {
         }
     }
 
-    /// Submits one application payload for transmission. Only the sender half acts
-    /// on it; it retains `payload` by reference so it can be re-sent on NACK.
+    /// Submits one complete application payload for transmission. Only the sender
+    /// half acts on it; it retains `payload` by reference so it can be re-sent on
+    /// NACK. Equivalent to [`Flow::push_app_frag`] with [`FragRole::Standalone`].
     pub fn push_app(&mut self, now: Timestamp, payload: Bytes) {
+        self.push_app_frag(now, payload, FragRole::Standalone);
+    }
+
+    /// Submits one fragment of an application payload the host has split across
+    /// consecutive sequences (Advanced fragmentation). `frag` is the fragment's role
+    /// ([`FragRole::First`] / [`FragRole::Middle`] / [`FragRole::Last`]), which the
+    /// core carries opaquely onto the [`MediaPacket`] and back out at delivery for
+    /// the host reassembler; it ascribes no meaning to it. Each fragment is an
+    /// independent sequence, so per-fragment ARQ falls out of the normal ring.
+    pub fn push_app_frag(&mut self, now: Timestamp, payload: Bytes, frag: FragRole) {
         if self.role == Role::Sender {
-            self.send_push_app(now, payload);
+            self.send_push_app(now, payload, frag);
         }
     }
 
@@ -408,7 +419,7 @@ fn mul_1_1(d: Micros) -> Micros {
 /// (those assertions live in the per-half test modules, next to the state).
 #[cfg(test)]
 pub(crate) mod testutil {
-    use super::{Event, Flow, MediaPacket, Output};
+    use super::{Event, Flow, FragRole, MediaPacket, Output};
     use crate::clock::{Ntp64, Timestamp};
     use bytes::Bytes;
 
@@ -429,6 +440,7 @@ pub(crate) mod testutil {
             payload: Bytes::from_static(payload),
             retransmit: false,
             path_id: 0,
+            frag: FragRole::Standalone,
         }
     }
 

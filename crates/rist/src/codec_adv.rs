@@ -52,7 +52,7 @@ use bytes::Bytes;
 
 use rist_codec::{adv, crypto, lpc};
 use rist_core::clock::{Ntp64, Timestamp};
-use rist_core::wire::{Feedback, MediaPacket};
+use rist_core::wire::{Feedback, FragRole, MediaPacket};
 
 use crate::codec::{self, CodecError};
 use crate::codec_main::Decoded;
@@ -156,6 +156,7 @@ impl AdvCodec {
             }
         }
 
+        let (first_frag, last_frag) = frag_to_flags(pkt.frag);
         let mut params = adv::Params {
             seq: pkt.seq,
             timestamp: Self::adv_ts_from_source(pkt.source_time),
@@ -163,8 +164,8 @@ impl AdvCodec {
             enc_type: adv::TYPE_DIRECT,
             psk_mode: adv::PSK_NONE,
             lpc_mode,
-            first_frag: true,
-            last_frag: true,
+            first_frag,
+            last_frag,
             retransmit: pkt.retransmit,
             ..adv::Params::default()
         };
@@ -207,9 +208,6 @@ impl AdvCodec {
     /// wrapping timestamp to the normalized fields. Fragments are rejected (libRIST
     /// never fragments).
     fn decode_media_adv(&mut self, p: &adv::Parsed) -> Result<MediaPacket, CodecError> {
-        if !(p.first_frag && p.last_frag) {
-            return Err(CodecError::AdvProfile("fragmented media not supported"));
-        }
         let mut data: Vec<u8> = p.payload.to_vec();
 
         match p.psk_mode {
@@ -258,6 +256,7 @@ impl AdvCodec {
             payload: Bytes::from(data),
             retransmit: p.retransmit,
             path_id: 0,
+            frag: flags_to_frag(p.first_frag, p.last_frag),
         })
     }
 
@@ -489,6 +488,29 @@ fn flow_id_from_ports(src_port: u16, dst_port: u16) -> adv::FlowId {
     }
 }
 
+/// Maps a normalized [`FragRole`] to the Advanced header's first/last fragment
+/// flags. The flag pair carries the role positionally: a standalone packet sets
+/// both, a run is first-only → neither → last-only (TR-06-3 §5).
+fn frag_to_flags(frag: FragRole) -> (bool, bool) {
+    match frag {
+        FragRole::Standalone => (true, true),
+        FragRole::First => (true, false),
+        FragRole::Middle => (false, false),
+        FragRole::Last => (false, true),
+    }
+}
+
+/// Inverse of [`frag_to_flags`]: recovers the fragment role from the parsed
+/// first/last flag pair.
+fn flags_to_frag(first: bool, last: bool) -> FragRole {
+    match (first, last) {
+        (true, true) => FragRole::Standalone,
+        (true, false) => FragRole::First,
+        (false, false) => FragRole::Middle,
+        (false, true) => FragRole::Last,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +537,7 @@ mod tests {
             payload: Bytes::copy_from_slice(payload),
             retransmit,
             path_id: 0,
+            frag: rist_core::wire::FragRole::Standalone,
         }
     }
 
@@ -564,6 +587,47 @@ mod tests {
             assert!(!got.retransmit, "{name} retransmit");
             assert_eq!(got.payload.as_ref(), payload.as_slice(), "{name} payload");
         }
+    }
+
+    #[test]
+    fn frag_role_round_trips() {
+        // Each fragment role maps to the header F/L bit pair and back. The encode
+        // side sets the bits from MediaPacket.frag; the decode side recovers it.
+        const SSRC: u32 = 0x0ACE_0AC0;
+        for role in [
+            FragRole::Standalone,
+            FragRole::First,
+            FragRole::Middle,
+            FragRole::Last,
+        ] {
+            let (mut enc, mut dec) = codec_pair(None, false, SSRC);
+            let pkt = MediaPacket {
+                seq: 0x42,
+                source_time: src_ntp(2_000_000),
+                ssrc: SSRC,
+                payload: Bytes::from_static(b"frag-payload"),
+                retransmit: false,
+                path_id: 0,
+                frag: role,
+            };
+            let dg = enc.encode_media(&pkt).unwrap();
+            let got = must_media(&mut dec, &dg);
+            assert_eq!(got.frag, role, "{role:?} should survive the round trip");
+            assert_eq!(got.payload.as_ref(), b"frag-payload", "{role:?} payload");
+        }
+    }
+
+    #[test]
+    fn frag_flag_mapping_is_total() {
+        // The four roles cover the four F/L combinations bijectively.
+        assert_eq!(frag_to_flags(FragRole::Standalone), (true, true));
+        assert_eq!(frag_to_flags(FragRole::First), (true, false));
+        assert_eq!(frag_to_flags(FragRole::Middle), (false, false));
+        assert_eq!(frag_to_flags(FragRole::Last), (false, true));
+        assert_eq!(flags_to_frag(true, true), FragRole::Standalone);
+        assert_eq!(flags_to_frag(true, false), FragRole::First);
+        assert_eq!(flags_to_frag(false, false), FragRole::Middle);
+        assert_eq!(flags_to_frag(false, true), FragRole::Last);
     }
 
     #[test]

@@ -535,6 +535,7 @@ impl Fabric {
             seq,
             payload,
             discontinuity,
+            ..
         }) = self.receiver.poll_event()
         {
             self.delivered_seqs.push(seq);

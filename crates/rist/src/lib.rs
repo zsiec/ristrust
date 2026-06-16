@@ -17,6 +17,7 @@ mod driver_bonded;
 mod driver_main;
 mod multicast;
 mod peer;
+mod reassembler;
 mod receiver;
 mod sender;
 mod session;
@@ -31,8 +32,8 @@ pub use receiver::{
 };
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
 pub use sender::{
-    Sender, dial, dial_bonded, dial_bonded_weighted, dial_bonded_weighted_with, dial_bonded_with,
-    dial_with, listen_sender, listen_sender_with,
+    MAX_FRAGMENTS_PER_WRITE, Sender, dial, dial_bonded, dial_bonded_weighted,
+    dial_bonded_weighted_with, dial_bonded_with, dial_with, listen_sender, listen_sender_with,
 };
 pub use stats::Stats;
 pub use url::parse_url;

@@ -149,6 +149,8 @@ impl MediaDecoder {
             payload: p.payload,
             retransmit: rtp::is_retransmit(p.header.ssrc),
             path_id: 0,
+            // The Simple profile does not fragment; every payload is whole.
+            frag: rist_core::wire::FragRole::Standalone,
         })
     }
 
@@ -355,6 +357,7 @@ mod tests {
             payload: Bytes::from_static(&[0x47, 0x01, 0x02, 0x03]),
             retransmit,
             path_id: 0,
+            frag: rist_core::wire::FragRole::Standalone,
         }
     }
 

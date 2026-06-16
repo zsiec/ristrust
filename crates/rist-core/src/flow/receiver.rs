@@ -24,7 +24,7 @@ use bytes::Bytes;
 use super::{Event, Flow, NACK_CADENCE, Output, RTT_ECHO_INTERVAL, TimerId};
 use crate::clock::{Micros, Ntp64, Timestamp};
 use crate::seq::{self, Seq32};
-use crate::wire::{Feedback, MediaPacket};
+use crate::wire::{Feedback, FragRole, MediaPacket};
 
 /// The occupancy state of one ring slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,6 +60,9 @@ struct Slot {
     path_seen: u64,
     /// The widened 32-bit sequence number occupying this slot.
     seq: u32,
+    /// The Advanced fragment role carried by the packet, surfaced at delivery for
+    /// the host reassembler.
+    frag: FragRole,
     /// `Empty` or `Filled`.
     state: SlotState,
 }
@@ -266,6 +269,7 @@ impl Flow {
             s.seq = seqn;
             s.source_time = source_time;
             s.payload = pkt.payload;
+            s.frag = pkt.frag;
             s.arrival = now;
             s.packet_time = packet_time;
             s.output_time = output_time;
@@ -321,6 +325,7 @@ impl Flow {
             s.seq = pkt.seq;
             s.source_time = pkt.source_time;
             s.payload = pkt.payload;
+            s.frag = pkt.frag;
             s.arrival = now;
             s.packet_time = now;
             s.output_time = output_time;
@@ -583,10 +588,10 @@ impl Flow {
     /// Hands the slot's payload to the application and advances the cursor. The
     /// payload reference moves into the event; the slot is cleared.
     fn emit_deliver(&mut self, idx: usize) {
-        let (seqn, payload) = {
+        let (seqn, payload, frag) = {
             let s = &mut self.receiver.ring[idx];
             s.state = SlotState::Empty;
-            (s.seq, std::mem::take(&mut s.payload))
+            (s.seq, std::mem::take(&mut s.payload), s.frag)
         };
         let discontinuity = self.receiver.pending_discontinuity;
         self.receiver.pending_discontinuity = false;
@@ -594,6 +599,7 @@ impl Flow {
             seq: seqn,
             payload,
             discontinuity,
+            frag,
         });
         self.stats.delivered += 1;
         self.receiver.deliver_next = self.receiver.deliver_next.wrapping_add(1);

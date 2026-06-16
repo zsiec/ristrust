@@ -344,6 +344,127 @@ async fn flow_attribute_round_trips_to_callback() {
 }
 
 #[tokio::test]
+async fn adv_fragmentation_round_trips() {
+    // A fragment size below the payload size forces each send to split into a
+    // First..Middle..Last run of independently sequenced packets; the receiver's
+    // reassembler folds each run back into the original payload, in order and
+    // byte-exact. A ~170-byte body over an 8-byte fragment size is ~22 fragments.
+    run_loopback(adv_cfg().with_fragment_size(8), 50, &"frag".repeat(40)).await;
+}
+
+#[tokio::test]
+async fn adv_fragmentation_with_aes_and_lz4() {
+    // Fragmentation composes with per-packet AES-CTR and LZ4: each fragment is an
+    // ordinary media packet, encrypted and compressed independently, then
+    // reassembled after decrypt/decompress on delivery.
+    run_loopback(
+        adv_cfg()
+            .with_fragment_size(64)
+            .with_secret("frag-256")
+            .with_aes_key_bits(AesKeyBits::Aes256)
+            .with_compression(true),
+        40,
+        &"compress-and-split-".repeat(10),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adv_fragmentation_recovers_loss_via_arq() {
+    // A dropped fragment is recovered by ARQ exactly like any other media packet:
+    // the flow core fills the hole before delivery, so the run carries no
+    // discontinuity and the reassembler completes it byte-exact. This proves
+    // fragmentation composes with the recovery plane (a lost fragment is not a lost
+    // payload). Each fragment is >MEDIA_THRESHOLD, so fragments are loss-eligible.
+    const N: usize = 60;
+    const FLUSH: usize = 24; // a delivered successor for the last asserted payload
+    // ~700-byte payloads over a 256-byte fragment size: three loss-eligible fragments.
+    let body = "advanced-fragment-loss-".repeat(28);
+
+    let cfg = adv_cfg()
+        .with_buffer(Duration::from_millis(500))
+        .with_fragment_size(256);
+    let (mut receiver, port) = listen_free(&cfg).await; // lossless receiver
+
+    let dropped = Arc::new(AtomicU64::new(0));
+    let lossy = LossyRuntime {
+        loss: 0.12,
+        next_seed: AtomicU64::new(0x00F0_0D11),
+        dropped: Arc::clone(&dropped),
+    };
+    let sender = dial_with(&format!("127.0.0.1:{port}"), cfg.clone(), &lossy)
+        .await
+        .expect("dial with the lossy runtime");
+
+    let mk = move |i: usize| format!("adv-{i:05}-{body}").into_bytes();
+    let send_mk = mk.clone();
+    // One sub-threshold (never-dropped) Standalone prime opens the stream so the
+    // receiver's sequence baseline is established by a packet that loss cannot
+    // touch (pure ARQ cannot recover loss that precedes the first delivered
+    // packet). The fragmented stream follows immediately — no await between them —
+    // so source timestamps stay evenly spaced and every later fragment loss falls
+    // inside the playout window where ARQ recovers it.
+    let send_task = tokio::spawn(async move {
+        sender.send(b"prime").await.expect("prime send");
+        for i in 0..N + FLUSH {
+            sender.send(&send_mk(i)).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sender
+    });
+
+    let primed = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("prime did not arrive")
+        .expect("session open");
+    assert_eq!(primed.as_ref(), b"prime", "prime payload corrupt");
+
+    for i in 0..N {
+        let got = tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}: fragment ARQ did not converge"))
+            .expect("session stayed open");
+        assert_eq!(
+            got.as_ref(),
+            mk(i).as_slice(),
+            "fragmented payload {i} out of order or corrupt under loss"
+        );
+    }
+
+    assert!(
+        dropped.load(Ordering::Relaxed) > 0,
+        "no fragment dropped — the loss/ARQ path was not exercised"
+    );
+
+    let sender = send_task.await.expect("send task");
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
+async fn send_rejects_payload_over_fragment_cap() {
+    // With fragmentation enabled a single send is capped at fragment_size ×
+    // MAX_FRAGMENTS_PER_WRITE bytes; a larger payload is rejected up front rather
+    // than split into more fragments than the peer's reassembler will absorb.
+    let sender = dial_with(
+        "127.0.0.1:5001",
+        adv_cfg().with_fragment_size(16),
+        &TokioRuntime,
+    )
+    .await
+    .expect("dial advanced");
+    let cap = 16 * rist::MAX_FRAGMENTS_PER_WRITE;
+    let too_big = vec![0u8; cap + 1];
+    assert!(matches!(
+        sender.send(&too_big).await,
+        Err(rist::Error::PayloadTooLarge { .. })
+    ));
+    // Exactly at the cap is accepted.
+    sender.send(&vec![0u8; cap]).await.expect("at-cap send ok");
+    sender.close().await.ok();
+}
+
+#[tokio::test]
 async fn write_flow_attribute_rejected_off_advanced() {
     // A non-Advanced sender has no flow-attribute channel.
     let sender = dial_with("127.0.0.1:5000", Config::default(), &TokioRuntime)

@@ -63,6 +63,31 @@ pub struct MediaPacket {
     /// per registered peer, and `flow` records per-path arrival without ever
     /// knowing what a path is.
     pub path_id: u8,
+
+    /// The Advanced-profile fragment role: whether this packet is a whole payload
+    /// or one piece of an application write the sender split across consecutive
+    /// sequences. [`FragRole::Standalone`] (the default) is a complete payload. The
+    /// core carries it opaquely from the sending codec, through the ring, to
+    /// delivery; only the Advanced codec (the header F/L bits) and the host
+    /// reassembler interpret it. Simple/Main always set [`FragRole::Standalone`].
+    pub frag: FragRole,
+}
+
+/// The Advanced-profile fragment role of a [`MediaPacket`] (TR-06-3 §5.2.2),
+/// mapping to the header's F (first) and L (last) bits. [`FragRole::Standalone`]
+/// (the zero value, `F=L=1`) is a complete, unfragmented payload; the others are
+/// the pieces of one application write split across consecutive sequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FragRole {
+    /// A complete, unfragmented payload (`F=1, L=1`). The default.
+    #[default]
+    Standalone,
+    /// The first piece of a split payload (`F=1, L=0`).
+    First,
+    /// A middle piece of a split payload (`F=0, L=0`).
+    Middle,
+    /// The last piece of a split payload (`F=0, L=1`).
+    Last,
 }
 
 /// The normalized form of everything that is not media: RTCP control traffic in

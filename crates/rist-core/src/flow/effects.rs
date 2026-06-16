@@ -81,6 +81,11 @@ pub enum Event {
         /// were abandoned (never recovered before their playout deadline), so the
         /// output stream has a gap here.
         discontinuity: bool,
+        /// The Advanced-profile fragment role carried by the delivered packet
+        /// ([`crate::wire::FragRole::Standalone`] for unfragmented media and on the
+        /// Simple/Main profiles). The host reassembler folds non-standalone roles
+        /// into whole application payloads.
+        frag: crate::wire::FragRole,
     },
 }
 

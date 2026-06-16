@@ -23,7 +23,7 @@ use rist_codec::rtcp::{EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
 use rist_core::clock::Timestamp;
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
-use rist_core::wire::Feedback;
+use rist_core::wire::{Feedback, FragRole};
 
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_adv::AdvCodec;
@@ -32,6 +32,7 @@ use crate::config::FlowAttrCallback;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
 use crate::peer::Peer;
+use crate::reassembler::FragReassembler;
 use crate::socket::MainSocket;
 use crate::stats::StatsCell;
 
@@ -82,11 +83,17 @@ pub(crate) struct AdvDriver {
     app_in: Option<mpsc::Receiver<Bytes>>,
     highest_sent: u32,
     ssrc: u32,
+    /// When > 0, split an application payload larger than this many bytes across
+    /// consecutive fragment sequences (TR-06-3 §5); 0 disables fragmentation.
+    frag_size: usize,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
     learned_ssrc: Option<u32>,
     greeted: bool,
+    /// Reassembles a delivered fragment run into a complete payload before it is
+    /// handed to the application (a no-op for unfragmented `Standalone` media).
+    reasm: FragReassembler,
 
     // --- EAP-SRP authentication ---
     eap: Option<EapRole>,
@@ -130,6 +137,7 @@ impl AdvDriver {
         on_flow_attr: Option<FlowAttrCallback>,
         flow_attr_rx: mpsc::Receiver<Vec<u8>>,
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
+        frag_size: usize,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -156,9 +164,11 @@ impl AdvDriver {
             app_in: Some(rx),
             highest_sent: start_seq,
             ssrc,
+            frag_size,
             data_out: None,
             learned_ssrc: None,
             greeted: false,
+            reasm: FragReassembler::default(),
             eap,
             authed,
             lqm: None,
@@ -212,9 +222,11 @@ impl AdvDriver {
             app_in: None,
             highest_sent: 0,
             ssrc,
+            frag_size: 0,
             data_out: Some(tx),
             learned_ssrc: None,
             greeted: false,
+            reasm: FragReassembler::default(),
             eap,
             authed,
             lqm,
@@ -260,7 +272,7 @@ impl AdvDriver {
                 payload = recv_app_gated(&mut self.app_in, self.authed) => match payload {
                     Some(p) => {
                         let now = self.now();
-                        self.flow.push_app(now, p);
+                        self.push_app(now, &p);
                         self.drain(now).await;
                     }
                     None => break,
@@ -408,6 +420,32 @@ impl AdvDriver {
         }
     }
 
+    /// Feeds one application payload to the flow core, splitting it across
+    /// consecutive sequences when fragmentation is enabled (`frag_size > 0`) and the
+    /// payload exceeds the fragment size. Each fragment is an independently
+    /// recoverable sequence tagged with its F/L role; the peer's reassembler folds
+    /// them back together. Without fragmentation, or for a payload that already fits,
+    /// it is a single unfragmented [`FragRole::Standalone`] push.
+    fn push_app(&mut self, now: Timestamp, p: &Bytes) {
+        if self.frag_size == 0 || p.len() <= self.frag_size {
+            self.flow.push_app(now, p.clone());
+            return;
+        }
+        let mut off = 0;
+        while off < p.len() {
+            let end = (off + self.frag_size).min(p.len());
+            let role = if off == 0 {
+                FragRole::First
+            } else if end == p.len() {
+                FragRole::Last
+            } else {
+                FragRole::Middle
+            };
+            self.flow.push_app_frag(now, p.slice(off..end), role);
+            off = end;
+        }
+    }
+
     async fn drain(&mut self, now: Timestamp) {
         let sock = self.socket.clone();
         let mut fbs = Vec::new();
@@ -443,9 +481,21 @@ impl AdvDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
+        while let Some(Event::Deliver {
+            payload,
+            discontinuity,
+            frag,
+            ..
+        }) = self.flow.poll_event()
+        {
+            // Reassemble a fragment run before delivery; an unfragmented payload
+            // (`Standalone`) passes straight through, an incomplete or broken run
+            // yields nothing (the application sees the same gap as any lost media).
+            let Some(out_payload) = self.reasm.push(frag, payload, discontinuity) else {
+                continue;
+            };
             if let Some(out) = &self.data_out
-                && out.send(payload).await.is_err()
+                && out.send(out_payload).await.is_err()
             {
                 return;
             }

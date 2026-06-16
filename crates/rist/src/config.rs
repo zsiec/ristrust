@@ -142,6 +142,13 @@ pub struct Config {
     pub srp_password: Option<String>,
     /// Enable LZ4 payload compression on the send path (Advanced profile).
     pub compression: bool,
+    /// Split an outbound application payload larger than this many bytes across
+    /// consecutive Advanced-profile fragment sequences (TR-06-3 §5), each
+    /// independently recoverable by ARQ; the peer reassembles them. `0` (the
+    /// default) disables fragmentation and sends every payload whole. Advanced
+    /// profile only. A single write is capped at `fragment_size` ×
+    /// [`MAX_FRAGMENTS_PER_WRITE`](crate::MAX_FRAGMENTS_PER_WRITE) bytes.
+    pub fragment_size: usize,
     /// Enable Main-profile null-packet deletion on the send path (TR-06-2 §8.6).
     /// A sender suppresses null MPEG-TS packets and signals their positions in the
     /// RIST NPD RTP extension, saving the bandwidth of transmitting stuffing; the
@@ -221,6 +228,7 @@ impl Default for Config {
             srp_username: None,
             srp_password: None,
             compression: false,
+            fragment_size: 0,
             null_packet_deletion: false,
             one_way: false,
             weight: 0,
@@ -338,6 +346,16 @@ impl Config {
     #[must_use]
     pub fn with_compression(mut self, on: bool) -> Config {
         self.compression = on;
+        self
+    }
+
+    /// Sets the Advanced-profile fragment size: an outbound application payload
+    /// larger than `bytes` is split across consecutive, independently recoverable
+    /// fragment sequences and reassembled by the peer. `0` disables fragmentation.
+    /// Advanced profile only.
+    #[must_use]
+    pub fn with_fragment_size(mut self, bytes: usize) -> Config {
+        self.fragment_size = bytes;
         self
     }
 
@@ -521,11 +539,18 @@ impl Config {
                 if self.null_packet_deletion {
                     return Err(unsupported("null-packet deletion", "Simple"));
                 }
+                if self.fragment_size != 0 {
+                    return Err(unsupported("payload fragmentation", "Simple"));
+                }
             }
             Profile::Main => {
                 if self.compression {
                     // LZ4 compression is an Advanced-profile feature only.
                     return Err(unsupported("LZ4 compression", "Main"));
+                }
+                if self.fragment_size != 0 {
+                    // Payload fragmentation (F/L bits) is Advanced-profile only.
+                    return Err(unsupported("payload fragmentation", "Main"));
                 }
             }
             Profile::Advanced => {
@@ -671,6 +696,32 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_gates_fragmentation_to_advanced() {
+        // Payload fragmentation (F/L bits) is an Advanced-profile feature; Simple
+        // and Main reject it rather than silently dropping the splitting behavior.
+        assert!(matches!(
+            Config::default().with_fragment_size(1200).validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_fragment_size(1200)
+                .validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(
+            Config::default()
+                .with_profile(Profile::Advanced)
+                .with_fragment_size(1200)
+                .validate()
+                .is_ok()
+        );
+        // Zero (the default) is accepted on every profile: fragmentation is off.
+        assert!(Config::default().validate().is_ok());
     }
 
     #[test]

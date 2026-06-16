@@ -679,6 +679,8 @@ impl MainCodec {
             payload,
             retransmit: rtp::is_retransmit(p.header.ssrc),
             path_id: 0,
+            // The Main profile does not fragment; every payload is whole.
+            frag: rist_core::wire::FragRole::Standalone,
         })
     }
 
@@ -875,6 +877,7 @@ mod tests {
             payload: Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
             retransmit: false,
             path_id: 0,
+            frag: rist_core::wire::FragRole::Standalone,
         };
         let got = c.encode_media(&pkt).unwrap();
         let want: &[u8] = &[
@@ -909,6 +912,7 @@ mod tests {
                 payload: Bytes::from(payload.clone()),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             };
             let dg = enc.encode_media(&pkt).unwrap();
             let got = must_media(&mut dec, &dg);
@@ -935,6 +939,7 @@ mod tests {
                 payload: Bytes::from(payload.clone()),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             };
             let dg = enc.encode_media(&pkt).unwrap();
             let got = must_media(&mut dec, &dg);
@@ -960,6 +965,7 @@ mod tests {
             payload: Bytes::from_static(&[1, 2, 3]),
             retransmit: false,
             path_id: 0,
+            frag: rist_core::wire::FragRole::Standalone,
         };
         let dg0 = enc.encode_media(&orig).unwrap();
         let d0 = must_media(&mut dec, &dg0);
@@ -971,6 +977,7 @@ mod tests {
                 payload: Bytes::copy_from_slice(&[i as u8]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             };
             must_media(&mut dec, &enc.encode_media(&p).unwrap());
         }
@@ -1082,6 +1089,7 @@ mod tests {
                 payload: Bytes::from_static(&[9]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         assert!(matches!(dec.decode(&media, 0).unwrap(), Decoded::Media(_)));
@@ -1114,6 +1122,7 @@ mod tests {
                 payload: Bytes::from_static(&[1]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         assert!(
@@ -1132,6 +1141,7 @@ mod tests {
                 payload: Bytes::from_static(&[1]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         assert!(
@@ -1152,6 +1162,7 @@ mod tests {
                 payload: Bytes::from_static(&[1]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         let lead = RtcpPacket::EmptyReceiverReport(EmptyReceiverReport { ssrc: 1 });
@@ -1164,6 +1175,7 @@ mod tests {
                 payload: Bytes::from_static(&[2]),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         assert_eq!((seq_of(&m0), seq_of(&f1), seq_of(&m2)), (0, 1, 2));
@@ -1183,6 +1195,7 @@ mod tests {
                 payload: Bytes::from(odd.clone()),
                 retransmit: false,
                 path_id: 0,
+                frag: rist_core::wire::FragRole::Standalone,
             })
             .unwrap();
         let got = must_media(&mut dec, &dg);
@@ -1222,6 +1235,7 @@ mod tests {
             payload: Bytes::from(ts_packet(188, 0x100, 0xAA)),
             retransmit: false,
             path_id: 0,
+            frag: rist_core::wire::FragRole::Standalone,
         };
         let dg = enc.encode_media(&pkt).unwrap();
         let (mut hdr, off) = gre::Header::parse(&dg).unwrap();
@@ -1288,6 +1302,7 @@ mod tests {
                     payload: Bytes::from(ts_packet(188, 0x100, 0xAA)),
                     retransmit: false,
                     path_id: 0,
+                    frag: rist_core::wire::FragRole::Standalone,
                 })
                 .unwrap();
             let (kind, _, _) = dec.peek_control(&md);

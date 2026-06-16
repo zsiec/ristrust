@@ -323,6 +323,7 @@ pub(crate) fn build_sender(
             cfg.on_flow_attr.clone(),
             attr_rx,
             oob_rx,
+            cfg.fragment_size,
         );
         return Ok(SenderSpawned {
             local,

@@ -468,6 +468,118 @@ pub(crate) fn build_receiver(
     })
 }
 
+/// Rejects a reversed-role session on a profile/feature it does not support.
+/// Reversed-role transport currently rides the Main-profile GRE substrate and has
+/// no return channel for the EAP-SRP handshake, so credentials are refused.
+fn require_reversible_main(cfg: &Config) -> io::Result<()> {
+    if cfg.profile != Profile::Main {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: reversed-role transport currently requires the Main profile",
+        ));
+    }
+    if cfg.srp_username.is_some() || cfg.srp_password.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: reversed-role transport does not support EAP-SRP authentication",
+        ));
+    }
+    Ok(())
+}
+
+/// Builds a reversed-role **listener-sender**: a media *sender* that binds the
+/// well-known port and waits, learning the receiver's address from its inbound
+/// announcement (the caller-receiver), then sending media to it. Media is held
+/// until that address is known. Main profile only; PSK supported, EAP-SRP refused.
+///
+/// # Errors
+/// As [`build_listener_sender`]'s profile/feature checks, or an I/O bind error.
+pub(crate) fn build_listener_sender(
+    rt: &dyn Runtime,
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<SenderSpawned> {
+    require_reversible_main(cfg)?;
+    let ssrc = random_even_ssrc();
+    let start_seq = random_start_seq();
+    let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
+    let membership = crate::multicast::receiver_membership(cfg, local)?;
+    let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+    let bound = socket.local()?;
+    // Empty peer: the caller-receiver's announcement teaches us where to send.
+    let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    let codec = build_main_codec(cfg, ssrc)?;
+    let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (app_in, close, stats, task) = MainDriver::spawn_sender(
+        flow,
+        socket,
+        peer,
+        codec,
+        ssrc,
+        flow_mac(ssrc),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        start_seq,
+        None, // reversed-role refuses EAP-SRP
+        RateControl::from_config(cfg),
+        oob_rx,
+    );
+    Ok(SenderSpawned {
+        local: bound,
+        app_in,
+        weight_cmd: None,
+        flow_attr_cmd: None,
+        oob_in: Some(oob_tx),
+        close,
+        stats,
+        task,
+    })
+}
+
+/// Builds a reversed-role **caller-receiver**: a media *receiver* that dials the
+/// listening sender's well-known address, announcing itself (an immediate
+/// greeting + keepalives) so the sender learns where to send, then receiving media.
+/// Main profile only; PSK supported, EAP-SRP refused.
+///
+/// # Errors
+/// As [`build_caller_receiver`]'s profile/feature checks, or an I/O bind error.
+pub(crate) fn build_caller_receiver(
+    rt: &dyn Runtime,
+    cfg: &Config,
+    remote: SocketAddr,
+) -> io::Result<ReceiverSpawned> {
+    require_reversible_main(cfg)?;
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
+    let egress = crate::multicast::sender_egress(cfg, remote)?;
+    let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
+    let local = socket.local()?;
+    // The sender's address is known up front (we dialled it), so we announce to it.
+    let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
+    let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
+    let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (data_out, close, stats, task) = MainDriver::spawn_receiver(
+        flow,
+        socket,
+        peer,
+        codec,
+        DEFAULT_FLOW_SSRC,
+        flow_mac(DEFAULT_FLOW_SSRC),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        None, // reversed-role refuses EAP-SRP
+        build_lqm_emitter(cfg),
+        oob_tx,
+    );
+    Ok(ReceiverSpawned {
+        local,
+        data_out,
+        oob_out: Some(oob_rx),
+        close,
+        stats,
+        task,
+    })
+}
+
 /// An empty bonding group sized by the config's session timeout and RTT clamps,
 /// ready for `add_path`.
 fn bonding_group(cfg: &Config) -> Group {

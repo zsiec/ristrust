@@ -127,6 +127,48 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
     })
 }
 
+/// Dials a reversed-role **caller-receiver**: a media receiver that calls out to a
+/// [`listen_sender`](crate::listen_sender) listening at `addr` (a bare `IP:port` or `rist://` URL),
+/// announces itself so the sender learns where to send, then receives media. Main
+/// profile only; PSK supported, EAP-SRP refused.
+///
+/// # Errors
+/// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]
+/// for an invalid configuration, or [`Error::Io`] (wrapping the non-Main / EAP-SRP
+/// rejection) if the profile is unsupported or the socket cannot be bound.
+pub async fn dial_receiver(addr: &str, cfg: Config) -> Result<Receiver, Error> {
+    dial_receiver_with(addr, cfg, &TokioRuntime).await
+}
+
+/// Like [`dial_receiver`], but binds the transport socket through `rt`.
+///
+/// # Errors
+/// As [`dial_receiver`].
+pub async fn dial_receiver_with(
+    addr: &str,
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Receiver, Error> {
+    let (addr, cfg) = if addr.contains("://") {
+        crate::url::parse_url(addr, cfg)?
+    } else {
+        (addr.to_string(), cfg)
+    };
+    cfg.validate()?;
+    let remote: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
+    let spawned = crate::session::build_caller_receiver(rt, &cfg, remote)?;
+    tracing::debug!(%remote, "rist: caller-receiver dialed");
+    Ok(Receiver {
+        cfg,
+        local: spawned.local,
+        data_out: spawned.data_out,
+        oob_out: spawned.oob_out,
+        close: spawned.close,
+        stats: spawned.stats,
+        task: spawned.task,
+    })
+}
+
 /// Binds a SMPTE 2022-7 bonded receiver to every address in `addrs`, merging the
 /// media that arrives on each into one in-order, ARQ-recovered stream (the
 /// `(seq, source_time)` dedup is the merge). Each address is one Main-profile GRE

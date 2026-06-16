@@ -1,6 +1,6 @@
 //! The public media sender and the [`dial`] constructor.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -284,6 +284,52 @@ pub async fn dial_bonded_weighted_with(
         cfg,
         local: spawned.local,
         remote: resolved[0].0,
+        app_in: spawned.app_in,
+        weight_cmd: spawned.weight_cmd,
+        flow_attr_cmd: spawned.flow_attr_cmd,
+        oob_in: spawned.oob_in,
+        close: spawned.close,
+        stats: spawned.stats,
+        task: spawned.task,
+    })
+}
+
+/// Binds a reversed-role **listener-sender**: a media sender that listens on `addr`
+/// (a bare `IP:port` or a `rist://` URL) and waits for a [`dial_receiver`](crate::dial_receiver) caller to
+/// announce itself, then sends media to it. Media submitted via [`Sender::send`] is
+/// held until the caller connects. Main profile only; PSK supported, EAP-SRP refused.
+///
+/// # Errors
+/// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]
+/// for an invalid configuration, or [`Error::Io`] (wrapping the non-Main / EAP-SRP
+/// rejection) if the profile is unsupported or the socket cannot be bound.
+pub async fn listen_sender(addr: &str, cfg: Config) -> Result<Sender, Error> {
+    listen_sender_with(addr, cfg, &TokioRuntime).await
+}
+
+/// Like [`listen_sender`], but binds the transport socket through `rt`.
+///
+/// # Errors
+/// As [`listen_sender`].
+pub async fn listen_sender_with(
+    addr: &str,
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Sender, Error> {
+    let (addr, cfg) = if addr.contains("://") {
+        crate::url::parse_url(addr, cfg)?
+    } else {
+        (addr.to_string(), cfg)
+    };
+    cfg.validate()?;
+    let local: SocketAddr = addr.parse().map_err(|_| Error::InvalidAddr(addr.clone()))?;
+    let spawned = crate::session::build_listener_sender(rt, &cfg, local)?;
+    tracing::debug!(%local, "rist: listener-sender bound");
+    Ok(Sender {
+        cfg,
+        local: spawned.local,
+        // The peer is learned from the caller's announcement; unknown until then.
+        remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,

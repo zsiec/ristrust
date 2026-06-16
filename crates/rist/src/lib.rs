@@ -25,11 +25,14 @@ mod stats;
 
 pub use config::{Config, FlowAttrCallback, NackType, Profile, RateCallback};
 pub use error::{ConfigError, Error};
-pub use receiver::{Receiver, listen, listen_bonded, listen_bonded_with, listen_with};
+pub use receiver::{
+    Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_with,
+    listen_with,
+};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
 pub use sender::{
     Sender, dial, dial_bonded, dial_bonded_weighted, dial_bonded_weighted_with, dial_bonded_with,
-    dial_with,
+    dial_with, listen_sender, listen_sender_with,
 };
 pub use stats::Stats;
 pub use url::parse_url;

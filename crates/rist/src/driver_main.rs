@@ -284,13 +284,16 @@ impl MainDriver {
         let sock = self.socket.clone();
         let mut buf = vec![0u8; RECV_BUF];
 
-        // A sender knows the peer's address up front; greet it immediately (the
-        // RTCP SDES that ungates libRIST's media, plus the GRE MAC beacon) so the
-        // peer authenticates us before our media arrives. When authenticating, also
-        // open the EAP-SRP handshake with EAPOL-START.
-        if self.sender {
+        // Greet a peer whose address is known up front: a dialing sender (the RTCP
+        // SDES that ungates media + the GRE MAC beacon) and, for reversed-role, a
+        // caller-receiver announcing itself to a listening sender so the latter
+        // learns where to send. A listening sender has no peer yet and greets later,
+        // on first learning the caller. When authenticating, also open EAPOL-START.
+        if self.sender || self.peer.media().is_some() {
             let now = self.now();
             self.greet(now).await;
+        }
+        if self.sender {
             self.send_eap_start().await;
         }
 
@@ -305,9 +308,12 @@ impl MainDriver {
                     Ok((n, src)) => self.on_recv(src, &buf[..n]).await,
                     Err(_) => break,
                 },
-                // Hold outbound media until the EAP-SRP handshake authenticates the
-                // data channel (a no-op when authentication is disabled).
-                payload = recv_app_gated(&mut self.app_in, self.authed) => match payload {
+                // Hold outbound media until the data channel is unblocked: the
+                // EAP-SRP handshake has authenticated (a no-op when auth is disabled)
+                // AND the peer's address is known. The latter is always true for a
+                // dialing sender; for a reversed-role listener-sender it holds media
+                // until a caller-receiver announces itself.
+                payload = recv_app_gated(&mut self.app_in, self.authed && self.peer.media().is_some()) => match payload {
                     Some(p) => {
                         let now = self.now();
                         self.flow.push_app(now, p);

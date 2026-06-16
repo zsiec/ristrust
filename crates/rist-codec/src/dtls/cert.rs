@@ -202,23 +202,26 @@ impl PeerKey {
 /// and the signature. It always signs with SHA-256 (a valid choice for every
 /// supported suite), choosing ECDSA or RSA-PKCS#1-v1.5 by the key type. Used for the
 /// ECDHE ServerKeyExchange.
-#[must_use]
-pub fn sign_handshake(identity: &Identity, msg: &[u8]) -> (u16, Vec<u8>) {
+///
+/// # Errors
+/// [`DtlsError::BadCertificate`] if the RSA key cannot produce a signature (e.g. a
+/// degenerate or too-small modulus on a caller-supplied identity) — surfaced rather
+/// than emitting an empty signature the peer would reject opaquely.
+pub fn sign_handshake(identity: &Identity, msg: &[u8]) -> Result<(u16, Vec<u8>), DtlsError> {
     match &identity.key {
         PrivKey::Ecdsa(key) => {
             let sig: Signature = key.sign(msg);
-            (
+            Ok((
                 SIG_SCHEME_ECDSA_P256_SHA256,
                 sig.to_der().as_bytes().to_vec(),
-            )
+            ))
         }
         PrivKey::Rsa(key) => {
             let digest = Sha256::digest(msg);
-            // PKCS#1 v1.5 signing is infallible for a valid key + correct digest size.
             let sig = key
                 .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
-                .unwrap_or_default();
-            (SIG_SCHEME_RSA_PKCS1_SHA256, sig)
+                .map_err(|_| DtlsError::BadCertificate)?;
+            Ok((SIG_SCHEME_RSA_PKCS1_SHA256, sig))
         }
     }
 }
@@ -338,7 +341,7 @@ mod tests {
         let id = Identity::generate("signer").unwrap();
         let key = leaf_public_key(id.der()).unwrap();
         let msg = b"server key exchange params";
-        let (scheme, sig) = sign_handshake(&id, msg);
+        let (scheme, sig) = sign_handshake(&id, msg).unwrap();
         assert_eq!(scheme, SIG_SCHEME_ECDSA_P256_SHA256);
         assert!(verify_handshake_signature(&key, scheme, msg, &sig));
         assert!(
@@ -352,7 +355,7 @@ mod tests {
         let id = Identity::generate_rsa("rsa-signer").unwrap();
         let key = leaf_public_key(id.der()).unwrap();
         let msg = b"server key exchange params";
-        let (scheme, sig) = sign_handshake(&id, msg);
+        let (scheme, sig) = sign_handshake(&id, msg).unwrap();
         assert_eq!(scheme, SIG_SCHEME_RSA_PKCS1_SHA256);
         assert!(verify_handshake_signature(&key, scheme, msg, &sig));
         assert!(!verify_handshake_signature(&key, scheme, b"tampered", &sig));
@@ -365,7 +368,7 @@ mod tests {
         let ecdsa_key = leaf_public_key(ecdsa.der()).unwrap();
         let msg = b"params";
         // An RSA signature presented under an ECDSA key (or vice versa) must fail.
-        let (rsa_scheme, rsa_sig) = sign_handshake(&rsa, msg);
+        let (rsa_scheme, rsa_sig) = sign_handshake(&rsa, msg).unwrap();
         assert!(!verify_handshake_signature(
             &ecdsa_key, rsa_scheme, msg, &rsa_sig
         ));

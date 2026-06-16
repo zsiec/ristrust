@@ -379,6 +379,14 @@ impl<T: Transport> Conn<T> {
         self.cipher_suite = sh.cipher_suite;
         self.suite = lookup_suite(sh.cipher_suite)
             .ok_or_else(|| proto("server selected an unsupported suite"))?;
+        // The server must not select a suite the client did not offer: a malicious
+        // server could otherwise force a downgrade (e.g. to the cleartext
+        // RSA_WITH_NULL_SHA256, or any suite the user disabled) that the client never
+        // put on the wire. `client_can_offer` is exactly the predicate that built the
+        // ClientHello suite list, so re-checking it rejects an off-list selection.
+        if !self.cfg.client_can_offer(self.suite) {
+            return Err(proto("server selected a suite we did not offer"));
+        }
         let server_random = sh.random;
         let ems = sh.ext_master_secret;
         if self.cfg.require_extended_master_secret && !ems {
@@ -661,7 +669,8 @@ impl<T: Transport> Conn<T> {
                 signed.extend_from_slice(&server_random);
                 signed.extend_from_slice(&ske.signed_params());
                 // Sign with the certificate's key type (ECDSA or RSA), SHA-256.
-                let (sig_scheme, signature) = cert::sign_handshake(&identity, &signed);
+                let (sig_scheme, signature) =
+                    cert::sign_handshake(&identity, &signed).map_err(dtls_err)?;
                 ske.sig_scheme = sig_scheme;
                 ske.signature = signature;
                 f4.push(self.emit_handshake(
@@ -1106,6 +1115,76 @@ mod tests {
         }
     }
 
+    /// Rewrites the cipher suite of the first ServerHello in a flight to `forced`,
+    /// re-marshaling that record and passing the rest through. Returns `None` if no
+    /// ServerHello is present (e.g. the HelloVerifyRequest flight).
+    fn force_serverhello_suite(datagram: &[u8], forced: u16) -> Option<Vec<u8>> {
+        let recs = split_records(datagram).ok()?;
+        let mut out = Vec::new();
+        let mut changed = false;
+        for rec in recs {
+            if !changed
+                && rec.typ == ContentType::Handshake
+                && let Ok((hdr, payload)) = FragmentHeader::parse(&rec.fragment)
+                && hdr.typ == HandshakeType::ServerHello
+                && hdr.fragment_offset == 0
+                && let Ok(mut sh) = ServerHello::parse(payload)
+            {
+                sh.cipher_suite = forced;
+                let fragment = full_message_bytes(
+                    HandshakeType::ServerHello,
+                    hdr.message_seq,
+                    &sh.marshal_body(),
+                );
+                Record {
+                    typ: rec.typ,
+                    version: rec.version,
+                    epoch: rec.epoch,
+                    seq: rec.seq,
+                    fragment,
+                }
+                .marshal(&mut out);
+                changed = true;
+                continue;
+            }
+            rec.marshal(&mut out);
+        }
+        changed.then_some(out)
+    }
+
+    /// A man-in-the-middle transport that rewrites the server's selected suite to
+    /// `forced` on the first ServerHello it relays toward the client.
+    struct ForceSuite {
+        inner: Pipe,
+        forced: u16,
+        done: bool,
+    }
+
+    impl Transport for ForceSuite {
+        fn send(&mut self, datagram: &[u8]) -> io::Result<usize> {
+            self.inner.send(datagram)
+        }
+        fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut tmp = vec![0u8; buf.len()];
+            let n = self.inner.recv(&mut tmp)?;
+            let dg = &tmp[..n];
+            let out = if self.done {
+                dg.to_vec()
+            } else if let Some(rw) = force_serverhello_suite(dg, self.forced) {
+                self.done = true;
+                rw
+            } else {
+                dg.to_vec()
+            };
+            let m = out.len().min(buf.len());
+            buf[..m].copy_from_slice(&out[..m]);
+            Ok(m)
+        }
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            self.inner.set_read_timeout(timeout)
+        }
+    }
+
     fn pipe() -> (Pipe, Pipe) {
         let (a_tx, a_rx) = channel();
         let (b_tx, b_rx) = channel();
@@ -1378,5 +1457,34 @@ mod tests {
             client_failed || srv.join().expect("server thread"),
             "the NULL cipher must not be selectable without the opt-in"
         );
+    }
+
+    /// A malicious server (here a man-in-the-middle) that answers with a suite the
+    /// client never offered must be rejected, not silently accepted: a PSK client is
+    /// forced a ServerHello selecting the cleartext RSA_WITH_NULL_SHA256 it never put
+    /// on the wire, and must abort with the downgrade guard rather than run in clear.
+    #[test]
+    fn client_rejects_unoffered_serverhello_suite() {
+        use super::super::suites::TLS_RSA_WITH_NULL_SHA256;
+        let (cp, sp) = pipe();
+        let server = std::thread::spawn(move || {
+            // Fails once the client aborts (its pipe drops) — result ignored.
+            let _ = Conn::server(sp, test_cfg(b"sekret")).handshake();
+        });
+        let transport = ForceSuite {
+            inner: cp,
+            forced: TLS_RSA_WITH_NULL_SHA256,
+            done: false,
+        };
+        let mut c = Conn::client(transport, test_cfg(b"sekret"));
+        let err = c
+            .handshake()
+            .expect_err("client must reject a suite it did not offer");
+        assert!(
+            err.to_string().contains("did not offer"),
+            "expected the offered-suite downgrade guard, got: {err}"
+        );
+        drop(c); // close the pipe so the server's handshake errors out promptly
+        let _ = server.join();
     }
 }

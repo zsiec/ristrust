@@ -108,6 +108,12 @@ pub(crate) struct AdvDriver {
     // --- EAP-SRP authentication ---
     eap: Option<EapRole>,
     authed: bool,
+    /// Whether the EAP-SRP handshake has succeeded at least once. The Advanced
+    /// profile has no in-band re-authentication path (unlike Main's NAT-rebind
+    /// recovery), so once authenticated the session stays authed: a subsequent
+    /// (possibly forged) EAPOL frame must not regress the data gate or tear the
+    /// established session down. Only an *initial* auth failure tears down.
+    ever_authed: bool,
 
     // --- source adaptation (TR-06-4 Part 1) ---
     /// The receiver's Link Quality Message emitter, when source adaptation is on.
@@ -201,6 +207,7 @@ impl AdvDriver {
             reasm: FragReassembler::default(),
             eap,
             authed,
+            ever_authed: false,
             lqm: None,
             rate,
             on_flow_attr,
@@ -265,6 +272,7 @@ impl AdvDriver {
             reasm: FragReassembler::default(),
             eap,
             authed,
+            ever_authed: false,
             lqm,
             rate: None,
             on_flow_attr,
@@ -332,6 +340,7 @@ impl AdvDriver {
             reasm: FragReassembler::default(),
             eap,
             authed,
+            ever_authed: false,
             lqm,
             rate: None,
             on_flow_attr,
@@ -408,7 +417,11 @@ impl AdvDriver {
                 },
                 _ = keepalive.tick() => {
                     let now = self.now();
-                    if self.eap.as_ref().is_some_and(EapRole::failed) {
+                    // Only an INITIAL auth failure tears the session down. A failure
+                    // after a prior success (e.g. a forged/replayed re-auth that the
+                    // hardened EAP role rejected) must not kill an established session
+                    // — `handle_eap` keeps media gated/held instead.
+                    if !self.ever_authed && self.eap.as_ref().is_some_and(EapRole::failed) {
                         self.close.set_auth();
                         break;
                     }
@@ -928,7 +941,13 @@ impl AdvDriver {
             return;
         };
         let reply = role.recv(payload);
-        self.authed = self.eap.as_ref().is_some_and(EapRole::authenticated);
+        if self.eap.as_ref().is_some_and(EapRole::authenticated) {
+            self.ever_authed = true;
+        }
+        // Once authenticated, the gate latches: the Advanced profile has no in-band
+        // re-auth, so a (possibly forged) post-success EAPOL frame that regresses the
+        // role must not drop `authed` and stall media on an already-proven session.
+        self.authed = self.ever_authed;
         if let Some(wire) = reply {
             self.send_eapol(&wire).await;
         }

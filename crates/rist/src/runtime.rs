@@ -81,6 +81,13 @@ pub trait Runtime: Send + Sync + 'static {
     fn bind(&self, addr: SocketAddr) -> io::Result<Arc<dyn AsyncUdpSocket>>;
 }
 
+/// The UDP send and receive buffer size [`TokioRuntime`] requests on every bound
+/// socket (2 MiB), best-effort. Linux's small default UDP receive buffer (~208 KB)
+/// drops a sender's opening burst before the driver drains it, forcing
+/// retransmission and stalling startup; requesting the same 2 MiB as libRIST/ristgo
+/// avoids it. The OS may clamp to its `rmem_max`/`wmem_max`, so failures are ignored.
+const UDP_SOCKET_BUFFER_BYTES: usize = 1 << 21;
+
 /// The default [`Runtime`], backed by tokio.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioRuntime;
@@ -104,6 +111,11 @@ impl Runtime for TokioRuntime {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
         let inner = tokio::net::UdpSocket::from_std(std_sock)?;
+        // Enlarge the UDP buffers (best-effort) so a startup burst is not dropped
+        // before the driver drains it — see UDP_SOCKET_BUFFER_BYTES.
+        let sock = socket2::SockRef::from(&inner);
+        let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+        let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES);
         Ok(Arc::new(TokioUdpSocket { inner }))
     }
 }

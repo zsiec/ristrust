@@ -202,7 +202,10 @@ fn build_main_codec(cfg: &Config, ssrc: u32) -> io::Result<MainCodec> {
         key_size_256,
         cfg.virt_src_port,
         cfg.virt_dst_port,
-        false, // NPD on the send path is a later, config-gated refinement
+        // NPD on the send path (Main only; validated in Config::validate). TODO
+        // (TR-06-2 §8.6.2): when FEC lands, compute FEC over the NPD-canonicalized
+        // payload (route through suppress→expand before the FEC parity).
+        cfg.null_packet_deletion,
         ssrc,
         cname_of(cfg),
     ))

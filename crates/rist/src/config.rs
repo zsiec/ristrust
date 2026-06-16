@@ -62,6 +62,9 @@ pub enum NackType {
 /// use (the constructors do this for you).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// The bool fields are independent on/off feature flags (compression, NPD, source
+// adaptation, multicast loopback), not a state space to model as an enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     /// The profile (wire dialect).
     pub profile: Profile,
@@ -111,6 +114,11 @@ pub struct Config {
     pub srp_password: Option<String>,
     /// Enable LZ4 payload compression on the send path (Advanced profile).
     pub compression: bool,
+    /// Enable Main-profile null-packet deletion on the send path (TR-06-2 §8.6).
+    /// A sender suppresses null MPEG-TS packets and signals their positions in the
+    /// RIST NPD RTP extension, saving the bandwidth of transmitting stuffing; the
+    /// receiver reconstructs them. Main profile only. Default: off.
+    pub null_packet_deletion: bool,
     /// Make a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
     /// or an Advanced control message (index `0x0002`). Default: off.
@@ -168,6 +176,7 @@ impl Default for Config {
             srp_username: None,
             srp_password: None,
             compression: false,
+            null_packet_deletion: false,
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
@@ -264,6 +273,15 @@ impl Config {
     #[must_use]
     pub fn with_compression(mut self, on: bool) -> Config {
         self.compression = on;
+        self
+    }
+
+    /// Enables Main-profile null-packet deletion on the send path (TR-06-2 §8.6):
+    /// the sender suppresses null MPEG-TS packets and signals their positions in
+    /// the RIST NPD RTP extension, saving stuffing bandwidth. Main profile only.
+    #[must_use]
+    pub fn with_null_packet_deletion(mut self, on: bool) -> Config {
+        self.null_packet_deletion = on;
         self
     }
 
@@ -393,6 +411,9 @@ impl Config {
                 if self.compression {
                     return Err(unsupported("LZ4 compression", "Simple"));
                 }
+                if self.null_packet_deletion {
+                    return Err(unsupported("null-packet deletion", "Simple"));
+                }
             }
             Profile::Main => {
                 if self.compression {
@@ -400,7 +421,13 @@ impl Config {
                     return Err(unsupported("LZ4 compression", "Main"));
                 }
             }
-            Profile::Advanced => {}
+            Profile::Advanced => {
+                if self.null_packet_deletion {
+                    // NPD is a Main-profile (MPEG-TS-over-GRE) feature; the Advanced
+                    // profile carries an opaque media payload.
+                    return Err(unsupported("null-packet deletion", "Advanced"));
+                }
+            }
         }
         // Multicast field-level checks (address-dependent checks — e.g. an SSM
         // source on a unicast bind — happen at socket construction, where the
@@ -511,6 +538,29 @@ mod tests {
             Config::default()
                 .with_profile(Profile::Main)
                 .with_secret("x")
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_gates_null_packet_deletion_to_main() {
+        // NPD is a Main-profile feature; rejected (not silently ignored) elsewhere.
+        assert!(matches!(
+            Config::default().with_null_packet_deletion(true).validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            Config::default()
+                .with_profile(Profile::Advanced)
+                .with_null_packet_deletion(true)
+                .validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(
+            Config::default()
+                .with_profile(Profile::Main)
+                .with_null_packet_deletion(true)
                 .validate()
                 .is_ok()
         );

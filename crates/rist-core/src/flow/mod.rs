@@ -83,6 +83,14 @@ pub struct Config {
     pub rtt_min: Micros,
     /// Upper clamp applied to measured RTT.
     pub rtt_max: Micros,
+    /// libRIST's `recovery_rtt_multiplier` (default 7): the factor by which the
+    /// receiver scales its smoothed RTT when dynamically auto-sizing the recovery
+    /// (playout) buffer. Consumed only when the buffer is windowed
+    /// (`recovery_buffer_min != recovery_buffer_max`) and the peer has advertised a
+    /// sender max via buffer negotiation; otherwise the buffer stays the static
+    /// midpoint and this is unused. `0` disables auto-scaling. See the receiver's
+    /// `auto_scale_buffer` (libRIST `_librist_receiver_buffer_calc`).
+    pub rtt_multiplier: u32,
     /// Minimum number of retransmission requests before giving up.
     pub min_retries: u32,
     /// Maximum number of retransmission requests before giving up.
@@ -121,6 +129,7 @@ impl Config {
             reorder_buffer: Micros::from_millis(15),
             rtt_min: Micros::from_millis(5),
             rtt_max: Micros::from_millis(500),
+            rtt_multiplier: 7,
             min_retries: 6,
             max_retries: 20,
             ring_size: DEFAULT_RING_SIZE,
@@ -376,6 +385,12 @@ impl Flow {
                             id: TimerId::RttEcho,
                             deadline: now + RTT_ECHO_INTERVAL,
                         });
+                        // Re-size the recovery buffer on this guaranteed ~100 ms
+                        // receiver heartbeat (libRIST recomputes on a periodic timer,
+                        // not on echo receipt), so it keeps adapting to loss even if
+                        // echo responses stop arriving. A no-op unless the buffer is
+                        // windowed and a sender max has been negotiated.
+                        self.auto_scale_buffer();
                     }
                 }
             },

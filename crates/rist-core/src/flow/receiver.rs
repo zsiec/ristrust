@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use super::{Event, Flow, NACK_CADENCE, Output, RTT_ECHO_INTERVAL, TimerId};
+use super::{Event, Flow, NACK_CADENCE, Output, RTT_ECHO_INTERVAL, Role, TimerId, mul_1_1};
 use crate::clock::{Micros, Ntp64, Timestamp};
 use crate::seq::{self, Seq32};
 use crate::wire::{Feedback, FragRole, MediaPacket};
@@ -132,6 +132,19 @@ pub(super) struct ReceiverState {
     pub(super) playout_armed: bool,
     playout_deadline: Timestamp,
     pub(super) nack_armed: bool,
+
+    /// Recovery-buffer auto-scaling state (libRIST `_librist_receiver_buffer_calc`),
+    /// active only when the buffer is windowed (`recovery_buffer_min !=
+    /// recovery_buffer_max`) and a sender max has been learned via buffer
+    /// negotiation. `sender_max_buffer` is libRIST's `sender_max_buffer_ticks` (the
+    /// largest buffer the sender retains for retransmission, so the receiver never
+    /// sizes past what can be recovered); `0` means not yet learned, holding the
+    /// static midpoint. `loss_snap`/`recovered_snap` hold the cumulative
+    /// `lost`/`recovered` counters at the previous recalc, so the loss-growth
+    /// modifier sees the per-period delta.
+    sender_max_buffer: Micros,
+    loss_snap: u64,
+    recovered_snap: u64,
 }
 
 impl ReceiverState {
@@ -154,6 +167,9 @@ impl ReceiverState {
             playout_armed: false,
             playout_deadline: Timestamp::ZERO,
             nack_armed: false,
+            sender_max_buffer: Micros::ZERO,
+            loss_snap: 0,
+            recovered_snap: 0,
         }
     }
 
@@ -182,6 +198,21 @@ impl std::fmt::Debug for ReceiverState {
 fn path_bit(path: u8) -> u64 {
     1u64 << (path & 63)
 }
+
+/// Recovery-buffer auto-scaling tuning (libRIST `_librist_receiver_buffer_calc`'s
+/// "magic numbers", which its own comment notes "still need tuning"): the cap on how
+/// much the auto-scaled buffer may shrink per recalc, so a transient RTT dip cannot
+/// abruptly collapse the playout deadline and shed packets still in flight.
+const BUFFER_DECREASE_STEP: Micros = Micros::from_millis(50);
+/// Per-period buffer-growth weight per lost packet (libRIST +5%).
+const BUFFER_GROWTH_PER_LOST: f64 = 0.05;
+/// Per-period buffer-growth weight per recovered packet (libRIST +2%; ristgo folds
+/// libRIST's `recovered_3nack`/`recovered_morenack` classes into one delta at this
+/// weight, erring slightly toward a larger buffer — the safe direction).
+const BUFFER_GROWTH_PER_RECOVERED: f64 = 0.02;
+/// Per-period lost count above which the receiver jumps straight to the sender's max
+/// buffer (libRIST `has_high_loss`).
+const BUFFER_HIGH_LOSS_THRESHOLD: u64 = 25;
 
 impl Flow {
     /// Maps a packet's NTP-64 source timestamp into the local clock domain using
@@ -332,6 +363,110 @@ impl Flow {
         r.pending_discontinuity = false;
         r.playout_armed = false;
         r.nack_armed = false;
+    }
+
+    /// Records the maximum buffer the peer retains as a sender (libRIST
+    /// `sender_max_buffer_ticks`), learned from an inbound buffer-negotiation
+    /// message. It enables receiver-side recovery-buffer auto-scaling, which never
+    /// sizes the playout buffer past what the sender can retransmit. A value below
+    /// `recovery_buffer_min` disables negotiation (the receiver falls back to the
+    /// static midpoint). Receiver-role only.
+    pub fn set_sender_max_buffer(&mut self, max_buffer: Micros) {
+        if self.role != Role::Receiver {
+            return;
+        }
+        if max_buffer.as_micros() < self.cfg.recovery_buffer_min.as_micros() {
+            self.receiver.sender_max_buffer = Micros::ZERO;
+            return;
+        }
+        if self.receiver.sender_max_buffer.as_micros() == 0 {
+            // Activation: baseline the loss counters so the first recalc's modifier
+            // measures loss over the period since auto-scaling turned on, not all
+            // loss since the flow started (which would spuriously trip the high-loss
+            // jump after a lossy startup/handshake).
+            self.receiver.loss_snap = self.stats.lost;
+            self.receiver.recovered_snap = self.stats.recovered;
+        }
+        self.receiver.sender_max_buffer = max_buffer;
+    }
+
+    /// The receiver's current recovery (playout) buffer — the static midpoint until
+    /// auto-scaling activates, then the dynamically sized value. The host reads it to
+    /// advertise the receiver's buffer back to the sender via buffer negotiation. It
+    /// is the live value the too-late and NACK-abandon thresholds use.
+    #[must_use]
+    pub fn current_recovery_buffer(&self) -> Micros {
+        self.recovery_buffer
+    }
+
+    /// Recomputes the recovery (playout) buffer from the smoothed RTT and recent
+    /// loss, porting libRIST's `_librist_receiver_buffer_calc`. It runs only for a
+    /// receiver with a windowed buffer (`recovery_buffer_min != recovery_buffer_max`),
+    /// a positive `rtt_multiplier`, and a sender max learned via buffer negotiation;
+    /// otherwise the static midpoint set in [`Flow::new`] stands. Called on the
+    /// receiver's periodic RTT-echo timer (~100 ms), so the loss-growth modifier sees
+    /// the loss accrued over that period and the buffer keeps adapting even if echo
+    /// responses stop arriving.
+    ///
+    /// The deadline of an already-buffered packet is fixed at its insertion (each
+    /// slot stores its own `output_time`), so changing the buffer here only affects
+    /// packets inserted afterward and the live too-late / NACK-abandon thresholds —
+    /// never retroactively re-dating a packet, which preserves the in-order /
+    /// no-late-delivery invariants. Growth is unbounded within `[min, max]`; shrink is
+    /// rate-limited.
+    #[allow(clippy::cast_precision_loss)]
+    pub(super) fn auto_scale_buffer(&mut self) {
+        if self.role != Role::Receiver || self.cfg.rtt_multiplier == 0 {
+            return;
+        }
+        if self.cfg.recovery_buffer_min.as_micros() == self.cfg.recovery_buffer_max.as_micros() {
+            return;
+        }
+        let sender_max = self.receiver.sender_max_buffer.as_micros();
+        if sender_max <= 0 {
+            // Auto-scaling activates only once the sender advertises the buffer it
+            // retains; until then the receiver holds the static midpoint.
+            return;
+        }
+
+        // desired = smoothedRTT * multiplier + reorder. The smoothed RTT is read
+        // unclamped, as libRIST does here (the [rtt_min, rtt_max] clamp paces NACK
+        // retries, not buffer sizing).
+        let mut desired = self.est.smoothed().as_micros() * i64::from(self.cfg.rtt_multiplier)
+            + self.cfg.reorder_buffer.as_micros();
+
+        // Loss-driven growth over the period since the last recalc.
+        let lost_delta = self.stats.lost - self.receiver.loss_snap;
+        let recovered_delta = self.stats.recovered - self.receiver.recovered_snap;
+        let modifier = 1.0
+            + lost_delta as f64 * BUFFER_GROWTH_PER_LOST
+            + recovered_delta as f64 * BUFFER_GROWTH_PER_RECOVERED;
+        desired = (desired as f64 * modifier) as i64;
+        if lost_delta > BUFFER_HIGH_LOSS_THRESHOLD {
+            // Heavy loss: jump straight to the largest buffer the sender supports.
+            desired = sender_max;
+        }
+
+        // Rate-limit the decrease so a brief RTT dip cannot collapse the deadline.
+        let cur = self.recovery_buffer.as_micros();
+        if desired < cur && cur - desired > BUFFER_DECREASE_STEP.as_micros() {
+            desired = cur - BUFFER_DECREASE_STEP.as_micros();
+        }
+
+        // Clamp to the configured window, then to what the sender retains.
+        desired = desired.clamp(
+            self.cfg.recovery_buffer_min.as_micros(),
+            self.cfg.recovery_buffer_max.as_micros(),
+        );
+        if desired > sender_max {
+            desired = sender_max;
+        }
+
+        let desired = Micros::from_micros(desired);
+        self.recovery_buffer = desired;
+        self.recovery_buffer_110 = mul_1_1(desired);
+        self.receiver.loss_snap = self.stats.lost;
+        self.receiver.recovered_snap = self.stats.recovered;
     }
 
     /// First-packet initialization (libRIST `receiver_enqueue` empty-queue
@@ -690,12 +825,165 @@ impl Flow {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::{Slot, SlotState};
-    use crate::clock::Timestamp;
+    use crate::clock::{Micros, Timestamp};
     use crate::flow::testutil::{
         TEST_SSRC, delivered_seqs, drain_events, drain_outputs, mk_pkt, src_ntp,
     };
     use crate::flow::{Config, Event, Flow, Output, Role, TimerId};
+    use crate::rtt::Estimator;
     use crate::wire::Feedback;
+
+    /// A millisecond duration in the core's `Micros` unit.
+    fn ms(n: i64) -> Micros {
+        Micros::from_micros(n * 1000)
+    }
+
+    /// A receiver flow with a windowed recovery buffer (`min != max`) so dynamic
+    /// auto-scaling is eligible. Static midpoint is `(1000-200)/2 + 200 = 600 ms`.
+    fn windowed_recv() -> Flow {
+        let mut cfg = Config::librist_defaults();
+        cfg.recovery_buffer_min = ms(200);
+        cfg.recovery_buffer_max = ms(1000);
+        cfg.reorder_buffer = ms(15);
+        cfg.rtt_multiplier = 7;
+        Flow::new(Role::Receiver, cfg)
+    }
+
+    /// Runs the auto-scaler to a steady value (the decrease is rate-limited to 50 ms
+    /// per recalc, so a fall takes several recalcs; with no fresh loss the modifier
+    /// is 1 and the buffer steps monotonically to its clamp).
+    fn converge(f: &mut Flow) {
+        let mut prev = -1;
+        for _ in 0..64 {
+            if f.recovery_buffer.as_micros() == prev {
+                break;
+            }
+            prev = f.recovery_buffer.as_micros();
+            f.auto_scale_buffer();
+        }
+    }
+
+    #[test]
+    fn auto_scale_buffer_librist_calc() {
+        // No sender max learned: holds the static midpoint.
+        let mut f = windowed_recv();
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(600).as_micros(),
+            "no sender max"
+        );
+
+        // Scales to smoothedRTT*multiplier + reorder = 100*7 + 15 = 715 ms, and the
+        // 1.1x threshold tracks it.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(715).as_micros(),
+            "rtt*mult+reorder"
+        );
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let want110 = (ms(715).as_micros() as f64 * 1.1) as i64;
+        assert_eq!(
+            f.recovery_buffer_110.as_micros(),
+            want110,
+            "110 must track dynamic buffer"
+        );
+
+        // Clamps up to buffer_min (20*7+15 = 155 ms, below the 200 ms floor).
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(20));
+        converge(&mut f);
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(200).as_micros(),
+            "clamp to min"
+        );
+
+        // Clamps down to the sender max (715 desired, sender retains only 500).
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(500));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(500).as_micros(),
+            "clamp to sender max"
+        );
+
+        // A sender max below buffer_min disables scaling.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(100));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(600).as_micros(),
+            "sender max < min disables"
+        );
+
+        // Loss grows the buffer: 5 lost -> modifier 1 + 5*0.05 = 1.25.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(50)); // base 50*7+15 = 365 ms
+        converge(&mut f);
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(365).as_micros(),
+            "loss-free base"
+        );
+        f.stats.lost += 5;
+        f.auto_scale_buffer();
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let want = (ms(365).as_micros() as f64 * 1.25) as i64;
+        assert_eq!(f.recovery_buffer.as_micros(), want, "loss-grown");
+
+        // Heavy loss (> 25 this period) jumps straight to the sender max.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(900));
+        f.est = Estimator::new(ms(50));
+        f.auto_scale_buffer(); // snapshot
+        f.stats.lost += 30;
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(900).as_micros(),
+            "high-loss jump"
+        );
+
+        // Decrease is rate-limited to 50 ms per recalc.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(100)); // 715 ms
+        f.auto_scale_buffer();
+        f.est = Estimator::new(ms(20)); // desired falls to 155 -> clamp 200, a 515 ms drop
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(665).as_micros(),
+            "decrease capped at 50ms"
+        );
+
+        // A non-windowed buffer (min == max) never scales.
+        let mut cfg = Config::librist_defaults();
+        cfg.recovery_buffer_min = ms(500);
+        cfg.recovery_buffer_max = ms(500);
+        cfg.rtt_multiplier = 7;
+        let mut f = Flow::new(Role::Receiver, cfg);
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(500).as_micros(),
+            "non-windowed never scales"
+        );
+    }
 
     fn ts(us: u64) -> Timestamp {
         Timestamp::from_micros(us)

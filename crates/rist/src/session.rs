@@ -120,6 +120,7 @@ fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
         reorder_buffer: dur_to_micros(cfg.reorder_buffer),
         rtt_min,
         rtt_max,
+        rtt_multiplier: cfg.rtt_multiplier,
         min_retries: cfg.min_retries,
         max_retries: cfg.max_retries,
         ring_size: 0, // 0 selects the default 2^16 ring

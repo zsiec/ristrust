@@ -22,18 +22,20 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use rist_codec::eap;
-use rist_codec::gre;
 use rist_codec::rtcp::{EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
+use rist_codec::{eap, fec_header, gre, rtp};
 use rist_core::clock::Timestamp;
+use rist_core::fec::{Direction, Recovered};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
-use rist_core::wire::Feedback;
+use rist_core::wire::{Feedback, FragRole, MediaPacket};
 
 use crate::bonding::Group;
+use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
 use crate::driver_main::EapRole;
+use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
 use crate::stats::StatsCell;
@@ -48,10 +50,22 @@ const PASSPHRASE_PUSH_ID: u8 = 0x40;
 /// The depth of the shared inbound channel the per-path readers feed.
 const INBOUND_CAPACITY: usize = 256;
 
-/// One inbound datagram, tagged with the path it arrived on.
+/// Whether an inbound datagram arrived on a path's GRE (media/control) socket or one
+/// of its separate-port FEC sockets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundKind {
+    /// The GRE socket: media, control, keepalive, or EAPOL.
+    Main,
+    /// A separate-port FEC socket (column or row): an RTP-wrapped FEC packet.
+    Fec,
+}
+
+/// One inbound datagram, tagged with the path it arrived on and its socket kind.
 struct Inbound {
     /// The path index (0-based, matching the [`Group`] registration).
     index: u8,
+    /// Which of the path's sockets it arrived on.
+    kind: InboundKind,
     /// The datagram's source address.
     src: SocketAddr,
     /// The datagram bytes.
@@ -124,6 +138,17 @@ pub(crate) struct BondedDriver {
     data_out: Option<mpsc::Sender<Bytes>>,
     /// The media SSRC learned from the first inbound packet (one stream, any path).
     learned_ssrc: Option<u32>,
+
+    // --- forward error correction (TR-06-2 §8.4, separate-port over bonding) ---
+    /// One shared FEC engine across all paths: the sender clips each first-tx payload
+    /// once and fans the FEC across the paths; every path's media and FEC feed the one
+    /// decoder, which dedups the 2022-7 duplication and recovers loss that struck every
+    /// path at once. `None` when FEC is off.
+    fec: Option<FecState>,
+    /// The weighted path the most recent media datagram was routed to, reused for that
+    /// datagram's FEC fan (so FEC follows media without spending a second rotation
+    /// credit). `None` for full-redundancy (every path is a duplicate target).
+    last_weighted: Option<u8>,
 }
 
 impl BondedDriver {
@@ -142,6 +167,7 @@ impl BondedDriver {
         keepalive: Duration,
         start_seq: u32,
         weight_rx: mpsc::Receiver<(u8, u32)>,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -169,6 +195,8 @@ impl BondedDriver {
             ssrc,
             data_out: None,
             learned_ssrc: None,
+            fec,
+            last_weighted: None,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -185,6 +213,7 @@ impl BondedDriver {
         mac: [u8; 6],
         bitmask: bool,
         keepalive: Duration,
+        fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -212,6 +241,8 @@ impl BondedDriver {
             ssrc,
             data_out: Some(tx),
             learned_ssrc: None,
+            fec,
+            last_weighted: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -315,6 +346,12 @@ impl BondedDriver {
         if i >= self.paths.len() {
             return;
         }
+        // A separate-port FEC datagram bypasses the GRE demux and feeds the shared FEC
+        // decoder directly (liveness rides on the GRE socket's media/control).
+        if inb.kind == InboundKind::Fec {
+            self.on_bond_fec(now, &inb.data).await;
+            return;
+        }
         self.paths[i].peer.learn_media(inb.src);
         self.paths[i].peer.observe(now);
         self.group.observe(inb.index, now);
@@ -352,9 +389,28 @@ impl BondedDriver {
                     if self.learned_ssrc.is_none() {
                         self.learned_ssrc = Some(pkt.ssrc);
                     }
+                    // FEC over the inner RTP payload: feed it (keyed on the raw wire
+                    // timestamp) to the shared decoder, which dedups copies from the
+                    // other paths by sequence, before the flow takes the payload.
+                    let fec_input = self.fec.is_some().then(|| {
+                        (
+                            pkt.seq,
+                            self.paths[i].codec.last_wire_ts(),
+                            pkt.ssrc,
+                            pkt.payload.clone(),
+                        )
+                    });
                     // Feed on this path's index: the one ring dedups copies from the
                     // other paths by `(seq, source_time)`.
                     self.flow.feed(now, inb.index, pkt);
+                    if let Some((seq, wts, ssrc, payload)) = fec_input {
+                        let recovered = self
+                            .fec
+                            .as_mut()
+                            .unwrap()
+                            .recv_media(seq, wts, FEC_PT, ssrc, payload);
+                        self.feed_fec_recovered(now, recovered);
+                    }
                 }
                 Ok(Decoded::Feedback(fbs)) => {
                     for fb in fbs {
@@ -389,8 +445,16 @@ impl BondedDriver {
                     // Weighted load-share: route this datagram to one elected weighted
                     // path (disjoint from the duplicate paths above, so no path is sent
                     // it twice), splitting the stream in proportion to the weights.
-                    if let Some(idx) = self.group.select_weighted(now) {
+                    let weighted = self.group.select_weighted(now);
+                    self.last_weighted = weighted;
+                    if let Some(idx) = weighted {
                         self.send_media_on(idx as usize, &pkt).await;
+                    }
+                    // FEC follows the same fan as media (every duplicate path plus the
+                    // elected weighted path): the receiver's one decoder dedups the
+                    // duplication and recovers loss that struck every path at once.
+                    if self.fec.is_some() && !pkt.retransmit {
+                        self.send_bond_fec(now, &pkt).await;
                     }
                 }
                 Output::SendFeedback { fb, .. } => fbs.push(fb),
@@ -412,9 +476,124 @@ impl BondedDriver {
                 return; // the application Receiver was dropped
             }
         }
-        // FEC over bonding is not yet wired (the bonded driver carries no FEC engine),
-        // so the FEC-recovered count is 0 here. See the WP18f note.
-        self.stats.publish(self.flow.stats(), 0);
+        self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
+    fn fec_recovered(&self) -> u64 {
+        self.fec.as_ref().map_or(0, FecState::recovered)
+    }
+
+    /// Clips one first-transmission media packet's (NPD-canonicalized) inner RTP
+    /// payload into the shared FEC matrix and fans any completed FEC packets — RTP-
+    /// wrapped (PT 127) on the column (path media + 2) / row (+ 4) ports — across the
+    /// same paths the media went to (every live duplicate path plus the elected
+    /// weighted path). The receiver's one decoder dedups the cross-path duplication.
+    async fn send_bond_fec(&mut self, now: Timestamp, pkt: &MediaPacket) {
+        // The FEC payload canonicalization (NPD §8.6.2) is config-driven, identical on
+        // every path; use path 0's codec.
+        let fpay = self.paths[0].codec.fec_payload(&pkt.payload);
+        let ts = codec::rtp_ts_from_source(pkt.source_time);
+        let variant = self
+            .fec
+            .as_ref()
+            .expect("fec present (checked by caller)")
+            .variant();
+        let fps = self
+            .fec
+            .as_mut()
+            .expect("fec present (checked by caller)")
+            .clip(pkt.seq, ts, FEC_PT, &fpay);
+        if fps.is_empty() {
+            return;
+        }
+        // The fan set: every live duplicate target plus the weighted path this media
+        // datagram was routed to (reused, not re-elected, to avoid spending a credit).
+        let mut targets = self.group.duplicate_targets(now);
+        if let Some(w) = self.last_weighted
+            && !targets.contains(&w)
+        {
+            targets.push(w);
+        }
+        let ssrc = self.ssrc;
+        for fp in &fps {
+            let (rtp_seq, port_off) = match fp.direction {
+                Direction::Column => (
+                    self.fec.as_mut().unwrap().next_col_seq(),
+                    FEC_COLUMN_PORT_OFFSET,
+                ),
+                Direction::Row => (
+                    self.fec.as_mut().unwrap().next_row_seq(),
+                    FEC_ROW_PORT_OFFSET,
+                ),
+            };
+            let rtp_pkt = rtp::Packet {
+                header: rtp::Header {
+                    version: rtp::VERSION,
+                    payload_type: FEC_PT,
+                    sequence_number: rtp_seq,
+                    ssrc,
+                    ..rtp::Header::default()
+                },
+                payload: fec_header::encode(fp, variant),
+                padding_size: 0,
+            };
+            let Ok(bytes) = rtp_pkt.encode() else {
+                continue;
+            };
+            for &idx in &targets {
+                let i = idx as usize;
+                if i >= self.paths.len() || !self.paths[i].authed {
+                    continue;
+                }
+                let Some(media_dst) = self.paths[i].peer.media() else {
+                    continue;
+                };
+                let mut dst = media_dst;
+                dst.set_port(media_dst.port().wrapping_add(port_off));
+                let sock = self.paths[i].socket.clone();
+                if let Err(e) = sock.send(&bytes, dst).await {
+                    tracing::debug!(path = i, "rist: bonded send fec failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Handles one inbound separate-port FEC datagram (from any path): strips the RTP
+    /// wrapper to the FEC body, feeds it to the shared decoder, and re-injects any
+    /// recovered packet into the flow.
+    async fn on_bond_fec(&mut self, now: Timestamp, data: &[u8]) {
+        let Ok(p) = rtp::Packet::decode(&Bytes::copy_from_slice(data)) else {
+            return;
+        };
+        if self.fec.is_some() {
+            let recovered = self.fec.as_mut().unwrap().recv_fec(&p.payload);
+            self.feed_fec_recovered(now, recovered);
+        }
+        self.drain(now).await;
+    }
+
+    /// Re-injects FEC-recovered packets into the flow as media, reconstructing each
+    /// source time (non-advancing) from the recovered RTP timestamp. The mapping is
+    /// timestamp-based and path-independent within the window, so path 0's codec
+    /// suffices regardless of which path the FEC arrived on.
+    fn feed_fec_recovered(&mut self, now: Timestamp, recovered: Vec<Recovered>) {
+        for r in recovered {
+            let source_time = self.paths[0].codec.fec_source_time(r.timestamp);
+            self.flow.feed(
+                now,
+                0,
+                MediaPacket {
+                    seq: r.seq,
+                    source_time,
+                    ssrc: r.ssrc,
+                    payload: r.payload,
+                    retransmit: false,
+                    path_id: 0,
+                    frag: FragRole::Standalone,
+                },
+            );
+        }
     }
 
     /// Encodes and transmits one media packet on path `i`, if it is addressed and
@@ -666,16 +845,34 @@ fn spawn_reader(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];
-        // The loop exits when the socket errors (the `while let` guard) or the
-        // driver drops the channel (the inner `break`).
-        while let Ok((n, src)) = socket.recv(&mut buf).await {
-            let inb = Inbound {
-                index,
-                src,
-                data: Bytes::copy_from_slice(&buf[..n]),
-            };
-            if tx.send(inb).await.is_err() {
-                break; // the driver has shut down
+        let mut col_buf = vec![0u8; RECV_BUF];
+        let mut row_buf = vec![0u8; RECV_BUF];
+        // The loop exits when the GRE socket errors (fatal for this path) or the driver
+        // drops the channel. The separate-port FEC sockets pend forever when unbound (a
+        // sender, or a receiver without FEC), so those arms are then no-ops.
+        loop {
+            tokio::select! {
+                r = socket.recv(&mut buf) => match r {
+                    Ok((n, src)) => {
+                        let inb = Inbound { index, kind: InboundKind::Main, src, data: Bytes::copy_from_slice(&buf[..n]) };
+                        if tx.send(inb).await.is_err() {
+                            break; // the driver has shut down
+                        }
+                    }
+                    Err(_) => break,
+                },
+                r = socket.recv_fec_col(&mut col_buf) => if let Ok((n, src)) = r {
+                    let inb = Inbound { index, kind: InboundKind::Fec, src, data: Bytes::copy_from_slice(&col_buf[..n]) };
+                    if tx.send(inb).await.is_err() {
+                        break;
+                    }
+                },
+                r = socket.recv_fec_row(&mut row_buf) => if let Ok((n, src)) = r {
+                    let inb = Inbound { index, kind: InboundKind::Fec, src, data: Bytes::copy_from_slice(&row_buf[..n]) };
+                    if tx.send(inb).await.is_err() {
+                        break;
+                    }
+                },
             }
         }
     })

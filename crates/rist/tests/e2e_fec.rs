@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rist::{
     AsyncUdpSocket, Config, FecConfig, FecVariant, Profile, Receiver, Runtime, TokioRuntime,
-    dial_with, listen,
+    dial_bonded_with, dial_with, listen, listen_bonded,
 };
 
 /// The media index dropped in every recovery test — a row-interior packet, mid-stream
@@ -317,6 +317,102 @@ async fn main_fec_with_npd_recovers_a_dropped_frame() {
         .with_buffer(Duration::from_millis(500))
         .with_fec(fec_2d());
     run_fec_recovery(cfg, ts_frames(64), port_media_pred).await;
+}
+
+/// Binds an `n`-path bonded receiver on distinct OS-chosen even ports (FEC needs the
+/// +2/+4 ports per path free), returning the receiver and the path address strings.
+async fn listen_free_bonded(cfg: &Config, n: usize) -> (Receiver, Vec<String>) {
+    'attempt: for _ in 0..64 {
+        let mut ports = Vec::with_capacity(n);
+        for _ in 0..n {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+            let mut p = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            if !p.is_multiple_of(2) {
+                p = p.wrapping_sub(1);
+            }
+            if p < 2 || ports.contains(&p) {
+                continue 'attempt;
+            }
+            ports.push(p);
+        }
+        let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+        let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        if let Ok(r) = listen_bonded(&refs, cfg.clone()).await {
+            return (r, addrs);
+        }
+    }
+    panic!("no free ports for the bonded receiver");
+}
+
+/// Drops both copies (every path) of media sequence [`DROP_AT`] — a correlated loss
+/// 2022-7 duplication cannot cover. The sender fans each sequence to both paths
+/// consecutively, so the two datagrams of sequence K are at media-count 2K and 2K+1.
+fn bonded_correlated_pred(media_ports: Vec<u16>) -> DropPred {
+    let seen = Arc::new(AtomicU64::new(0));
+    Arc::new(move |_buf: &[u8], dst: SocketAddr| {
+        if media_ports.contains(&dst.port()) {
+            let n = seen.fetch_add(1, Ordering::Relaxed);
+            return n == 2 * DROP_AT || n == 2 * DROP_AT + 1;
+        }
+        false
+    })
+}
+
+#[tokio::test]
+async fn bonded_fec_recovers_correlated_loss() {
+    // The case bonding alone cannot handle: a media sequence lost on EVERY path at
+    // once. 2022-7 duplication has no surviving copy, so only FEC (fanned across the
+    // same paths, feeding the one shared decoder) can recover it. One-way (no ARQ).
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_one_way(true)
+        .with_buffer(Duration::from_millis(500))
+        .with_fec(fec_2d());
+    let (mut receiver, addrs) = listen_free_bonded(&cfg, 2).await;
+    let media_ports: Vec<u16> = addrs
+        .iter()
+        .map(|a| a.parse::<SocketAddr>().expect("addr").port())
+        .collect();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let rt = DropRuntime {
+        pred: bonded_correlated_pred(media_ports),
+        dropped: Arc::clone(&dropped),
+    };
+    let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let sender = dial_bonded_with(&refs, cfg.clone(), &rt)
+        .await
+        .expect("dial the bonded receiver");
+
+    let payloads = text_payloads(64, "bonded-fec");
+    let send_payloads = payloads.clone();
+    let send_task = tokio::spawn(async move {
+        for p in &send_payloads {
+            sender.send(p).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sender
+    });
+    for (i, want) in payloads.iter().enumerate() {
+        let got = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}: bonded FEC did not converge"))
+            .expect("session open");
+        assert_eq!(got.as_ref(), want.as_slice(), "payload {i}");
+    }
+    assert!(
+        dropped.load(Ordering::Relaxed) >= 2,
+        "the correlated pair (both paths) was not dropped — test not exercised"
+    );
+    let stats = receiver.stats();
+    assert!(
+        stats.fec_recovered >= 1,
+        "bonded FEC recovery not counted: {stats:?}"
+    );
+    let sender = send_task.await.expect("send task");
+    sender.close().await.ok();
+    receiver.close().await.expect("close receiver");
 }
 
 #[tokio::test]

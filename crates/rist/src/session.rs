@@ -694,6 +694,7 @@ pub(crate) fn build_bonded_sender(
         cfg.keepalive_interval,
         start_seq,
         weight_rx,
+        build_fec(cfg),
     );
     Ok(SenderSpawned {
         local,
@@ -728,9 +729,17 @@ pub(crate) fn build_bonded_receiver(
     let mut bound = None;
     for (i, &local) in locals.iter().enumerate() {
         let membership = crate::multicast::receiver_membership(cfg, local)?;
-        let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+        let mut socket = MainSocket::listen(rt, local, membership.as_ref())?;
+        let path_local = socket.local()?;
         if bound.is_none() {
-            bound = Some(socket.local()?);
+            bound = Some(path_local);
+        }
+        // Separate-port FEC over bonding: each path binds its own column/row FEC
+        // sockets, all feeding the one shared decoder.
+        if let Some(f) = &cfg.fec
+            && f.resolved_separate_ports(cfg.profile)
+        {
+            socket.bind_fec(rt, path_local, membership.as_ref(), !f.column_only)?;
         }
         let peer = Peer::new(dur_to_micros(cfg.session_timeout));
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
@@ -761,6 +770,7 @@ pub(crate) fn build_bonded_receiver(
         flow_mac(DEFAULT_FLOW_SSRC),
         bitmask_of(cfg),
         cfg.keepalive_interval,
+        build_fec(cfg),
     );
     Ok(ReceiverSpawned {
         local: bound,

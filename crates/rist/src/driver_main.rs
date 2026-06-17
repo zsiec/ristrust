@@ -51,6 +51,12 @@ const REBIND_MAX_ATTEMPTS: u32 = 10;
 /// `REBIND_BACKOFF_CAP × session_timeout`.
 const REBIND_BACKOFF_CAP: u32 = 10;
 
+/// The maximum consecutive keepalive-driven EAP retransmits with no inbound EAP frame
+/// before a stalled handshake is abandoned (re-armed whenever the peer advances the
+/// exchange). At the 1 s default keepalive this is a generous multi-round-trip budget,
+/// far more than a handshake needs even at heavy loss.
+const EAP_MAX_RETX: u32 = 16;
+
 /// One inbound Main-profile datagram, tagged with the socket it arrived on. The pump
 /// drains these from a channel (the injected-feed seam): a single-flow driver fills it
 /// from its own reader task; a multi-flow [`MultiReceiver`](crate::multi) fills many
@@ -219,6 +225,15 @@ pub(crate) struct MainDriver {
     /// the START exactly once). A forced re-auth re-opens via [`start_reauth`](Self::start_reauth),
     /// not this latch.
     eap_start_sent: bool,
+    /// The last EAP frame transmitted (EAPOL-START or a handshake reply), retransmitted
+    /// on the keepalive tick until the handshake authenticates. EAP frames are not
+    /// ARQ-protected, so without this a single dropped handshake datagram would deadlock
+    /// authentication; the peer's [`recv`](rist_codec::eap::Authenticatee::recv) replays
+    /// its reply idempotently, so a retransmit cannot desync the SRP exchange.
+    eap_last_tx: Option<Vec<u8>>,
+    /// Consecutive keepalive-driven EAP retransmits with no intervening inbound EAP
+    /// frame; reset whenever the peer sends one. Caps a stalled handshake.
+    eap_retx: u32,
 
     // --- source adaptation (TR-06-4 Part 1) ---
     /// The receiver's Link Quality Message emitter, when source adaptation is on.
@@ -314,6 +329,8 @@ impl MainDriver {
             reauthing: false,
             reauth_deadline: Timestamp::ZERO,
             eap_start_sent: false,
+            eap_last_tx: None,
+            eap_retx: 0,
             lqm: None,
             rate,
             fec,
@@ -386,6 +403,8 @@ impl MainDriver {
             reauthing: false,
             reauth_deadline: Timestamp::ZERO,
             eap_start_sent: false,
+            eap_last_tx: None,
+            eap_retx: 0,
             lqm,
             rate: None,
             fec,
@@ -458,6 +477,8 @@ impl MainDriver {
             reauthing: false,
             reauth_deadline: Timestamp::ZERO,
             eap_start_sent: false,
+            eap_last_tx: None,
+            eap_retx: 0,
             lqm,
             rate: None,
             fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
@@ -574,6 +595,29 @@ impl MainDriver {
                         if !self.maybe_rebind_caller(now) {
                             self.close.set_session_timeout();
                             break;
+                        }
+                    }
+                    // Retransmit the outstanding EAP frame until the handshake
+                    // authenticates. EAP-SRP frames are not ARQ-protected, so without this
+                    // a single dropped handshake datagram deadlocks auth under loss; the
+                    // peer replays its reply idempotently, so a retransmit never desyncs
+                    // the SRP exchange. Runs during the initial handshake AND a re-auth
+                    // (media held either way). A stalled handshake that never advances is
+                    // abandoned at the retry cap: an initial failure tears the session
+                    // down; a re-auth is already bounded by `reauth_deadline`.
+                    if !self.authed
+                        && self.eap.is_some()
+                        && self.peer.media().is_some()
+                        && let Some(frame) = self.eap_last_tx.clone()
+                    {
+                        if self.eap_retx >= EAP_MAX_RETX {
+                            if !self.ever_authed {
+                                self.close.set_auth();
+                                break;
+                            }
+                        } else {
+                            self.eap_retx += 1;
+                            self.send_eapol(&frame).await;
                         }
                     }
                     // Periodic keepalive — suppressed during a re-auth: the peer tuple is
@@ -1156,6 +1200,10 @@ impl MainDriver {
         };
         self.send_eapol(&start).await;
         self.eap_start_sent = true;
+        // Arm retransmission: the EAPOL-START is re-sent on the keepalive tick until the
+        // handshake authenticates, so a dropped START cannot deadlock auth.
+        self.eap_last_tx = Some(start);
+        self.eap_retx = 0;
     }
 
     /// Drives the EAP role with one received EAP payload, transmitting any reply
@@ -1166,6 +1214,8 @@ impl MainDriver {
     /// force at most a bounded media gap, never deliver under an unproven tuple.
     async fn handle_eap(&mut self, now: Timestamp, payload: &[u8]) {
         let was_authed = self.authed;
+        // An inbound EAP frame is forward progress: reset the retransmit budget.
+        self.eap_retx = 0;
         let Some(role) = self.eap.as_mut() else {
             return;
         };
@@ -1173,6 +1223,8 @@ impl MainDriver {
         self.authed = self.eap.as_ref().is_some_and(EapRole::authenticated);
         if let Some(wire) = reply {
             self.send_eapol(&wire).await;
+            // This reply is now the outstanding frame to retransmit under loss.
+            self.eap_last_tx = Some(wire);
         }
         if self.authed {
             // SUCCESS — the initial handshake, or a NAT-rebind / in-band re-auth just
@@ -1269,6 +1321,9 @@ impl MainDriver {
         };
         let frame = role.reopen();
         self.send_eapol(&frame).await;
+        // Arm retransmission for the re-auth opener too.
+        self.eap_last_tx = Some(frame);
+        self.eap_retx = 0;
     }
 
     /// Recovers a NAT source-port rebind on an authenticated single-flow EAP-SRP

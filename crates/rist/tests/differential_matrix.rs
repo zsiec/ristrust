@@ -590,8 +590,7 @@ async fn diff_adv_clear_lossy_ristrust_rx() {
 // EAP-SRP authentication (Main profile, combined SRP+secret mode) — both
 // directions. The sender authenticates as the SRP user; the receiver verifies and,
 // once authenticated, the PSK secret keys the media. Modern (EAPOL v3) and legacy
-// (EAPOL v2 / `srp-compat`) handshakes on a clean link. (The lossy variants are
-// `#[ignore]`d — see the note below: the EAP handshake itself is not retransmitted.)
+// (EAPOL v2 / `srp-compat`) handshakes, clean and under ~12% loss.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -612,27 +611,17 @@ async fn diff_main_srp_legacy_ristrust_rx() {
     ristrust_rx_from_tx("main/srp-legacy ristrust-rx", main_srp_legacy(), 0.0).await;
 }
 
-// EAP-SRP under ~12% loss. IGNORED — these document a real, known robustness gap
-// rather than a passing guarantee: neither ristrust nor ristgo retransmits EAP-SRP
-// handshake frames (both drive the exchange purely reactively; the EAPOL-START is sent
-// exactly once and every reply is sent only in response to an inbound frame). So a
-// single dropped handshake datagram deadlocks authentication, and at ~12% loss the
-// handshake never completes (0 bytes delivered) — whereas the clean handshake (above)
-// interops perfectly. libRIST is more robust here: it keeps EAP wire timers + retry
-// counts in the host, which neither port implements. The correct fix is to make the
-// EAP core retransmit-idempotent — cache each role's last reply keyed by the request
-// identifier and replay it on a duplicate, rather than recomputing fresh SRP ephemerals
-// (a retransmitted Challenge/IdentityResponse currently rebuilds the SRP client/server
-// with new randomness and desyncs) — plus a host retransmit timer and a proactive
-// authenticator IDENTITY REQUEST. That is a careful, security-sensitive change to the
-// hardened EAP state machine, tracked as a focused follow-up. Run with `--ignored`.
+// EAP-SRP under ~12% loss — the authenticated handshake must complete despite dropped
+// EAPOL datagrams. EAP-SRP frames are not ARQ-protected, so this exercises the host
+// retransmit timer (re-send the outstanding frame on the keepalive tick) and the EAP
+// core's retransmit idempotency (a duplicate frame replays the cached reply instead of
+// recomputing a fresh SRP ephemeral, which would desync) — on BOTH stacks. Before that
+// fix this deadlocked at 0 bytes; it now recovers.
 #[tokio::test]
-#[ignore = "EAP-SRP handshake has no retransmission (shared with ristgo); deadlocks under loss"]
 async fn diff_main_srp_lossy_ristgo_rx() {
     rx_from_ristrust_tx("main/srp lossy ristgo-rx", main_srp(), 0.12).await;
 }
 #[tokio::test]
-#[ignore = "EAP-SRP handshake has no retransmission (shared with ristgo); deadlocks under loss"]
 async fn diff_main_srp_lossy_ristrust_rx() {
     ristrust_rx_from_tx("main/srp lossy ristrust-rx", main_srp(), 0.12).await;
 }

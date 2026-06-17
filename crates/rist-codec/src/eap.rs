@@ -659,6 +659,12 @@ pub struct Authenticatee {
     salt: Vec<u8>,
     session: Option<[u8; HASH_LEN]>,
     use_key_passphrase: bool,
+    /// The last inbound frame processed and the reply it produced. A byte-identical
+    /// re-arrival (a peer retransmit under loss) replays the cached reply instead of
+    /// re-running the state machine, which would recompute a fresh SRP ephemeral `a`
+    /// and desync. See [`Authenticatee::recv`].
+    last_rx: Option<Vec<u8>>,
+    last_reply: Option<Frame>,
 }
 
 impl Authenticatee {
@@ -680,6 +686,8 @@ impl Authenticatee {
             salt: Vec::new(),
             session: None,
             use_key_passphrase: true,
+            last_rx: None,
+            last_reply: None,
         })
     }
 
@@ -734,15 +742,37 @@ impl Authenticatee {
         self.client = None;
         self.salt = Vec::new();
         self.session = None;
+        // Drop the retransmit-replay cache: a fresh handshake must not replay a reply
+        // from the previous one.
+        self.last_rx = None;
+        self.last_reply = None;
     }
 
     /// Processes one received EAPOL frame and returns the reply to transmit (and
     /// any terminal error). Never panics on arbitrary input.
+    ///
+    /// An exact byte-for-byte duplicate of the last processed frame — a peer
+    /// retransmitting under loss — replays the cached reply without re-running the
+    /// state machine, so a retransmitted CHALLENGE does not rebuild the SRP client
+    /// with a fresh ephemeral `a` (which would desync the handshake). This makes the
+    /// handshake recoverable when datagrams are dropped.
     pub fn recv(&mut self, payload: &[u8]) -> Reply {
-        match Frame::parse(payload) {
-            Ok(f) => self.handle(f),
-            Err(e) => Reply::err(e),
+        if !payload.is_empty() && self.last_rx.as_deref() == Some(payload) {
+            return match &self.last_reply {
+                Some(f) => Reply::frame(f.clone()),
+                None => Reply::none(),
+            };
         }
+        let reply = match Frame::parse(payload) {
+            Ok(f) => self.handle(f),
+            Err(e) => return Reply::err(e),
+        };
+        // Cache only a clean step; a terminal error is never retransmit-replayed.
+        if reply.error.is_none() {
+            self.last_rx = Some(payload.to_vec());
+            self.last_reply.clone_from(&reply.frame);
+        }
+        reply
     }
 
     // Justification: the frame is consumed conditionally per match arm (each arm
@@ -947,6 +977,11 @@ pub struct Authenticator {
     /// echoes the advertised version and switches to matching legacy math, so the whole
     /// handshake runs in legacy mode for interop with old peers.
     legacy: bool,
+    /// The last inbound frame processed and the reply it produced; a byte-identical
+    /// re-arrival replays the cached reply rather than rebuilding the SRP server with a
+    /// fresh ephemeral `B`. See [`Authenticator::recv`].
+    last_rx: Option<Vec<u8>>,
+    last_reply: Option<Frame>,
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -989,6 +1024,8 @@ impl Authenticator {
             use_key_passphrase: true,
             ever_authed: false,
             legacy,
+            last_rx: None,
+            last_reply: None,
         }
     }
 
@@ -1009,6 +1046,10 @@ impl Authenticator {
         self.session = None;
         self.verified = false;
         self.id = self.id.wrapping_add(1);
+        // Drop the retransmit-replay cache: a fresh re-auth must not replay a reply
+        // from the previous handshake.
+        self.last_rx = None;
+        self.last_reply = None;
     }
 
     /// Selects how the role answers a peer's passphrase request: push "use the SRP
@@ -1067,11 +1108,28 @@ impl Authenticator {
 
     /// Processes one received EAPOL frame and returns the reply to transmit (and
     /// any terminal error). Never panics on arbitrary input.
+    ///
+    /// An exact byte-for-byte duplicate of the last processed frame — a peer
+    /// retransmitting under loss — replays the cached reply without re-running the
+    /// state machine, so a retransmitted IDENTITY_RESPONSE does not rebuild the SRP
+    /// server with a fresh ephemeral `B` (which would desync the handshake).
     pub fn recv(&mut self, payload: &[u8]) -> Reply {
-        match Frame::parse(payload) {
-            Ok(f) => self.handle(f),
-            Err(e) => Reply::err(e),
+        if !payload.is_empty() && self.last_rx.as_deref() == Some(payload) {
+            return match &self.last_reply {
+                Some(f) => Reply::frame(f.clone()),
+                None => Reply::none(),
+            };
         }
+        let reply = match Frame::parse(payload) {
+            Ok(f) => self.handle(f),
+            Err(e) => return Reply::err(e),
+        };
+        // Cache only a clean step; a terminal error / FAILURE frame is not replayed.
+        if reply.error.is_none() {
+            self.last_rx = Some(payload.to_vec());
+            self.last_reply.clone_from(&reply.frame);
+        }
+        reply
     }
 
     // Justification: as the authenticatee handler — the frame is consumed
@@ -1487,6 +1545,63 @@ mod tests {
         assert!(authee.done() && auth.done());
         let ck = authee.session_key().unwrap();
         assert_eq!(ck, auth.session_key().unwrap(), "session keys agree");
+    }
+
+    /// The wire bytes of a reply frame, or `None`.
+    fn reply_bytes(r: &Reply) -> Option<Vec<u8>> {
+        r.frame.as_ref().map(|f| {
+            let mut w = Vec::new();
+            f.append_to(&mut w);
+            w
+        })
+    }
+
+    #[test]
+    fn retransmitted_frames_replay_idempotently() {
+        // Drive the full handshake, but deliver EVERY frame twice (a peer retransmit
+        // under loss). The duplicate must replay a byte-identical reply — proving the
+        // state machine does not recompute fresh SRP ephemerals on a retransmit — and
+        // the handshake must still complete with agreeing session keys.
+        let (user, pass) = ("rist", "mainprofile");
+        let salt = hx(KAT_SALT);
+        let verifier = srp::make_verifier(&srp::default_group(), user, pass, &salt).unwrap();
+        let mut authee = Authenticatee::new(user, pass).unwrap();
+        let mut auth = Authenticator::new(static_verifier(user, verifier, salt));
+
+        let mut cur = authee.start();
+        let mut server_turn = true; // the authenticator receives START first
+        for _ in 0..16 {
+            let mut wire = Vec::new();
+            cur.append_to(&mut wire);
+            let (first, dup) = if server_turn {
+                (auth.recv(&wire), auth.recv(&wire))
+            } else {
+                (authee.recv(&wire), authee.recv(&wire))
+            };
+            assert!(first.error.is_none() && dup.error.is_none(), "no error");
+            assert_eq!(
+                reply_bytes(&first),
+                reply_bytes(&dup),
+                "a retransmitted frame must replay the identical reply"
+            );
+            let Some(out) = first.frame else { break };
+            cur = out;
+            server_turn = !server_turn;
+        }
+
+        assert!(
+            authee.authenticated(),
+            "authenticatee authenticated under retransmits"
+        );
+        assert!(
+            auth.authenticated(),
+            "authenticator authenticated under retransmits"
+        );
+        assert_eq!(
+            authee.session_key().unwrap(),
+            auth.session_key().unwrap(),
+            "session keys agree despite duplicated frames"
+        );
     }
 
     #[test]

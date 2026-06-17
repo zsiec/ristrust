@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rist::{
     AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_bonded_weighted_with,
-    dial_bonded_with, listen_bonded,
+    dial_bonded_with, listen_bonded, listen_bonded_priority,
 };
 
 /// A Main-profile bonded base config with a short recovery buffer.
@@ -440,4 +440,64 @@ async fn bonded_set_weight_rebalances_at_runtime() {
         ratio > 2.0,
         "set_weight did not rebalance: {counts:?} (ratio {ratio:.2}), want path 0 favored"
     );
+}
+
+#[tokio::test]
+async fn bonded_priority_receiver_delivers() {
+    // A bonded receiver with a per-path NACK-recovery priority (libRIST
+    // recovery-priority) still merges and delivers a clean stream byte-exact. The
+    // priority only steers which path NACKs leave on (the selection algorithm is
+    // unit-tested in the bonding Group); here we prove the listen_bonded_priority
+    // construction + delivery path works end to end.
+    let cfg = bonded_cfg();
+    // Two even ports, retrying past the probe/bind race.
+    let (mut receiver, addrs) = 'attempt: loop {
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
+            let p = probe.local_addr().expect("probe addr").port() & !1;
+            drop(probe);
+            if p == 0 || ports.contains(&p) || ports.contains(&(p + 1)) {
+                continue 'attempt;
+            }
+            ports.push(p);
+        }
+        let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+        // Path 0 high priority, path 1 low — NACKs prefer path 0.
+        let peers: Vec<(&str, u32)> = vec![(addrs[0].as_str(), 10), (addrs[1].as_str(), 1)];
+        if let Ok(r) = listen_bonded_priority(&peers, cfg.clone()).await {
+            break (r, addrs);
+        }
+    };
+
+    let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let sender = dial_bonded_with(&refs, cfg.clone(), &TokioRuntime)
+        .await
+        .expect("dial the bonded receiver");
+
+    let n: usize = 40;
+    let send = tokio::spawn(async move {
+        for i in 0..n {
+            sender
+                .send(format!("prio-{i:05}").as_bytes())
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        sender
+    });
+    for i in 0..n {
+        let got = tokio::time::timeout(Duration::from_secs(15), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}"))
+            .expect("session open");
+        assert_eq!(
+            got.as_ref(),
+            format!("prio-{i:05}").as_bytes(),
+            "payload {i}"
+        );
+    }
+    let sender = send.await.expect("send task");
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
 }

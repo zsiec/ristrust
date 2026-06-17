@@ -39,8 +39,8 @@ pub use multi::{
     listen_multi_with,
 };
 pub use receiver::{
-    Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_with,
-    listen_with,
+    Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_priority,
+    listen_bonded_priority_with, listen_bonded_with, listen_with,
 };
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
 pub use sender::{

@@ -778,7 +778,7 @@ pub(crate) fn build_injected_bonded(
         group.add_path(
             u8::try_from(i).unwrap_or(u8::MAX),
             bonding::WEIGHT_DUPLICATE,
-            0,
+            0, // multi-flow per-path recovery priority not plumbed (single-flow only)
         );
         paths.push(PathParts {
             socket: socket.clone(),
@@ -841,7 +841,7 @@ pub(crate) fn build_injected_bonded_simple(
         group.add_path(
             u8::try_from(i).unwrap_or(u8::MAX),
             bonding::WEIGHT_DUPLICATE,
-            0,
+            0, // multi-flow per-path recovery priority not plumbed (single-flow only)
         );
         paths.push(SimplePathParts {
             socket: socket.clone(),
@@ -1344,8 +1344,12 @@ pub(crate) fn build_bonded_receiver(
     rt: &dyn Runtime,
     cfg: &Config,
     locals: &[SocketAddr],
+    priorities: &[u32],
 ) -> io::Result<ReceiverSpawned> {
     require_bondable(cfg)?;
+    // Per-path NACK-recovery priority (libRIST recovery-priority); the bonding Group's
+    // NACK-peer selection prefers the highest. Missing entries default to 0.
+    let prio = |i: usize| priorities.get(i).copied().unwrap_or(0);
 
     // Simple bonds through the even/odd BondedSimpleDriver: one media+RTCP socket pair
     // per path, all merged into the one flow.
@@ -1364,7 +1368,7 @@ pub(crate) fn build_bonded_receiver(
             group.add_path(
                 u8::try_from(i).unwrap_or(u8::MAX),
                 bonding::WEIGHT_DUPLICATE,
-                0,
+                prio(i),
             );
             paths.push(SimplePathParts {
                 socket,
@@ -1423,7 +1427,7 @@ pub(crate) fn build_bonded_receiver(
         group.add_path(
             u8::try_from(i).unwrap_or(u8::MAX),
             bonding::WEIGHT_DUPLICATE,
-            0,
+            prio(i),
         );
         paths.push(PathParts {
             socket,

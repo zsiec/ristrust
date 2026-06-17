@@ -282,8 +282,54 @@ pub async fn listen_bonded_with(
     }
     cfg.validate()?;
     let locals = crate::sender::resolve_bonded_addrs(addrs)?;
-    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals)?;
+    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &[])?;
     tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening");
+    Ok(Receiver {
+        cfg,
+        local: spawned.local,
+        data_out: spawned.data_out,
+        oob_out: spawned.oob_out,
+        oob_in: spawned.oob_in,
+        close: spawned.close,
+        stats: spawned.stats,
+        task: spawned.task,
+    })
+}
+
+/// Listens as a SMPTE 2022-7 bonded receiver with a per-path NACK-recovery
+/// `priority` on each address (libRIST `recovery-priority`): when the receiver must
+/// send a NACK it routes it to the highest-priority live, addressable path (ties
+/// broken by the lowest raw RTT). Use it to steer retransmission requests toward the
+/// link whose sender holds the recovery buffer on an asymmetric multipath. `0` (what
+/// [`listen_bonded`] uses) leaves selection to the RTT tie-break. Bonding requires the
+/// Main profile; the path index is the position in `peers`.
+///
+/// # Errors
+/// As [`listen_bonded`].
+pub async fn listen_bonded_priority(peers: &[(&str, u32)], cfg: Config) -> Result<Receiver, Error> {
+    listen_bonded_priority_with(peers, cfg, &TokioRuntime).await
+}
+
+/// Like [`listen_bonded_priority`], but binds every path's transport socket through `rt`.
+///
+/// # Errors
+/// As [`listen_bonded`].
+pub async fn listen_bonded_priority_with(
+    peers: &[(&str, u32)],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<Receiver, Error> {
+    if peers.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded receiver needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let addrs: Vec<&str> = peers.iter().map(|&(a, _)| a).collect();
+    let priorities: Vec<u32> = peers.iter().map(|&(_, p)| p).collect();
+    let locals = crate::sender::resolve_bonded_addrs(&addrs)?;
+    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &priorities)?;
+    tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening (per-path priority)");
     Ok(Receiver {
         cfg,
         local: spawned.local,

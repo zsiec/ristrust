@@ -39,9 +39,11 @@ async fn listen_multi_bonded_free(cfg: Config, n: usize) -> (rist::MultiReceiver
         let mut ports = Vec::with_capacity(n);
         for _ in 0..n {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-            let p = probe.local_addr().expect("probe addr").port();
+            // Even ports so the same helper serves the Simple profile (even media + odd
+            // RTCP); Main/Advanced accept any port.
+            let p = probe.local_addr().expect("probe addr").port() & !1;
             drop(probe);
-            if p == 0 || ports.contains(&p) {
+            if p == 0 || ports.contains(&p) || ports.contains(&(p + 1)) {
                 continue 'attempt;
             }
             ports.push(p);
@@ -186,15 +188,10 @@ async fn multi_demuxes_two_advanced_flows_by_source() {
     .await;
 }
 
-#[tokio::test]
-async fn multi_demuxes_two_bonded_flows_by_source() {
-    // Two SMPTE 2022-7 bonded senders, each sourcing all its paths from one socket,
-    // stream into one bonded MultiReceiver across the same two path ports. The demux
-    // keys each sender by its single source address into its own bonded flow, merging
-    // the redundant copies arriving on both paths.
-    let cfg = Config::default()
-        .with_profile(Profile::Main)
-        .with_buffer(Duration::from_millis(200));
+/// Two SMPTE 2022-7 bonded senders stream into one bonded MultiReceiver across the same
+/// path ports; the demux keys each sender into its own bonded flow (Main/Advanced by
+/// source address, Simple by RTP SSRC), merging the redundant copies on both paths.
+async fn run_multi_bonded(cfg: Config) {
     let (mrx, addrs) = listen_multi_bonded_free(cfg.clone(), 2).await;
     let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
     let sender_a = dial_bonded(&refs, cfg.clone())
@@ -207,16 +204,33 @@ async fn multi_demuxes_two_bonded_flows_by_source() {
 }
 
 #[tokio::test]
-async fn listen_multi_bonded_rejects_non_main() {
-    // Bonding rides the Main GRE substrate; a Simple-profile bonded multi-receiver is
-    // rejected up front.
-    let cfg = Config::default().with_buffer(Duration::from_millis(200));
-    assert!(
-        listen_multi_bonded(&["127.0.0.1:5052", "127.0.0.1:5054"], cfg)
-            .await
-            .is_err(),
-        "bonded multi-flow must require the Main profile"
-    );
+async fn multi_demuxes_two_bonded_flows_by_source() {
+    run_multi_bonded(
+        Config::default()
+            .with_profile(Profile::Main)
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_advanced_bonded_flows() {
+    run_multi_bonded(
+        Config::default()
+            .with_profile(Profile::Advanced)
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_demuxes_two_simple_bonded_flows() {
+    run_multi_bonded(
+        Config::default()
+            .with_profile(Profile::Simple)
+            .with_buffer(Duration::from_millis(200)),
+    )
+    .await;
 }
 
 #[tokio::test]

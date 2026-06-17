@@ -45,18 +45,21 @@ const INBOUND_CAPACITY: usize = 256;
 
 /// Whether an inbound datagram arrived on a path's media (even) or RTCP (odd) socket.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SimpleKind {
+pub(crate) enum SimpleKind {
     Media,
     Rtcp,
 }
 
 /// One inbound datagram, tagged with the path it arrived on and its socket kind.
-struct SimpleBondInbound {
+/// `pub(crate)` so the multi-flow bonded-Simple demultiplexer can read each path,
+/// key by RTP SSRC, and route the datagram (with its path index) into the per-source
+/// injected session.
+pub(crate) struct SimpleBondInbound {
     /// The path index (receiver: the per-path socket; sender: unused, resolved by src).
-    index: u8,
-    kind: SimpleKind,
-    src: SocketAddr,
-    data: Bytes,
+    pub(crate) index: u8,
+    pub(crate) kind: SimpleKind,
+    pub(crate) src: SocketAddr,
+    pub(crate) data: Bytes,
 }
 
 /// The transport + learned peer of one bonded Simple path. There is no per-path codec
@@ -102,6 +105,11 @@ pub(crate) struct BondedSimpleDriver {
     learned_ssrc: Option<u32>,
     lqm: Option<LqmEmitter>,
     rate: Option<RateControl>,
+
+    /// Pre-routed inbound feed for a multi-flow demultiplexed receiver: when `Some`,
+    /// the [`MultiReceiver`](crate::MultiReceiver) demultiplexer owns the path readers
+    /// and routes this flow's datagrams in, so [`run`](Self::run) spawns none itself.
+    injected: Option<mpsc::Receiver<SimpleBondInbound>>,
 }
 
 impl BondedSimpleDriver {
@@ -150,6 +158,7 @@ impl BondedSimpleDriver {
             learned_ssrc: None,
             lqm: None,
             rate,
+            injected: None,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -196,8 +205,62 @@ impl BondedSimpleDriver {
             learned_ssrc: None,
             lqm,
             rate: None,
+            injected: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns an **injected** bonded Simple receiver for a multi-flow
+    /// [`MultiReceiver`](crate::MultiReceiver): like [`spawn_receiver`](Self::spawn_receiver)
+    /// but it spawns no path readers — the demultiplexer owns the `N` even/odd sockets,
+    /// reads them, keys each datagram by RTP SSRC, and routes this source's datagrams
+    /// (tagged with their path index) into the returned [`SimpleBondInbound`] channel.
+    /// The driver still sends its keepalives and feedback out through the path sockets.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_injected_receiver(
+        flow: Flow,
+        group: Group,
+        paths: Vec<SimplePathParts>,
+        ssrc: u32,
+        cname: String,
+        bitmask: bool,
+        keepalive: Duration,
+        lqm: Option<LqmEmitter>,
+    ) -> (
+        mpsc::Sender<SimpleBondInbound>,
+        mpsc::Receiver<Bytes>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = BondedSimpleDriver {
+            sender: false,
+            flow,
+            group,
+            paths: link_paths(paths),
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            close: close.clone(),
+            stats: stats.clone(),
+            app_in: None,
+            weight_cmd: None,
+            highest_sent: 0,
+            ssrc,
+            cname,
+            bitmask,
+            data_out: Some(data_tx),
+            mdec: MediaDecoder::new(),
+            learned_ssrc: None,
+            lqm,
+            rate: None,
+            injected: Some(in_rx),
+        };
+        (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
     }
 
     /// The current session-relative instant.
@@ -226,22 +289,31 @@ impl BondedSimpleDriver {
     }
 
     async fn run(mut self) {
-        let (in_tx, mut in_rx) = mpsc::channel::<SimpleBondInbound>(INBOUND_CAPACITY);
         let mut readers = Vec::new();
+        // Multi-flow demux: the demultiplexer owns the path readers and routes this
+        // source's datagrams into `in_rx`; spawn none. Otherwise own the readers.
+        let mut in_rx = if let Some(rx) = self.injected.take() {
+            rx
+        } else {
+            let (in_tx, in_rx) = mpsc::channel::<SimpleBondInbound>(INBOUND_CAPACITY);
+            if self.sender {
+                // The sender shares one even/odd socket across all paths: one reader
+                // funnels its inbound (the path is resolved by source in `on_recv`).
+                readers.push(spawn_reader(0, self.paths[0].socket.clone(), in_tx.clone()));
+            } else {
+                for p in &self.paths {
+                    readers.push(spawn_reader(p.index, p.socket.clone(), in_tx.clone()));
+                }
+            }
+            drop(in_tx);
+            in_rx
+        };
         if self.sender {
-            // The sender shares one even/odd socket across all paths: one reader funnels
-            // its inbound (the path is resolved by source in `on_recv`).
-            readers.push(spawn_reader(0, self.paths[0].socket.clone(), in_tx.clone()));
             let now = self.now();
             for i in 0..self.paths.len() {
                 self.send_keepalive(i, now).await;
             }
-        } else {
-            for p in &self.paths {
-                readers.push(spawn_reader(p.index, p.socket.clone(), in_tx.clone()));
-            }
         }
-        drop(in_tx);
 
         let mut keepalive = tokio::time::interval(self.keepalive);
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -543,8 +615,9 @@ async fn recv_weight(cmd: &mut Option<mpsc::Receiver<(u8, u32)>>) -> Option<(u8,
 }
 
 /// Spawns one path reader: it reads the path's media (even) and RTCP (odd) sockets and
-/// funnels each datagram, tagged with the path index and kind, into the pump's channel.
-fn spawn_reader(
+/// funnels each datagram, tagged with the path index and kind, into the channel. Used
+/// by the driver in self-driven mode and by the multi-flow demultiplexer.
+pub(crate) fn spawn_reader(
     index: u8,
     socket: SimpleSocket,
     tx: mpsc::Sender<SimpleBondInbound>,

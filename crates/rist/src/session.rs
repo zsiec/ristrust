@@ -738,7 +738,7 @@ pub(crate) fn build_injected_bonded(
     mpsc::Sender<crate::driver_bonded::Inbound>,
     crate::receiver::Receiver,
 )> {
-    require_main(cfg)?;
+    require_bondable(cfg)?;
     if sockets.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -764,6 +764,9 @@ pub(crate) fn build_injected_bonded(
             eap,
         });
     }
+    let adv = (cfg.profile == Profile::Advanced)
+        .then(|| build_adv_codec(cfg, DEFAULT_FLOW_SSRC))
+        .transpose()?;
     let (in_tx, data_out, close, stats, task) = BondedDriver::spawn_injected_receiver(
         flow,
         group,
@@ -772,6 +775,64 @@ pub(crate) fn build_injected_bonded(
         flow_mac(DEFAULT_FLOW_SSRC),
         bitmask_of(cfg),
         cfg.keepalive_interval,
+        adv,
+    );
+    let receiver = crate::receiver::Receiver::from_parts(
+        cfg.clone(),
+        local,
+        data_out,
+        None,
+        close,
+        stats,
+        task,
+    );
+    Ok((in_tx, receiver))
+}
+
+/// Builds an injected bonded **Simple** session for one source of a multi-flow bonded
+/// receiver: it spawns no readers (the demultiplexer owns the `N` even/odd path sockets
+/// and routes this source's datagrams into the returned channel), merging the redundant
+/// copies into one [`Receiver`](crate::receiver::Receiver).
+///
+/// # Errors
+/// Returns an I/O error if `sockets` is empty.
+pub(crate) fn build_injected_bonded_simple(
+    sockets: &[SimpleSocket],
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<(
+    mpsc::Sender<crate::driver_bonded_simple::SimpleBondInbound>,
+    crate::receiver::Receiver,
+)> {
+    if sockets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: bonded multi-flow needs at least one path socket",
+        ));
+    }
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, DEFAULT_FLOW_SSRC, 0));
+    let mut group = bonding_group(cfg);
+    let mut paths = Vec::with_capacity(sockets.len());
+    for (i, socket) in sockets.iter().enumerate() {
+        group.add_path(
+            u8::try_from(i).unwrap_or(u8::MAX),
+            bonding::WEIGHT_DUPLICATE,
+            0,
+        );
+        paths.push(SimplePathParts {
+            socket: socket.clone(),
+            peer: Peer::new(dur_to_micros(cfg.session_timeout)),
+        });
+    }
+    let (in_tx, data_out, close, stats, task) = BondedSimpleDriver::spawn_injected_receiver(
+        flow,
+        group,
+        paths,
+        DEFAULT_FLOW_SSRC,
+        cname_of(cfg),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        build_lqm_emitter(cfg),
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -1087,25 +1148,6 @@ fn bonding_group(cfg: &Config) -> Group {
 /// The error returned when a bonded session is requested for a non-Main profile.
 /// SMPTE 2022-7 bonding rides the Main-profile GRE transport (matching libRIST and
 /// ristgo); the Simple and Advanced profiles are single-path here.
-fn require_main(cfg: &Config) -> io::Result<()> {
-    if cfg.profile != Profile::Main {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: SMPTE 2022-7 bonding requires the Main profile",
-        ));
-    }
-    // Bonding spreads one flow across several paths/peers, which the single-peer DTLS
-    // handshake does not model (ristgo rejects bonded DTLS likewise).
-    #[cfg(feature = "dtls")]
-    if cfg.dtls.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: DTLS is not supported with SMPTE 2022-7 bonding",
-        ));
-    }
-    Ok(())
-}
-
 /// The gate for SMPTE 2022-7 bonding, now on all three profiles (Simple bonds through
 /// the even/odd [`BondedSimpleDriver`](crate::driver_bonded_simple); Main/Advanced
 /// through the single-socket [`BondedDriver`](crate::driver_bonded)). Rejects DTLS, and

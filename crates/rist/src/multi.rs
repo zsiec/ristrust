@@ -26,6 +26,9 @@ use crate::config::{Config, Profile};
 use crate::driver::SimpleInbound;
 use crate::driver_adv::AdvInbound;
 use crate::driver_bonded::{INBOUND_CAPACITY, Inbound, spawn_reader};
+use crate::driver_bonded_simple::{
+    SimpleBondInbound, SimpleKind, spawn_reader as spawn_simple_bond_reader,
+};
 use crate::driver_main::MainInbound;
 use crate::error::{ConfigError, Error};
 use crate::receiver::Receiver;
@@ -199,17 +202,10 @@ pub async fn listen_multi_bonded_with(
         ));
     }
     cfg.validate()?;
-    // Bonding rides the Main-profile GRE substrate; reject other profiles up front.
-    if cfg.profile != Profile::Main {
-        let name = if cfg.profile == Profile::Simple {
-            "Simple"
-        } else {
-            "Advanced"
-        };
-        return Err(Error::Config(ConfigError::ProfileFeatureUnsupported {
-            feature: "SMPTE 2022-7 bonding",
-            profile: name,
-        }));
+    // Simple bonds through the even/odd SSRC-keyed demultiplexer; Main and Advanced
+    // tunnel each path over one GRE socket and key by source address.
+    if cfg.profile == Profile::Simple {
+        return listen_multi_bonded_simple(addrs, cfg, rt).await;
     }
     // FEC and per-flow demux conflict (one auxiliary stream, not per-flow).
     if cfg.fec.is_some() {
@@ -247,6 +243,97 @@ pub async fn listen_multi_bonded_with(
         demux,
         local: bound,
     })
+}
+
+/// Binds the Simple-profile bonded multi-receiver: `N` even/odd path socket pairs, a
+/// demultiplexer that keys each datagram by RTP SSRC and feeds a bonded [`Receiver`]
+/// per source (merging that source's redundant copies across the paths).
+async fn listen_multi_bonded_simple(
+    addrs: &[&str],
+    cfg: Config,
+    rt: &dyn Runtime,
+) -> Result<MultiReceiver, Error> {
+    if cfg.fec.is_some() {
+        return Err(Error::Config(ConfigError::FecInvalid {
+            reason: "FEC is not supported with multi-flow receive",
+        }));
+    }
+    let locals = crate::sender::resolve_bonded_addrs(addrs)?;
+    let mut sockets = Vec::with_capacity(locals.len());
+    let mut bound = None;
+    for &local in &locals {
+        let membership = crate::multicast::receiver_membership(&cfg, local)?;
+        let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
+        let path_local = socket.media_local()?;
+        if bound.is_none() {
+            bound = Some(path_local);
+        }
+        sockets.push(socket);
+    }
+    let bound = bound.ok_or_else(|| {
+        Error::InvalidAddr("bonded multi-receiver needs at least one address".into())
+    })?;
+    let (accept_tx, accept_rx) = mpsc::channel(MAX_FLOWS);
+    let demux = tokio::spawn(demux_bonded_simple(sockets, cfg, bound, accept_tx));
+    tracing::debug!(target: crate::logging::BONDING, %bound, paths = locals.len(), "rist: bonded Simple multi-receiver listening");
+    Ok(MultiReceiver {
+        accept_rx,
+        demux,
+        local: bound,
+    })
+}
+
+/// The Simple-profile bonded demultiplexer: reads every path's even/odd sockets, keys
+/// each datagram by RTP SSRC, and feeds the matching per-source injected bonded session
+/// (creating it on first sight), so each source's redundant path copies merge into one
+/// bonded [`Receiver`].
+async fn demux_bonded_simple(
+    sockets: Vec<SimpleSocket>,
+    cfg: Config,
+    local: SocketAddr,
+    accept_tx: mpsc::Sender<Receiver>,
+) {
+    let (in_tx, mut in_rx) = mpsc::channel::<SimpleBondInbound>(INBOUND_CAPACITY);
+    let mut readers = Vec::with_capacity(sockets.len());
+    for (j, sock) in sockets.iter().enumerate() {
+        readers.push(spawn_simple_bond_reader(
+            u8::try_from(j).unwrap_or(u8::MAX),
+            sock.clone(),
+            in_tx.clone(),
+        ));
+    }
+    drop(in_tx);
+    let mut flows: HashMap<u32, mpsc::Sender<SimpleBondInbound>> = HashMap::new();
+    while let Some(inb) = in_rx.recv().await {
+        let ssrc = match inb.kind {
+            SimpleKind::Media => peek_media_ssrc(&inb.data),
+            SimpleKind::Rtcp => peek_rtcp_ssrc(&inb.data),
+        };
+        let Some(ssrc) = ssrc else { continue };
+        if let Some(tx) = flows.get(&ssrc) {
+            if tx.send(inb).await.is_err() {
+                flows.remove(&ssrc);
+            }
+            continue;
+        }
+        flows.retain(|_, tx| !tx.is_closed());
+        if flows.len() >= MAX_FLOWS {
+            continue;
+        }
+        match crate::session::build_injected_bonded_simple(&sockets, &cfg, local) {
+            Ok((tx, receiver)) => {
+                let _ = tx.send(inb).await;
+                flows.insert(ssrc, tx);
+                let _ = accept_tx.send(receiver).await;
+            }
+            Err(e) => {
+                tracing::warn!(target: crate::logging::BONDING, "rist: multi-flow bonded Simple: drop flow, build failed: {e}");
+            }
+        }
+    }
+    for r in readers {
+        r.abort();
+    }
 }
 
 /// The demultiplexer task: reads the shared media (even) and RTCP (odd) sockets,

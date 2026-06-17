@@ -302,6 +302,7 @@ impl BondedDriver {
         mac: [u8; 6],
         bitmask: bool,
         keepalive: Duration,
+        adv: Option<AdvCodec>,
     ) -> (
         mpsc::Sender<Inbound>,
         mpsc::Receiver<Bytes>,
@@ -335,7 +336,7 @@ impl BondedDriver {
             fec: None,
             last_weighted: None,
             lqm: None, // multi-flow bonded LQM emission is deferred
-            adv: None, // multi-flow bonded Advanced is wired by the caller when needed
+            adv,
             rate: None,
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))

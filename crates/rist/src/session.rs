@@ -241,7 +241,13 @@ fn build_eap_role(cfg: &Config, sender: bool) -> io::Result<Option<EapRole>> {
                 )
             })?;
         let lookup = static_verifier(user, verifier, salt.to_vec());
-        let mut a = Authenticator::new(lookup);
+        // Legacy mode (libRIST srp-compat=1) advertises EAPOL version 2 + unpadded-k/u
+        // SRP; the caller auto-negotiates the matching mode from the version byte.
+        let mut a = if cfg.srp_compat {
+            Authenticator::new_legacy(lookup)
+        } else {
+            Authenticator::new(lookup)
+        };
         a.set_use_key_passphrase(use_key);
         Ok(Some(EapRole::Authenticator(Box::new(a))))
     }

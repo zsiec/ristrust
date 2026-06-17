@@ -926,6 +926,9 @@ impl Authenticatee {
 
 /// The EAP-SRP server role (the side verifying a peer, e.g. a RIST listener).
 /// Sans-I/O and single-use; not safe for concurrent use.
+// The flags (`verified`/`use_key_passphrase`/`ever_authed`/`legacy`) are independent
+// per-handshake state, not a state enum; folding them would obscure the protocol.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Authenticator {
     lookup: VerifierLookup,
     state: State,
@@ -939,6 +942,11 @@ pub struct Authenticator {
     /// spoofed EAPOL-LOGOFF can no longer tear the exchange down even while a re-auth
     /// is in progress (an established session is only re-proven, never reset).
     ever_authed: bool,
+    /// Legacy (pre-0.2.16, libRIST `srp-compat=1`) mode: advertise EAPOL version 2 and
+    /// use the unpadded-k/u SRP hashing ([`srp::Server::new_legacy`]). The authenticatee
+    /// echoes the advertised version and switches to matching legacy math, so the whole
+    /// handshake runs in legacy mode for interop with old peers.
+    legacy: bool,
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -953,9 +961,23 @@ impl std::fmt::Debug for Authenticator {
 }
 
 impl Authenticator {
-    /// Creates an EAP-SRP server that resolves verifiers via `lookup`.
+    /// Creates an EAP-SRP server that resolves verifiers via `lookup` (the libRIST
+    /// 0.2.16+ default, EAPOL version 3, RFC 5054 PAD-compliant hashing).
     #[must_use]
     pub fn new(lookup: VerifierLookup) -> Authenticator {
+        Authenticator::with_mode(lookup, false)
+    }
+
+    /// Creates an EAP-SRP server in the legacy (pre-0.2.16, libRIST `srp-compat=1`)
+    /// compatibility mode: it advertises EAPOL version 2 and uses the unpadded-k/u SRP
+    /// hashing, driving the authenticatee into the matching legacy math. Use only to
+    /// interoperate with a legacy peer.
+    #[must_use]
+    pub fn new_legacy(lookup: VerifierLookup) -> Authenticator {
+        Authenticator::with_mode(lookup, true)
+    }
+
+    fn with_mode(lookup: VerifierLookup, legacy: bool) -> Authenticator {
         Authenticator {
             lookup,
             state: State::Unauth,
@@ -966,7 +988,13 @@ impl Authenticator {
             verified: false,
             use_key_passphrase: true,
             ever_authed: false,
+            legacy,
         }
+    }
+
+    /// The EAPOL version this authenticator advertises: 2 in legacy mode, else 3.
+    fn version(&self) -> u8 {
+        if self.legacy { 2 } else { EAP_VERSION_3 }
     }
 
     /// Resets the server to the unauthenticated state for a fresh handshake (EAP
@@ -1029,7 +1057,7 @@ impl Authenticator {
             self.state = State::InProgress;
         }
         Frame {
-            version: EAP_VERSION_3,
+            version: self.version(),
             code: Code::Request,
             identifier: self.id,
             kind: Kind::IdentityRequest,
@@ -1106,7 +1134,14 @@ impl Authenticator {
                     return Reply::err(EapError::NoVerifier);
                 };
                 let grp = srp::default_group();
-                let server = match srp::Server::new(&grp, &verifier, &salt) {
+                // Legacy mode (version 2) uses the unpadded-k/u SRP math; the version
+                // byte on the Challenge drives the authenticatee into the same mode.
+                let built = if self.legacy {
+                    srp::Server::new_legacy(&grp, &verifier, &salt)
+                } else {
+                    srp::Server::new(&grp, &verifier, &salt)
+                };
+                let server = match built {
                     Ok(s) => s,
                     Err(e) => {
                         self.state = State::Failed;
@@ -1118,7 +1153,7 @@ impl Authenticator {
                 self.state = State::InProgress;
                 self.id = self.id.wrapping_add(1);
                 Reply::frame(Frame {
-                    version: EAP_VERSION_3,
+                    version: self.version(),
                     code: Code::Request,
                     identifier: self.id,
                     kind: Kind::Challenge,
@@ -1138,7 +1173,7 @@ impl Authenticator {
                 self.id = self.id.wrapping_add(1);
                 let b = self.server.as_ref().unwrap().b();
                 Reply::frame(Frame {
-                    version: EAP_VERSION_3,
+                    version: self.version(),
                     code: Code::Request,
                     identifier: self.id,
                     kind: Kind::ServerKey,
@@ -1156,7 +1191,7 @@ impl Authenticator {
                     self.state = State::Failed;
                     return Reply::frame_err(
                         Frame {
-                            version: EAP_VERSION_3,
+                            version: self.version(),
                             code: Code::Failure,
                             identifier: self.id,
                             kind: Kind::Failure,
@@ -1171,7 +1206,7 @@ impl Authenticator {
                 self.id = self.id.wrapping_add(1);
                 let m2 = self.server.as_ref().unwrap().m2().unwrap_or_default();
                 Reply::frame(Frame {
-                    version: EAP_VERSION_3,
+                    version: self.version(),
                     code: Code::Request,
                     identifier: self.id,
                     kind: Kind::ServerValidator,
@@ -1452,6 +1487,42 @@ mod tests {
         assert!(authee.done() && auth.done());
         let ck = authee.session_key().unwrap();
         assert_eq!(ck, auth.session_key().unwrap(), "session keys agree");
+    }
+
+    #[test]
+    fn legacy_handshake_success() {
+        // A legacy (srp-compat) authenticator advertises EAPOL version 2; the
+        // authenticatee auto-negotiates the legacy unpadded-k/u math from that byte and
+        // both reach Success with matching session keys.
+        let (user, pass) = ("rist", "mainprofile");
+        let salt = hx(KAT_SALT);
+        let verifier = srp::make_verifier(&srp::default_group(), user, pass, &salt).unwrap();
+
+        // A legacy authenticator advertises EAPOL version 2 in its IDENTITY REQUEST.
+        let mut probe =
+            Authenticator::new_legacy(static_verifier(user, verifier.clone(), salt.clone()));
+        assert_eq!(
+            probe.start().version,
+            2,
+            "legacy authenticator advertises v2"
+        );
+
+        let mut authee = Authenticatee::new(user, pass).unwrap();
+        let mut auth = Authenticator::new_legacy(static_verifier(user, verifier, salt));
+        let transcript = drive(&mut authee, &mut auth);
+        assert!(
+            authee.authenticated() && auth.authenticated(),
+            "legacy handshake"
+        );
+        assert_eq!(
+            authee.session_key().unwrap(),
+            auth.session_key().unwrap(),
+            "legacy session keys agree"
+        );
+        assert!(
+            transcript.contains(&Kind::ServerValidator),
+            "full exchange ran"
+        );
     }
 
     #[test]

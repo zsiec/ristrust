@@ -150,6 +150,12 @@ pub struct Config {
     pub srp_username: Option<String>,
     /// EAP-SRP password paired with `srp_username`.
     pub srp_password: Option<String>,
+    /// Legacy SRP compatibility (libRIST `srp-compat=1`, pre-0.2.16): a listener
+    /// (authenticator) advertises EAPOL version 2 and uses the unpadded-k/u SRP hashing
+    /// so it can authenticate an old peer. A caller (authenticatee) auto-negotiates the
+    /// legacy mode from the listener's advertised version, so this flag only affects a
+    /// listener. Default: off (the 0.2.16+ PAD-compliant mode).
+    pub srp_compat: bool,
     /// Enable LZ4 payload compression on the send path (Advanced profile).
     pub compression: bool,
     /// Split an outbound application payload larger than this many bytes across
@@ -256,6 +262,7 @@ impl Default for Config {
             key_rotation: 0,
             srp_username: None,
             srp_password: None,
+            srp_compat: false,
             compression: false,
             fragment_size: 0,
             null_packet_deletion: false,
@@ -371,6 +378,16 @@ impl Config {
     ) -> Config {
         self.srp_username = Some(username.into());
         self.srp_password = Some(password.into());
+        self
+    }
+
+    /// Enables legacy SRP compatibility (libRIST `srp-compat=1`): a listener advertises
+    /// EAPOL version 2 and uses the pre-0.2.16 unpadded-k/u SRP hashing, to authenticate
+    /// an old peer. A caller auto-negotiates it from the listener's version, so this
+    /// only affects a listener.
+    #[must_use]
+    pub fn with_srp_compat(mut self, on: bool) -> Config {
+        self.srp_compat = on;
         self
     }
 

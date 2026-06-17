@@ -142,6 +142,18 @@ async fn main_loopback_authenticated_srp_delivers_in_order() {
 }
 
 #[tokio::test]
+async fn main_loopback_legacy_srp_compat_delivers_in_order() {
+    // Legacy SRP (libRIST srp-compat=1): the listener (authenticator) advertises EAPOL
+    // version 2 and uses the unpadded-k/u hashing; the caller (authenticatee) auto-
+    // negotiates the legacy math from that version byte. The whole handshake runs in
+    // legacy mode and media flows in order.
+    let cfg = main_cfg(Some(("psk-secret", AesKeyBits::Aes128)))
+        .with_srp_credentials("rist", "mainprofile")
+        .with_srp_compat(true);
+    run_loopback(cfg, &TokioRuntime, 50, 0, "legacy-srp").await;
+}
+
+#[tokio::test]
 async fn main_loopback_srp_only_keys_media_from_session_key() {
     // No explicit PSK secret: after EAP-SRP authenticates, the data channel re-keys
     // purely from the SRP session key K, and media flows encrypted under it. This is

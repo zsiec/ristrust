@@ -281,6 +281,10 @@ fn apply_string_and_feature_params(
     if let Some(n) = int("key-rotation")? {
         cfg.key_rotation = clamp_u32("key-rotation", n)?;
     }
+    // `srp-compat`: legacy (pre-0.2.16) SRP mode; any non-zero value enables it.
+    if let Some(n) = int("srp-compat")? {
+        cfg.srp_compat = n != 0;
+    }
     // `weight`: the uniform 2022-7 bonding load-share weight (0 = full duplication).
     if let Some(n) = int("weight")? {
         cfg.weight = clamp_u32("weight", n)?;

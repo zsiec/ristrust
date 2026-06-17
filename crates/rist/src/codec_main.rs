@@ -140,7 +140,7 @@ pub(crate) struct MainCodec {
     /// The peer's SDES CNAME most recently decoded from an ENCRYPTED RTCP datagram,
     /// for NAT-rebind re-association. Learned only behind a keyed session (a forger or
     /// cleartext sender cannot supply it); the host reads it via [`MainCodec::peer_cname`].
-    last_rx_cname: Option<String>,
+    last_rx_cname: Option<Bytes>,
 }
 
 impl MainCodec {
@@ -178,7 +178,7 @@ impl MainCodec {
     /// The peer's SDES CNAME learned from an encrypted RTCP datagram, if any (the
     /// host trusts it only behind an authenticated session). Used to validate a NAT
     /// source-port rebind re-association: a migrated tuple must present the same CNAME.
-    pub(crate) fn peer_cname(&self) -> Option<&str> {
+    pub(crate) fn peer_cname(&self) -> Option<&[u8]> {
         self.last_rx_cname.as_deref()
     }
 
@@ -187,7 +187,7 @@ impl MainCodec {
     /// is RTCP feedback carrying a CNAME. It never advances the media decoder, so it
     /// is a safe probe; a forger with no key, a cleartext sender, or a media datagram
     /// all yield `None`. Used to gate a NAT source-port rebind re-association.
-    pub(crate) fn feedback_cname(&mut self, b: &[u8]) -> Option<String> {
+    pub(crate) fn feedback_cname(&mut self, b: &[u8]) -> Option<Bytes> {
         match self.main_region(b) {
             Ok(Region::Inner {
                 region,
@@ -361,7 +361,7 @@ impl MainCodec {
             lead,
             RtcpPacket::Sdes(rtcp::Sdes {
                 ssrc: self.ssrc,
-                cname: self.cname.clone(),
+                cname: Bytes::from(self.cname.clone()),
             }),
         ];
         let mut nacks = Vec::new();
@@ -881,7 +881,7 @@ impl MainCodec {
                 // The CNAME is fixed for the session, so the guard only enters (and
                 // clones) on an actual change, not every encrypted SDES datagram.
                 RtcpPacket::Sdes(s)
-                    if encrypted && self.last_rx_cname.as_deref() != Some(s.cname.as_str()) =>
+                    if encrypted && self.last_rx_cname.as_deref() != Some(s.cname.as_ref()) =>
                 {
                     self.last_rx_cname = Some(s.cname.clone());
                 }

@@ -201,7 +201,7 @@ pub(crate) struct MainDriver {
     /// The peer's RTCP SDES CNAME, recorded only from ENCRYPTED RTCP under an
     /// authenticated SRP session — the identity a migrated tuple must re-present to
     /// trigger a NAT source-port rebind re-association. `None` until learned.
-    peer_cname: Option<String>,
+    peer_cname: Option<Bytes>,
     /// Whether the EAP-SRP handshake has succeeded at least once. Distinguishes an
     /// initial auth failure (tear the session down) from a re-auth failure (hold
     /// media), and gates CNAME-based re-association on a proven identity.
@@ -746,7 +746,7 @@ impl MainDriver {
         {
             // Borrow-compare first: the CNAME is fixed for the session, so this only
             // allocates on the (rare) first/changed value, not every authed datagram.
-            self.peer_cname = Some(c.to_owned());
+            self.peer_cname = Some(Bytes::copy_from_slice(c));
         }
         self.drain(now).await;
     }

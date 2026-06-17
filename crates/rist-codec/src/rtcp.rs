@@ -194,8 +194,10 @@ impl Default for LinkQualityReport {
 pub struct Sdes {
     /// The originator (the RIST sender or receiver).
     pub ssrc: u32,
-    /// The canonical name string (truncated to 255 bytes on encode).
-    pub cname: String,
+    /// The canonical name (truncated to 255 bytes on encode). Held as raw bytes, not a
+    /// `String`, so an arbitrary (non-UTF-8) peer CNAME round-trips byte-stably and the
+    /// NAT-rebind identity comparison is byte-exact rather than lossy.
+    pub cname: Bytes,
 }
 
 /// One Packet Range Request of TR-06-1 §5.3.2.2: packets `start` through
@@ -412,7 +414,7 @@ impl LinkQualityReport {
 
 impl Sdes {
     fn append_to(&self, dst: &mut Vec<u8>) {
-        let name = &self.cname.as_bytes()[..self.cname.len().min(MAX_CNAME_LEN)];
+        let name = &self.cname[..self.cname.len().min(MAX_CNAME_LEN)];
         let size = sdes_size(name.len());
         append_header(dst, 1, PT_SDES, (size / 4 - 1) as u16);
         dst.extend_from_slice(&self.ssrc.to_be_bytes());
@@ -697,7 +699,7 @@ fn decode_sdes(h: &RtcpHeader, body: &[u8]) -> Option<Packet> {
     if body[SDES_FIXED_SIZE + n..].iter().any(|&x| x != 0) {
         return None;
     }
-    let cname = String::from_utf8_lossy(&body[SDES_FIXED_SIZE..SDES_FIXED_SIZE + n]).into_owned();
+    let cname = Bytes::copy_from_slice(&body[SDES_FIXED_SIZE..SDES_FIXED_SIZE + n]);
     Some(Packet::Sdes(Sdes {
         ssrc: be32(body, 4),
         cname,
@@ -1242,6 +1244,27 @@ mod tests {
         assert_eq!(n, foreign.len());
         assert!(matches!(pkt, Packet::Raw(_)));
         assert_eq!(pkt.encode(), foreign);
+    }
+
+    #[test]
+    fn sdes_cname_round_trips_non_utf8_byte_stably() {
+        // A non-UTF-8 CNAME must survive decode→re-encode byte-for-byte (the reason the
+        // field is `Bytes`, not a lossily-decoded `String`).
+        let raw: &[u8] = &[0x52, 0xFF, 0x00, 0xC3, 0x28, 0x49]; // invalid UTF-8 bytes
+        let wire = Packet::Sdes(Sdes {
+            ssrc: 0x1234_5678,
+            cname: Bytes::copy_from_slice(raw),
+        })
+        .encode();
+        let (pkt, n) = parse(&wire).unwrap();
+        assert_eq!(n, wire.len());
+        match pkt {
+            Packet::Sdes(s) => {
+                assert_eq!(s.cname.as_ref(), raw, "CNAME bytes preserved");
+                assert_eq!(Packet::Sdes(s).encode(), wire, "re-encode byte-stable");
+            }
+            other => panic!("expected Sdes, got {other:?}"),
+        }
     }
 
     #[test]

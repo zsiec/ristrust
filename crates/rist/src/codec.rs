@@ -246,7 +246,7 @@ pub(crate) fn encode_feedback(
         lead,
         RtcpPacket::Sdes(rtcp::Sdes {
             ssrc: local_ssrc,
-            cname: cname.to_string(),
+            cname: bytes::Bytes::copy_from_slice(cname.as_bytes()),
         }),
     ];
     let mut nacks = Vec::new();

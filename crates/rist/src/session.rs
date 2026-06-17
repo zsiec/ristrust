@@ -1013,6 +1013,7 @@ pub(crate) fn build_bonded_sender(
         cfg.keepalive_interval,
         start_seq,
         weight_rx,
+        RateControl::from_config(cfg),
         build_fec(cfg),
     );
     Ok(SenderSpawned {
@@ -1090,6 +1091,7 @@ pub(crate) fn build_bonded_receiver(
         flow_mac(DEFAULT_FLOW_SSRC),
         bitmask_of(cfg),
         cfg.keepalive_interval,
+        build_lqm_emitter(cfg),
         build_fec(cfg),
     );
     Ok(ReceiverSpawned {

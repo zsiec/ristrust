@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use rist::{AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_with, listen};
+use rist::{
+    AsyncUdpSocket, Config, Profile, Receiver, Runtime, TokioRuntime, dial_bonded, dial_with,
+    listen, listen_bonded,
+};
 
 /// A config for `profile` with source adaptation on, a short keepalive (so Link
 /// Quality Messages report every 100 ms), and a short recovery buffer.
@@ -148,6 +151,79 @@ async fn adapt_backs_off_under_loss_simple() {
 #[tokio::test]
 async fn adapt_backs_off_under_loss_advanced() {
     assert_backs_off_under_loss(Profile::Advanced, 0x5EED_9ABC).await;
+}
+
+#[tokio::test]
+async fn bonded_adapt_closes_the_loop_over_two_paths() {
+    // Source adaptation over SMPTE 2022-7 bonding: the bonded receiver fans a Global
+    // Link Quality Message out every path, and the bonded sender folds it into its
+    // controller and reports a rate — proving the loop closes across bonded paths.
+    let cfg = adapt_cfg(Profile::Main);
+
+    // Two OS-chosen free ports for the bonded receiver.
+    let mut ports = Vec::new();
+    let mut probes = Vec::new();
+    for _ in 0..2 {
+        let p = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
+        ports.push(p.local_addr().expect("addr").port());
+        probes.push(p);
+    }
+    drop(probes);
+    let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+    let addr_refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+
+    let mut receiver = listen_bonded(&addr_refs, cfg.clone())
+        .await
+        .expect("listen_bonded");
+
+    let rates = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let rec = rates.clone();
+    let send_cfg = cfg
+        .clone()
+        .with_rate_callback(move |kbps| rec.lock().expect("rates").push(kbps));
+    let sender = dial_bonded(&addr_refs, send_cfg)
+        .await
+        .expect("dial_bonded");
+
+    let body = vec![b'x'; 160];
+    let send_task = tokio::spawn(async move {
+        for i in 0..400usize {
+            let mut p = body.clone();
+            p[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            if sender.send(&p).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        sender
+    });
+    let drain = tokio::spawn(async move {
+        for _ in 0..400 {
+            if tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        receiver
+    });
+
+    let sender = send_task.await.expect("send task");
+    sender.close().await.expect("close sender");
+    let receiver = drain.await.expect("drain task");
+    receiver.close().await.expect("close receiver");
+
+    let rates = rates.lock().expect("rates").clone();
+    assert!(
+        !rates.is_empty(),
+        "no Link Quality Messages closed the loop over bonding"
+    );
+    let max = Config::default().max_bitrate_kbps;
+    assert!(
+        rates.iter().all(|&r| r == max),
+        "clean bonded link should hold at the ceiling {max}, saw {rates:?}"
+    );
 }
 
 /// A [`Runtime`] whose UDP sockets drop a fraction of forward *media* datagrams

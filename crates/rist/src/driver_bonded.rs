@@ -22,7 +22,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use rist_codec::rtcp::{EmptyReceiverReport, Packet as RtcpPacket, SenderReport};
+use rist_codec::rtcp::{
+    EmptyReceiverReport, LinkQualityReport, Packet as RtcpPacket, SenderReport,
+};
 use rist_codec::{eap, fec_header, gre, rtp};
 use rist_core::clock::Timestamp;
 use rist_core::fec::{Direction, Recovered};
@@ -30,6 +32,7 @@ use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
 use rist_core::wire::{Feedback, FragRole, MediaPacket};
 
+use crate::adapt::{LqmEmitter, RateControl};
 use crate::bonding::Group;
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
@@ -157,6 +160,14 @@ pub(crate) struct BondedDriver {
     /// datagram's FEC fan (so FEC follows media without spending a second rotation
     /// credit). `None` for full-redundancy (every path is a duplicate target).
     last_weighted: Option<u8>,
+    /// The source-adaptation Link Quality Message emitter (TR-06-4 Part 1); `Some` on
+    /// a bonded receiver with source adaptation enabled. The Global LQM is fanned out
+    /// every live path with one shared sequence number (§5.5).
+    lqm: Option<LqmEmitter>,
+    /// The source-adaptation rate controller; `Some` on a bonded sender with a rate
+    /// callback configured. It folds each inbound LQM into a target bitrate and invokes
+    /// the application's `on_rate_adapt` callback.
+    rate: Option<RateControl>,
 }
 
 impl BondedDriver {
@@ -175,6 +186,7 @@ impl BondedDriver {
         keepalive: Duration,
         start_seq: u32,
         weight_rx: mpsc::Receiver<(u8, u32)>,
+        rate: Option<RateControl>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
@@ -206,6 +218,8 @@ impl BondedDriver {
             learned_ssrc: None,
             fec,
             last_weighted: None,
+            lqm: None, // a sender does not emit LQM
+            rate,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -222,6 +236,7 @@ impl BondedDriver {
         mac: [u8; 6],
         bitmask: bool,
         keepalive: Duration,
+        lqm: Option<LqmEmitter>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
@@ -253,6 +268,8 @@ impl BondedDriver {
             learned_ssrc: None,
             fec,
             last_weighted: None,
+            lqm,
+            rate: None, // a receiver does not consume LQM
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -305,6 +322,8 @@ impl BondedDriver {
             learned_ssrc: None,
             fec: None,
             last_weighted: None,
+            lqm: None, // multi-flow bonded LQM emission is deferred
+            rate: None,
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -405,6 +424,9 @@ impl BondedDriver {
                             self.send_keepalive(i, now).await;
                         }
                     }
+                    // Source adaptation: fan a Global LQM out every live path when a
+                    // reporting period has elapsed (receiver only).
+                    self.maybe_emit_lqm(now).await;
                 },
             }
         }
@@ -493,6 +515,11 @@ impl BondedDriver {
                             pkt.payload.clone(),
                         )
                     });
+                    // Meter the merged stream's RTP bytes for the LQM bandwidth fields
+                    // before the packet is consumed.
+                    if let Some(e) = self.lqm.as_mut() {
+                        e.meter(pkt.payload.len(), pkt.retransmit);
+                    }
                     // Feed on this path's index: the one ring dedups copies from the
                     // other paths by `(seq, source_time)`.
                     self.flow.feed(now, path_id, pkt);
@@ -507,7 +534,15 @@ impl BondedDriver {
                 }
                 Ok(Decoded::Feedback(fbs)) => {
                     for fb in fbs {
-                        self.flow.feed_feedback(now, fb);
+                        // A Link Quality Message is a host-level source-adaptation
+                        // signal: drive the rate controller, never the flow core.
+                        if let Feedback::LinkQuality { lqm } = fb {
+                            if let Some(r) = &mut self.rate {
+                                r.handle(&lqm);
+                            }
+                        } else {
+                            self.flow.feed_feedback(now, fb);
+                        }
                     }
                 }
                 // A peer's buffer-negotiation feeds the shared flow's auto-scaler (a
@@ -803,6 +838,48 @@ impl BondedDriver {
         if let Ok(bytes) = self.paths[i].codec.encode_keepalive(&ka, gre::VERSION_MIN) {
             let sock = self.paths[i].socket.clone();
             let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Emits one Link Quality Message (TR-06-4 Part 1) when a reporting period has
+    /// elapsed, fanning the Global LQM out every live path with one shared sequence
+    /// number (§5.5 — the message is built once). A no-op when source adaptation is
+    /// off (sender, one-way, or not configured).
+    async fn maybe_emit_lqm(&mut self, now: Timestamp) {
+        if self.lqm.as_ref().is_none_or(|e| !e.due(now)) {
+            return;
+        }
+        let ssrc = self.local_ssrc();
+        let stats = self.flow.stats();
+        let fec = self.fec_recovered();
+        let lqm = self
+            .lqm
+            .as_mut()
+            .expect("emitter present (checked above)")
+            .build(now, &stats, fec);
+        let lqr = LinkQualityReport {
+            ssrc,
+            lqm: lqm.encode(),
+        };
+        for i in 0..self.paths.len() {
+            let Some(dst) = self.paths[i].peer.media() else {
+                continue; // this path's return address is not learned yet
+            };
+            match self.paths[i].codec.encode_feedback(
+                RtcpPacket::LinkQualityReport(lqr),
+                &[],
+                self.bitmask,
+            ) {
+                Ok(bytes) => {
+                    let sock = self.paths[i].socket.clone();
+                    if let Err(e) = sock.send(&bytes, dst).await {
+                        tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded lqm send failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded lqm encode failed: {e}");
+                }
+            }
         }
     }
 

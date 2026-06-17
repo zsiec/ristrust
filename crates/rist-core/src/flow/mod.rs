@@ -283,10 +283,16 @@ impl Flow {
         &self.cfg
     }
 
-    /// A snapshot of this flow's counters.
+    /// A snapshot of this flow's counters, with the live gauges
+    /// ([`smoothed_rtt_us`](Stats::smoothed_rtt_us) and the sender bit-rate fields)
+    /// filled from the current estimator/bitrate state.
     #[must_use]
     pub fn stats(&self) -> Stats {
-        self.stats
+        let mut s = self.stats;
+        s.smoothed_rtt_us = self.est.smoothed().as_micros();
+        s.data_bitrate_bps = self.data_bitrate_bps();
+        s.retry_bitrate_bps = self.retry_bitrate_bps();
+        s
     }
 
     /// Feeds one inbound media packet that arrived on `path` at `now`. Only the

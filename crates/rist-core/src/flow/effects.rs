@@ -101,10 +101,26 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
+    // --- Gauges (filled by [`Flow::stats`](crate::flow::Flow::stats) at snapshot
+    // time from live estimator/bitrate state; they stay 0 in the raw incremental
+    // struct, unlike the counters below which the flow increments in place). ---
+    /// The smoothed round-trip time in microseconds (the RTT EWMA), 0 before the
+    /// first sample. Mirrors libRIST's per-flow `rtt` gauge.
+    pub smoothed_rtt_us: i64,
+    /// The sender's smoothed first-transmission bit rate (bits/sec, 1 s window) —
+    /// libRIST's `bandwidth`. 0 on a receiver flow.
+    pub data_bitrate_bps: i64,
+    /// The sender's smoothed retransmission bit rate (bits/sec, 1 s window) —
+    /// libRIST's `retry_bandwidth`. 0 on a receiver flow.
+    pub retry_bitrate_bps: i64,
+
     // --- Receiver half ---
     /// Media packets accepted into the receiver ring (first copies and accepted
     /// retransmissions; duplicates and too-late drops excluded).
     pub received: u64,
+    /// Payload bytes accepted into the receiver ring (the byte analog of
+    /// [`received`](Self::received)) — libRIST's `received_bytes`.
+    pub received_bytes: u64,
     /// Packets dropped by the `(seq, source_time)` duplicate test — ARQ
     /// duplicates and extra SMPTE 2022-7 path copies alike.
     pub duplicates: u64,
@@ -161,8 +177,12 @@ pub struct Stats {
     // --- Sender half ---
     /// First-transmission media packets emitted by `push_app`.
     pub sent: u64,
+    /// Payload bytes in first-transmission media packets — libRIST's `sent_bytes`.
+    pub sent_bytes: u64,
     /// Retransmission media packets emitted in response to NACK feedback.
     pub retransmitted: u64,
+    /// Payload bytes in retransmission media packets — libRIST's `retransmitted_bytes`.
+    pub retransmitted_bytes: u64,
     /// NACKed sequence numbers no longer in the sender history (aged out or never
     /// sent) and therefore not resendable.
     pub retransmit_skipped: u64,

@@ -144,7 +144,8 @@ impl Flow {
         let seqn = self.sender.next_seq;
         self.sender.next_seq = self.sender.next_seq.wrapping_add(1);
         let source_time = Ntp64::from_timestamp(now).bits();
-        let wire_n = wire_bytes(payload.len());
+        let payload_len = payload.len();
+        let wire_n = wire_bytes(payload_len);
 
         // A no-recovery (one-way) transport never retransmits, so retaining the
         // packet in the history ring would only waste memory: emit and forget. A
@@ -182,6 +183,20 @@ impl Flow {
         });
         self.sender.data_bw.feed(now, wire_n); // recovery_maxbitrate data-rate EWMA
         self.stats.sent += 1;
+        self.stats.sent_bytes += payload_len as u64;
+    }
+
+    /// The sender's smoothed first-transmission bit rate (bits/sec, 1 s window) for
+    /// the [`Stats`](crate::flow::Stats) `data_bitrate_bps` gauge. 0 on a receiver
+    /// flow (the data-rate EWMA is never fed).
+    pub(crate) fn data_bitrate_bps(&self) -> i64 {
+        self.sender.data_bw.slow_bps()
+    }
+
+    /// The sender's smoothed retransmission bit rate (bits/sec, 1 s window) for the
+    /// `retry_bitrate_bps` gauge. 0 on a receiver flow.
+    pub(crate) fn retry_bitrate_bps(&self) -> i64 {
+        self.sender.retry_bw.slow_bps()
     }
 
     /// Retransmits every requested sequence still resendable, applying the
@@ -255,7 +270,8 @@ impl Flow {
                     sl.transmit_count += 1;
                     (sl.source_time, sl.payload.clone(), sl.frag)
                 };
-                let retry_n = wire_bytes(payload.len());
+                let payload_len = payload.len();
+                let retry_n = wire_bytes(payload_len);
                 self.outputs.push_back(Output::SendMedia {
                     path: tx_path,
                     pkt: MediaPacket {
@@ -270,6 +286,7 @@ impl Flow {
                 });
                 self.sender.retry_bw.feed(now, retry_n);
                 self.stats.retransmitted += 1;
+                self.stats.retransmitted_bytes += payload_len as u64;
                 emitted += 1;
                 if emitted >= max_nacks {
                     return; // per-pass retransmit budget exhausted; receiver re-NACKs the rest

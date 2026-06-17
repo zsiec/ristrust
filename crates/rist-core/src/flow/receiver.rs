@@ -439,6 +439,7 @@ impl Flow {
         }
 
         let output_time = packet_time + self.recovery_buffer;
+        let pkt_bytes = pkt.payload.len() as u64;
         {
             let s = &mut self.receiver.ring[idx];
             s.state = SlotState::Filled;
@@ -452,6 +453,7 @@ impl Flow {
             s.path_seen = path_bit(path);
         }
         self.stats.received += 1;
+        self.stats.received_bytes += pkt_bytes;
         if out_of_order {
             self.stats.reordered += 1;
         }
@@ -606,6 +608,7 @@ impl Flow {
     fn start(&mut self, now: Timestamp, path: u8, pkt: MediaPacket) {
         let src = Ntp64::from_bits(pkt.source_time).to_timestamp();
         let output_time = now + self.recovery_buffer;
+        let pkt_bytes = pkt.payload.len() as u64;
         {
             let r = &mut self.receiver;
             r.offset = now - src;
@@ -632,6 +635,7 @@ impl Flow {
             s.path_seen = path_bit(path);
         }
         self.stats.received += 1;
+        self.stats.received_bytes += pkt_bytes;
 
         self.arm_playout(output_time);
         // A no-recovery (one-way) transport has no return channel, so the receiver
@@ -1313,7 +1317,14 @@ mod tests {
         let mut f = recv();
         f.feed(ts(10_000), 0, rtx(100, 0, b"a"));
         assert!(!f.receiver.started, "flow must not start on a retransmit");
-        assert_eq!(f.stats(), crate::flow::Stats::default());
+        // No counters moved (the RTT gauge is seeded to rtt_min, so the full snapshot
+        // is not all-default — assert the counters that should be untouched).
+        let s = f.stats();
+        assert_eq!(s.received, 0);
+        assert_eq!(s.received_bytes, 0);
+        assert_eq!(s.delivered, 0);
+        assert_eq!(s.retransmitted_received, 0);
+        assert_eq!(s.missing, 0);
     }
 
     #[test]

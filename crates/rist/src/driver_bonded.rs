@@ -35,8 +35,10 @@ use rist_core::wire::{Feedback, FragRole, MediaPacket};
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::bonding::Group;
 use crate::codec::{self};
+use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
+use crate::driver_adv::{adv_ctrl_ts, is_adv_framed};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
@@ -164,6 +166,12 @@ pub(crate) struct BondedDriver {
     /// a bonded receiver with source adaptation enabled. The Global LQM is fanned out
     /// every live path with one shared sequence number (§5.5).
     lqm: Option<LqmEmitter>,
+    /// The shared Advanced-profile media codec, `Some` on an Advanced bonded flow. The
+    /// per-path [`MainCodec`] still carries the GRE substrate (EAP / RTCP handshake);
+    /// Advanced media, keepalive, and NACK feedback are adv-framed through this one
+    /// shared codec (encode once, fan to every path; the 2022-7 merge dedups on
+    /// receive). `None` for a Main-profile bonded flow.
+    adv: Option<AdvCodec>,
     /// The source-adaptation rate controller; `Some` on a bonded sender with a rate
     /// callback configured. It folds each inbound LQM into a target bitrate and invokes
     /// the application's `on_rate_adapt` callback.
@@ -187,6 +195,7 @@ impl BondedDriver {
         start_seq: u32,
         weight_rx: mpsc::Receiver<(u8, u32)>,
         rate: Option<RateControl>,
+        adv: Option<AdvCodec>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
@@ -219,6 +228,7 @@ impl BondedDriver {
             fec,
             last_weighted: None,
             lqm: None, // a sender does not emit LQM
+            adv,
             rate,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
@@ -237,6 +247,7 @@ impl BondedDriver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
+        adv: Option<AdvCodec>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
@@ -269,6 +280,7 @@ impl BondedDriver {
             fec,
             last_weighted: None,
             lqm,
+            adv,
             rate: None, // a receiver does not consume LQM
         };
         (rx, close, stats, tokio::spawn(driver.run()))
@@ -323,6 +335,7 @@ impl BondedDriver {
             fec: None,
             last_weighted: None,
             lqm: None, // multi-flow bonded LQM emission is deferred
+            adv: None, // multi-flow bonded Advanced is wired by the caller when needed
             rate: None,
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
@@ -444,6 +457,45 @@ impl BondedDriver {
         }
     }
 
+    /// Decodes one adv-framed (Advanced media / keepalive / NACK) datagram through the
+    /// shared adv codec, feeding media and feedback into the flow. Returns `true` when
+    /// the datagram was adv-framed (and thus consumed here), `false` when it is not
+    /// Advanced or not adv-framed (a raw GRE substrate datagram for the caller to
+    /// handle). The 2022-7 merge dedups copies arriving on other paths.
+    fn handle_adv_inbound(&mut self, now: Timestamp, path_id: u8, data: &Bytes) -> bool {
+        if self.adv.is_none() || !is_adv_framed(data) {
+            return false;
+        }
+        match self.adv.as_mut().unwrap().decode(data) {
+            Ok(Decoded::Media(pkt)) => {
+                if self.learned_ssrc.is_none() {
+                    self.learned_ssrc = Some(pkt.ssrc);
+                }
+                if let Some(e) = self.lqm.as_mut() {
+                    e.meter(pkt.payload.len(), pkt.retransmit);
+                }
+                self.flow.feed(now, path_id, pkt);
+            }
+            Ok(Decoded::Feedback(fbs)) => {
+                for fb in fbs {
+                    if let Feedback::LinkQuality { lqm } = fb {
+                        if let Some(r) = &mut self.rate {
+                            r.handle(&lqm);
+                        }
+                    } else {
+                        self.flow.feed_feedback(now, fb);
+                    }
+                }
+            }
+            Ok(_) => {} // adv keepalive / control: liveness only (recorded by the caller)
+            Err(e) => {
+                let psk = self.adv.as_ref().unwrap().has_psk();
+                crate::driver::decode_warn(psk, "bonded adv", &e);
+            }
+        }
+        true
+    }
+
     /// Handles one inbound datagram: learns its path's peer and liveness, then routes
     /// it as EAP, keepalive, media, or feedback. The receiver tags each datagram with
     /// the path (its bound socket); the sender shares one source socket across all
@@ -500,6 +552,14 @@ impl BondedDriver {
         // Drop non-EAPOL flow input on a path that has not completed its EAP-SRP
         // handshake (per-path authentication gate). A no-op without auth.
         if !self.paths[i].authed {
+            self.drain(now).await;
+            return;
+        }
+
+        // Advanced media / keepalive / NACK feedback are adv-framed through the shared
+        // adv codec; the GRE substrate (EAP above, RTCP handshake below) stays raw GRE
+        // on the per-path main codec.
+        if self.handle_adv_inbound(now, path_id, &inb.data) {
             self.drain(now).await;
             return;
         }
@@ -582,24 +642,42 @@ impl BondedDriver {
                     if !pkt.retransmit && seq_after(pkt.seq, self.highest_sent) {
                         self.highest_sent = pkt.seq;
                     }
-                    // Full 2022-7 redundancy: the identical (seq, source_time) packet
-                    // on every live duplicate-weight path, each in its own GRE frame.
-                    for idx in self.group.duplicate_targets(now) {
-                        self.send_media_on(idx as usize, &pkt).await;
-                    }
-                    // Weighted load-share: route this datagram to one elected weighted
-                    // path (disjoint from the duplicate paths above, so no path is sent
-                    // it twice), splitting the stream in proportion to the weights.
+                    // The 2022-7 fan: the identical (seq, source_time) packet on every
+                    // live duplicate-weight path, plus one elected weighted load-share
+                    // path (disjoint, so no path is sent it twice).
+                    let targets = self.group.duplicate_targets(now);
                     let weighted = self.group.select_weighted(now);
                     self.last_weighted = weighted;
-                    if let Some(idx) = weighted {
-                        self.send_media_on(idx as usize, &pkt).await;
-                    }
-                    // FEC follows the same fan as media (every duplicate path plus the
-                    // elected weighted path): the receiver's one decoder dedups the
-                    // duplication and recovers loss that struck every path at once.
-                    if self.fec.is_some() && !pkt.retransmit {
-                        self.send_bond_fec(now, &pkt).await;
+                    // Advanced encodes the media ONCE via the shared adv codec and fans
+                    // the identical bytes; Main encodes per-path (each path's GRE
+                    // sequence differs).
+                    let adv_bytes = self.adv.as_mut().map(|a| a.encode_media(&pkt));
+                    match adv_bytes {
+                        Some(Ok(bytes)) => {
+                            let bytes = Bytes::from(bytes);
+                            for idx in targets {
+                                self.send_bytes_on(idx as usize, &bytes).await;
+                            }
+                            if let Some(idx) = weighted {
+                                self.send_bytes_on(idx as usize, &bytes).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: bonded adv encode media failed: {e}");
+                        }
+                        None => {
+                            for idx in targets {
+                                self.send_media_on(idx as usize, &pkt).await;
+                            }
+                            if let Some(idx) = weighted {
+                                self.send_media_on(idx as usize, &pkt).await;
+                            }
+                            // FEC follows the same fan as media (Main separate-port FEC;
+                            // in-band FEC over bonded Advanced is deferred).
+                            if self.fec.is_some() && !pkt.retransmit {
+                                self.send_bond_fec(now, &pkt).await;
+                            }
+                        }
                     }
                 }
                 Output::SendFeedback { fb, .. } => fbs.push(fb),
@@ -743,6 +821,22 @@ impl BondedDriver {
 
     /// Encodes and transmits one media packet on path `i`, if it is addressed and
     /// authenticated.
+    /// Sends pre-encoded media `bytes` on path `i` (the Advanced encode-once-fan path;
+    /// the bytes are the shared adv codec's output). A no-op until the path is
+    /// authenticated and its peer is known.
+    async fn send_bytes_on(&mut self, i: usize, bytes: &Bytes) {
+        if !self.paths[i].authed {
+            return;
+        }
+        let Some(dst) = self.paths[i].peer.media() else {
+            return;
+        };
+        let sock = self.paths[i].socket.clone();
+        if let Err(e) = sock.send(bytes, dst).await {
+            tracing::debug!(target: crate::logging::SOCKET, path = i, "rist: bonded send media bytes failed: {e}");
+        }
+    }
+
     async fn send_media_on(&mut self, i: usize, pkt: &rist_core::wire::MediaPacket) {
         if !self.paths[i].authed {
             return;
@@ -792,6 +886,28 @@ impl BondedDriver {
         let Some(dst) = self.paths[i].peer.media() else {
             return;
         };
+        // Advanced feedback (NACKs) is adv-framed through the shared adv codec (one or
+        // more datagrams); Main feedback is a single GRE-framed RTCP compound.
+        let adv_dgs = self
+            .adv
+            .as_mut()
+            .map(|a| a.encode_feedback(fbs, self.bitmask, adv_ctrl_ts(now)));
+        if let Some(result) = adv_dgs {
+            match result {
+                Ok(dgs) => {
+                    let sock = self.paths[i].socket.clone();
+                    for dg in dgs {
+                        if let Err(e) = sock.send(&dg, dst).await {
+                            tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded adv send feedback failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: crate::logging::RTCP, path = i, "rist: bonded adv encode feedback failed: {e}");
+                }
+            }
+            return;
+        }
         let lead = self.feedback_lead(now);
         match self.paths[i].codec.encode_feedback(lead, fbs, self.bitmask) {
             Ok(bytes) => {
@@ -830,20 +946,26 @@ impl BondedDriver {
         }
     }
 
-    /// Sends a GRE keepalive (MAC + standard capabilities) on path `i`.
-    async fn send_keepalive(&mut self, i: usize, _now: Timestamp) {
+    /// Sends a keepalive on path `i`: an adv-framed keepalive on an Advanced flow (the
+    /// shared adv codec), or a GRE keepalive (MAC + standard capabilities) on Main.
+    async fn send_keepalive(&mut self, i: usize, now: Timestamp) {
         if self.flow.config().no_recovery {
             return; // one-way: no control egress
         }
         let Some(dst) = self.paths[i].peer.media() else {
             return;
         };
-        let ka = gre::Keepalive {
-            mac: self.mac,
-            caps: gre::Capabilities::standard(),
-            ..gre::Keepalive::default()
+        let bytes = if let Some(adv) = self.adv.as_mut() {
+            adv.keepalive_datagram(adv_ctrl_ts(now))
+        } else {
+            let ka = gre::Keepalive {
+                mac: self.mac,
+                caps: gre::Capabilities::standard(),
+                ..gre::Keepalive::default()
+            };
+            self.paths[i].codec.encode_keepalive(&ka, gre::VERSION_MIN)
         };
-        if let Ok(bytes) = self.paths[i].codec.encode_keepalive(&ka, gre::VERSION_MIN) {
+        if let Ok(bytes) = bytes {
             let sock = self.paths[i].socket.clone();
             let _ = sock.send(&bytes, dst).await;
         }

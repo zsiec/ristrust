@@ -131,6 +131,46 @@ async fn bonded_two_paths_aes256() {
     .await;
 }
 
+/// A bonded Advanced-profile base config (media driven by the shared adv codec).
+fn bonded_adv_cfg() -> Config {
+    Config::default()
+        .with_profile(Profile::Advanced)
+        .with_buffer(Duration::from_millis(200))
+}
+
+#[tokio::test]
+async fn bonded_advanced_two_paths_clean() {
+    // Advanced media over two 2022-7 paths: encode-once-fan on the shared adv codec,
+    // dedup on the merge — each payload delivered once, in order.
+    run_bonded(bonded_adv_cfg(), 2, 60, "adv-payload", |_| {
+        Arc::new(TokioRuntime)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn bonded_advanced_two_paths_aes256() {
+    run_bonded(
+        bonded_adv_cfg().with_secret("bond-adv-secret"),
+        2,
+        60,
+        "adv-encrypted",
+        |_| Arc::new(TokioRuntime),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bonded_advanced_survives_one_path_blackhole() {
+    // Advanced 2022-7 redundancy: path 0's forward media is dropped; path 1 carries the
+    // whole stream seamlessly.
+    let body = "x".repeat(200);
+    run_bonded(bonded_adv_cfg(), 2, 60, &body, |dests| {
+        Arc::new(PathTapRuntime::blackholing(dests, 0))
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn bonded_survives_one_path_blackhole() {
     // Path 0's forward media (everything sent to its remote) is entirely dropped; the

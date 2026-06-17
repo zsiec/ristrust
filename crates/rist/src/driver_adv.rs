@@ -54,7 +54,7 @@ const PASSPHRASE_PUSH_ID: u8 = 0x40;
 
 /// Whether `data` is Advanced framing (RTP V=2, PT 127 or a dynamic type ≥ 96)
 /// rather than a raw Main-profile GRE packet.
-fn is_adv_framed(data: &[u8]) -> bool {
+pub(crate) fn is_adv_framed(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] & 0xC0 == 0x80 && {
         let pt = data[1] & 0x7F;
         pt == adv::PAYLOAD_TYPE || pt >= 96
@@ -64,7 +64,7 @@ fn is_adv_framed(data: &[u8]) -> bool {
 /// The Advanced control/media RTP timestamp for a session instant (the effective
 /// 2^16 MHz rate: `micros << 16`).
 #[allow(clippy::cast_possible_truncation)]
-fn adv_ctrl_ts(now: Timestamp) -> u32 {
+pub(crate) fn adv_ctrl_ts(now: Timestamp) -> u32 {
     (now.as_micros() << 16) as u32
 }
 

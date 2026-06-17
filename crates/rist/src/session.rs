@@ -1105,6 +1105,34 @@ fn require_main(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
+/// The gate for the single-socket (Main/Advanced) bonded driver: admits Main and
+/// Advanced (the Simple even/odd pair bonds through its own driver), rejects DTLS, and
+/// rejects EAP-SRP on Advanced — Advanced bonding keys media through ONE shared adv
+/// codec, which cannot hold the per-path SRP session keys, so it requires a shared PSK
+/// (or cleartext).
+fn require_bondable(cfg: &Config) -> io::Result<()> {
+    if cfg.profile == Profile::Simple {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: this bonded transport requires the Main or Advanced profile",
+        ));
+    }
+    #[cfg(feature = "dtls")]
+    if cfg.dtls.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: DTLS is not supported with SMPTE 2022-7 bonding",
+        ));
+    }
+    if cfg.profile == Profile::Advanced && cfg.srp_username.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: EAP-SRP is not supported with Advanced-profile bonding (shared media codec)",
+        ));
+    }
+    Ok(())
+}
+
 /// Builds and spawns a bonded Main-profile sender that fans identical media across
 /// every remote in `remotes` (full SMPTE 2022-7 redundancy, weight 0). All paths
 /// share **one** source socket — so a multiplexing receiver sees the sender's paths
@@ -1120,7 +1148,7 @@ pub(crate) fn build_bonded_sender(
     cfg: &Config,
     peers: &[(SocketAddr, u32)],
 ) -> io::Result<SenderSpawned> {
-    require_main(cfg)?;
+    require_bondable(cfg)?;
     let &(first_remote, _) = peers.first().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1153,6 +1181,11 @@ pub(crate) fn build_bonded_sender(
     }
     // The runtime `set_weight` command channel (rare control traffic, small depth).
     let (weight_tx, weight_rx) = mpsc::channel(16);
+    // Advanced bonding drives media through one shared adv codec; Main keys media on the
+    // per-path codecs above.
+    let adv = (cfg.profile == Profile::Advanced)
+        .then(|| build_adv_codec(cfg, ssrc))
+        .transpose()?;
     let (app_in, close, stats, task) = BondedDriver::spawn_sender(
         flow,
         group,
@@ -1164,6 +1197,7 @@ pub(crate) fn build_bonded_sender(
         start_seq,
         weight_rx,
         RateControl::from_config(cfg),
+        adv,
         build_fec(cfg),
     );
     Ok(SenderSpawned {
@@ -1193,7 +1227,7 @@ pub(crate) fn build_bonded_receiver(
     cfg: &Config,
     locals: &[SocketAddr],
 ) -> io::Result<ReceiverSpawned> {
-    require_main(cfg)?;
+    require_bondable(cfg)?;
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let mut group = bonding_group(cfg);
     let mut paths = Vec::with_capacity(locals.len());
@@ -1233,6 +1267,9 @@ pub(crate) fn build_bonded_receiver(
             "rist: bonded receiver needs at least one local address",
         )
     })?;
+    let adv = (cfg.profile == Profile::Advanced)
+        .then(|| build_adv_codec(cfg, DEFAULT_FLOW_SSRC))
+        .transpose()?;
     let (data_out, close, stats, task) = BondedDriver::spawn_receiver(
         flow,
         group,
@@ -1242,6 +1279,7 @@ pub(crate) fn build_bonded_receiver(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         build_lqm_emitter(cfg),
+        adv,
         build_fec(cfg),
     );
     Ok(ReceiverSpawned {

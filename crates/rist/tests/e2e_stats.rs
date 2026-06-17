@@ -254,6 +254,78 @@ async fn stats_zero_the_other_role_fields() {
     receiver.close().await.expect("close receiver");
 }
 
+#[tokio::test]
+async fn authenticated_and_ssrc_reflect_an_srp_session() {
+    // Main + EAP-SRP: media flows only after the handshake, so once media is delivered
+    // both ends report authenticated() and the receiver has learned the media SSRC.
+    let cfg = Config::default()
+        .with_profile(Profile::Main)
+        .with_buffer(Duration::from_millis(150))
+        .with_keepalive(Duration::from_millis(100)) // publish status promptly
+        .with_srp_credentials("rist", "statspass");
+
+    // A Main receiver on an OS-chosen free port.
+    let (mut receiver, port) = {
+        let mut found = None;
+        for _ in 0..64 {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
+            let p = probe.local_addr().expect("addr").port();
+            drop(probe);
+            if p == 0 {
+                continue;
+            }
+            if let Ok(r) = listen(&format!("127.0.0.1:{p}"), cfg.clone()).await {
+                found = Some((r, p));
+                break;
+            }
+        }
+        found.expect("free main port")
+    };
+    let sender = dial(&format!("127.0.0.1:{port}"), cfg.clone())
+        .await
+        .expect("dial the SRP receiver");
+
+    let send_task = tokio::spawn(async move {
+        for i in 0..20 {
+            if sender
+                .send(format!("auth-{i:03}").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await; // let a status tick fire
+        sender
+    });
+    for i in 0..10 {
+        tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on payload {i}: SRP media did not flow"))
+            .expect("session stayed open");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await; // let the receiver tick publish
+    let sender = send_task.await.expect("send task");
+
+    assert!(
+        receiver.authenticated(),
+        "receiver should report authenticated after the SRP handshake"
+    );
+    assert!(
+        sender.authenticated(),
+        "sender should report authenticated after the SRP handshake"
+    );
+    assert_ne!(
+        receiver.ssrc(),
+        0,
+        "receiver should have learned the media SSRC"
+    );
+
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
 #[test]
 fn default_stats_is_all_zero() {
     // The pre-publish snapshot a handle reads before any session work is all zero.

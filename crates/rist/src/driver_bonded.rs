@@ -379,6 +379,9 @@ impl BondedDriver {
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         keepalive.tick().await; // consume the immediate first tick
 
+        // Initial status (no-EAP paths are authenticated immediately).
+        self.stats.set_authenticated(self.all_authed());
+
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             // Media is gated until every path's data channel is open; recompute each
@@ -427,6 +430,11 @@ impl BondedDriver {
                     // Source adaptation: fan a Global LQM out every live path when a
                     // reporting period has elapsed (receiver only).
                     self.maybe_emit_lqm(now).await;
+                    // Publish session status for the handle's authenticated()/ssrc().
+                    self.stats.set_authenticated(self.all_authed());
+                    if let Some(s) = self.learned_ssrc {
+                        self.stats.set_ssrc(s);
+                    }
                 },
             }
         }

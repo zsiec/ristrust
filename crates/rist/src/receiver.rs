@@ -79,6 +79,22 @@ impl Receiver {
         self.stats.snapshot()
     }
 
+    /// Whether the session is authenticated: `true` once the Main/Advanced EAP-SRP
+    /// handshake has completed, or immediately for a session with no authentication
+    /// configured (no credentials, or the Simple profile). Updated by the session task.
+    #[must_use]
+    pub fn authenticated(&self) -> bool {
+        self.stats.authenticated()
+    }
+
+    /// The media SSRC learned from the first received packet, or `0` until one has
+    /// arrived (ristgo `Receiver.SSRC`). For a bonded receiver it is the single merged
+    /// stream's SSRC.
+    #[must_use]
+    pub fn ssrc(&self) -> u32 {
+        self.stats.ssrc()
+    }
+
     /// Reads the next out-of-band datagram's payload (the protocol type is
     /// discarded; use [`Receiver::read_oob_typed`] to keep it).
     ///

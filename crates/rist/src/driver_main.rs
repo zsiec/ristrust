@@ -508,6 +508,9 @@ impl MainDriver {
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         keepalive.tick().await; // consume the immediate first tick
 
+        // Initial status (a no-EAP session is authenticated immediately).
+        self.stats.set_authenticated(self.authed);
+
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
@@ -592,6 +595,11 @@ impl MainDriver {
                         // Source adaptation: emit a Link Quality Message when a
                         // reporting period has elapsed (receiver only).
                         self.maybe_emit_lqm(now).await;
+                    }
+                    // Publish session status for the handle's authenticated()/ssrc().
+                    self.stats.set_authenticated(self.authed);
+                    if let Some(s) = self.learned_ssrc {
+                        self.stats.set_ssrc(s);
                     }
                 },
             }

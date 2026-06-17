@@ -5,6 +5,7 @@
 //! each event; the public [`Sender`](crate::Sender) / [`Receiver`](crate::Receiver)
 //! handle reads the latest snapshot through its `stats()` method.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A snapshot of a [`Sender`](crate::Sender)'s or [`Receiver`](crate::Receiver)'s
@@ -74,11 +75,26 @@ impl From<rist_core::flow::Stats> for Stats {
     }
 }
 
-/// A shared cell holding a session's latest [`Stats`] snapshot: the driver task
-/// publishes into it after each event; the public handle reads it. Cloned between a
-/// driver and its `Sender`/`Receiver` handle.
+/// The shared state behind a [`StatsCell`]: the latest counter snapshot plus the
+/// two lightweight session-status fields the public handles expose
+/// (`authenticated` / `ssrc`), kept as atomics so the driver can update them without
+/// taking the stats mutex.
+#[derive(Debug, Default)]
+struct CellInner {
+    stats: Mutex<Stats>,
+    /// Whether the session is authenticated: `true` immediately for a session with no
+    /// EAP-SRP (none required), or once the handshake completes.
+    authenticated: AtomicBool,
+    /// The media SSRC the receiver learned from the first packet (`0` until learned).
+    ssrc: AtomicU32,
+}
+
+/// A shared cell holding a session's latest [`Stats`] snapshot plus its
+/// authenticated / learned-SSRC status: the driver task publishes into it; the
+/// public handle reads it. Cloned between a driver and its `Sender`/`Receiver`
+/// handle.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct StatsCell(Arc<Mutex<Stats>>);
+pub(crate) struct StatsCell(Arc<CellInner>);
 
 impl StatsCell {
     /// Publishes the flow core's current counters as the latest snapshot, layering on
@@ -86,11 +102,31 @@ impl StatsCell {
     pub(crate) fn publish(&self, core: rist_core::flow::Stats, fec_recovered: u64) {
         let mut snapshot: Stats = core.into();
         snapshot.fec_recovered = fec_recovered;
-        *self.0.lock().expect("stats mutex poisoned") = snapshot;
+        *self.0.stats.lock().expect("stats mutex poisoned") = snapshot;
     }
 
     /// Reads the latest published snapshot (all-zero until the first publish).
     pub(crate) fn snapshot(&self) -> Stats {
-        *self.0.lock().expect("stats mutex poisoned")
+        *self.0.stats.lock().expect("stats mutex poisoned")
+    }
+
+    /// Records whether the session is currently authenticated (driver-side).
+    pub(crate) fn set_authenticated(&self, yes: bool) {
+        self.0.authenticated.store(yes, Ordering::Relaxed);
+    }
+
+    /// Whether the session is authenticated (handle-side read).
+    pub(crate) fn authenticated(&self) -> bool {
+        self.0.authenticated.load(Ordering::Relaxed)
+    }
+
+    /// Records the media SSRC a receiver learned (driver-side).
+    pub(crate) fn set_ssrc(&self, ssrc: u32) {
+        self.0.ssrc.store(ssrc, Ordering::Relaxed);
+    }
+
+    /// The learned media SSRC, or `0` until a packet has been received (handle-side).
+    pub(crate) fn ssrc(&self) -> u32 {
+        self.0.ssrc.load(Ordering::Relaxed)
     }
 }

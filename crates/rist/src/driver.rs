@@ -359,6 +359,9 @@ impl Driver {
         keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
         keepalive.tick().await; // consume the immediate first tick
 
+        // The Simple profile has no authentication: it is always "authenticated".
+        self.stats.set_authenticated(true);
+
         loop {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
@@ -392,6 +395,12 @@ impl Driver {
                         // Source adaptation: emit a Link Quality Message when a
                         // reporting period has elapsed (receiver only).
                         self.maybe_emit_lqm(now).await;
+                    }
+                    // Publish session status: the Simple profile has no authentication,
+                    // so the session is always "authenticated"; surface the learned SSRC.
+                    self.stats.set_authenticated(true);
+                    if let Some(s) = self.learned_ssrc {
+                        self.stats.set_ssrc(s);
                     }
                 },
             }

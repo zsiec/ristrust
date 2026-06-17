@@ -70,6 +70,14 @@ impl Sender {
         self.stats.snapshot()
     }
 
+    /// Whether the session is authenticated: `true` once the Main/Advanced EAP-SRP
+    /// handshake has completed, or immediately for a session with no authentication
+    /// configured (no credentials, or the Simple profile). Updated by the session task.
+    #[must_use]
+    pub fn authenticated(&self) -> bool {
+        self.stats.authenticated()
+    }
+
     /// Changes the SMPTE 2022-7 load-share weight of bonded path `path` at runtime
     /// (`0` returns it to full duplication; `> 0` puts it in the weighted rotation).
     /// Takes effect from the next rotation round.

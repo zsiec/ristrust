@@ -285,8 +285,10 @@ impl AdvCodec {
 
     /// Reconstructs a [`MediaPacket`] from a parsed DIRECT packet: decrypt (AES-CTR
     /// mode 1) then decompress (LZ4), then map the native 32-bit sequence and the
-    /// wrapping timestamp to the normalized fields. Fragments are rejected (libRIST
-    /// never fragments).
+    /// wrapping timestamp to the normalized fields. The F/L bits map to the packet's
+    /// [`FragRole`](rist_core::wire::FragRole) (the host reassembler folds a run);
+    /// libRIST always sends whole packets (F=L=1, `Standalone`), so an interop peer
+    /// only ever yields that role.
     fn decode_media_adv(&mut self, p: &adv::Parsed) -> Result<MediaPacket, CodecError> {
         let mut data: Vec<u8> = p.payload.to_vec();
 

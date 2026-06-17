@@ -162,6 +162,52 @@ impl SimpleSocket {
         })
     }
 
+    /// Binds an ephemeral **consecutive** even/odd pair: a free even media port and its
+    /// odd neighbor (`media + 1`) for RTCP. Used by the reversed-role caller-receiver so
+    /// a listener-sender can derive the caller's media port as `rtcp_port - 1` (matching
+    /// libRIST/ristgo). Probes for a free even port whose neighbor is also free.
+    ///
+    /// # Errors
+    /// Returns an I/O error if no free even/odd pair can be bound, or the egress options
+    /// cannot be applied.
+    pub(crate) fn dial_ephemeral_paired(
+        rt: &dyn Runtime,
+        ipv6: bool,
+        egress: Option<&Egress>,
+    ) -> io::Result<SimpleSocket> {
+        let unspecified = if ipv6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+        for _ in 0..64 {
+            let media = rt.bind(SocketAddr::new(unspecified, 0))?;
+            let port = media.local_addr()?.port();
+            if !port.is_multiple_of(2) {
+                continue; // odd media port: drop it and retry for an even one
+            }
+            let mut rtcp_addr = SocketAddr::new(unspecified, 0);
+            rtcp_addr.set_port(port + 1);
+            let Ok(rtcp) = rt.bind(rtcp_addr) else {
+                continue; // the odd neighbor is taken: retry a fresh pair
+            };
+            if let Some(e) = egress {
+                media.set_multicast_egress(e)?;
+                rtcp.set_multicast_egress(e)?;
+            }
+            return Ok(SimpleSocket {
+                media,
+                rtcp,
+                fec_col: None,
+                fec_row: None,
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "rist: socket: no free even/odd port pair for a reversed-role caller-receiver",
+        ))
+    }
+
     /// The local media (even) address the transport is bound to.
     ///
     /// # Errors

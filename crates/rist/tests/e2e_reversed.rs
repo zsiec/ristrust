@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use rist::{AesKeyBits, Config, Error, Profile, Sender, dial_receiver, listen_sender};
+use rist::{AesKeyBits, Config, Profile, Sender, dial_receiver, listen_sender};
 
 /// A reversed-role base config for `profile` with a short recovery buffer.
 fn rev_cfg(profile: Profile, secret: Option<&str>) -> Config {
@@ -93,15 +93,10 @@ async fn reversed_role_delivers_advanced_aes256() {
 }
 
 #[tokio::test]
-async fn listen_sender_rejects_simple() {
-    // The default profile is Simple; reversed-role requires Main or Advanced.
-    let err = listen_sender("127.0.0.1:5000", Config::default())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, Error::Io(_)),
-        "expected the Simple-profile rejection"
-    );
+async fn reversed_role_delivers_simple() {
+    // Simple reversed-role: the listener-sender learns the caller's even media port from
+    // its odd RTCP announcement and streams to it, held until the caller is known.
+    reversed_round_trip(Profile::Simple, None).await;
 }
 
 #[tokio::test]

@@ -789,13 +789,14 @@ pub(crate) fn build_injected_bonded(
 /// supported (the single bidirectional GRE socket carries the handshake once the
 /// peer is learned — the media sender is the authenticatee whichever side dials),
 /// but DTLS is not.
+// All three profiles support reversed-role transport (Simple via the even/odd pair,
+// Main/Advanced via the single GRE port). Only DTLS is excluded, so `cfg` is read
+// solely by the feature-gated check below.
+#[cfg_attr(
+    not(feature = "dtls"),
+    allow(unused_variables, clippy::unnecessary_wraps)
+)]
 fn require_reversible(cfg: &Config) -> io::Result<()> {
-    if cfg.profile == Profile::Simple {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: reversed-role transport requires the Main or Advanced profile",
-        ));
-    }
     // Reversed-role peer-learning (a sender that waits, or a receiver that dials an
     // announcer) is not modelled by the DTLS client/server handshake here.
     #[cfg(feature = "dtls")]
@@ -810,12 +811,15 @@ fn require_reversible(cfg: &Config) -> io::Result<()> {
 
 /// Builds a reversed-role **listener-sender**: a media *sender* that binds the
 /// well-known port and waits, learning the receiver's address from its inbound
-/// announcement (the caller-receiver), then sending media to it. Media is held
-/// until that address is known. Main profile only; PSK and EAP-SRP supported (the
-/// sender is the authenticatee and opens its EAPOL-START once it learns the caller).
+/// announcement (the caller-receiver), then sending media to it. Media is held until
+/// that address is known. All profiles; PSK and EAP-SRP supported (the sender is the
+/// authenticatee and opens its EAPOL-START once it learns the caller).
 ///
 /// # Errors
 /// As [`build_listener_sender`]'s profile/feature checks, or an I/O bind error.
+// A per-profile dispatch builder (Simple / Advanced / Main); splitting it would only
+// scatter the per-profile session wiring.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_listener_sender(
     rt: &dyn Runtime,
     cfg: &Config,
@@ -826,10 +830,42 @@ pub(crate) fn build_listener_sender(
     let start_seq = random_start_seq();
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     let membership = crate::multicast::receiver_membership(cfg, local)?;
-    let socket = MainSocket::listen(rt, local, membership.as_ref())?;
-    let bound = socket.local()?;
     // Empty peer: the caller-receiver's announcement teaches us where to send.
     let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+
+    // Simple reversed-role listener-sender: bind the even/odd pair and learn the caller
+    // from its RTCP announcement (the Simple driver derives the caller's even media port
+    // from the odd RTCP source and holds media until then).
+    if cfg.profile == Profile::Simple {
+        let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
+        let bound = socket.media_local()?;
+        let (app_in, close, stats, task) = Driver::spawn_sender(
+            flow,
+            socket,
+            peer,
+            ssrc,
+            cname_of(cfg),
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            start_seq,
+            RateControl::from_config(cfg),
+            None, // FEC + reversed-role deferred
+        );
+        return Ok(SenderSpawned {
+            local: bound,
+            app_in,
+            weight_cmd: None,
+            flow_attr_cmd: None,
+            oob_in: None,
+            oob_out: None,
+            close,
+            stats,
+            task,
+        });
+    }
+
+    let socket = MainSocket::listen(rt, local, membership.as_ref())?;
+    let bound = socket.local()?;
 
     // Advanced reversed-role listener-sender: same single-GRE-port listen + learn-the-
     // caller setup, driven by the Advanced codec (the AdvDriver holds media until the
@@ -922,6 +958,40 @@ pub(crate) fn build_caller_receiver(
     require_reversible(cfg)?;
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let egress = crate::multicast::sender_egress(cfg, remote)?;
+
+    // Simple reversed-role caller-receiver: dial the listener-sender's even/odd pair and
+    // announce via RTCP (the keepalive RR teaches the sender our address); media then
+    // flows to our even media port.
+    if cfg.profile == Profile::Simple {
+        // A consecutive even/odd pair so the listener-sender can derive our media port
+        // as (rtcp source port - 1) from our RTCP announcement.
+        let socket = SimpleSocket::dial_ephemeral_paired(rt, remote.is_ipv6(), egress.as_ref())?;
+        let local = socket.media_local()?;
+        let mut rtcp = remote;
+        rtcp.set_port(remote.port().wrapping_add(1));
+        let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, rtcp);
+        let (data_out, close, stats, task) = Driver::spawn_receiver(
+            flow,
+            socket,
+            peer,
+            DEFAULT_FLOW_SSRC,
+            cname_of(cfg),
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            build_lqm_emitter(cfg),
+            None, // FEC + reversed-role deferred
+        );
+        return Ok(ReceiverSpawned {
+            local,
+            data_out,
+            oob_out: None,
+            oob_in: None,
+            close,
+            stats,
+            task,
+        });
+    }
+
     let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
     let local = socket.local()?;
     // The sender's address is known up front (we dialled it), so we announce to it.

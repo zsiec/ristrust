@@ -369,7 +369,10 @@ impl Driver {
                     Some(inb) => self.on_inbound(inb).await,
                     None => break, // the reader exited (socket error) or the demuxer closed
                 },
-                payload = recv_app(&mut self.app_in) => match payload {
+                // Hold media until the peer's media address is known: a normal sender
+                // knows it at construction (always ready); a reversed-role listener-sender
+                // holds until it learns the caller from the caller's RTCP announcement.
+                payload = recv_app_gated(&mut self.app_in, self.peer.media().is_some()) => match payload {
                     Some(p) => {
                         let now = self.now();
                         self.flow.push_app(now, p);
@@ -499,6 +502,17 @@ impl Driver {
     async fn on_rtcp(&mut self, src: SocketAddr, data: &[u8]) {
         let now = self.now();
         self.peer.learn_rtcp(src);
+        // Reversed-role listener-sender: a caller-receiver announces via RTCP only, so
+        // derive its media address from the RTCP source (the even media port is the odd
+        // RTCP port minus one, since the caller binds a consecutive pair) and learn it.
+        // Gated to the sender role: a normal sender's media address is already locked
+        // from the dial (so this is a no-op), and a receiver must not derive a peer media
+        // address from RTCP (the peer's ports need not be consecutive).
+        if self.sender
+            && let Some(media_port) = src.port().checked_sub(1)
+        {
+            self.peer.learn_media(SocketAddr::new(src.ip(), media_port));
+        }
         self.peer.observe(now);
         if let Ok(fbs) = codec::decode_feedback(data, self.highest_sent) {
             for fb in fbs {
@@ -793,7 +807,14 @@ fn spawn_reader(
 
 /// Awaits the next application payload, or never resolves when there is no
 /// application input channel (the receiver half).
-async fn recv_app(app_in: &mut Option<mpsc::Receiver<Bytes>>) -> Option<Bytes> {
+/// Receives the next application payload, gated on `ready`: while `ready` is false the
+/// future never resolves, so a reversed-role listener-sender holds its application
+/// media until it has learned the caller's address. A normal sender knows its peer at
+/// construction, so `ready` is always true and this is a plain receive.
+async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, ready: bool) -> Option<Bytes> {
+    if !ready {
+        return std::future::pending().await;
+    }
     match app_in {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,

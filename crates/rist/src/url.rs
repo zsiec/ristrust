@@ -428,12 +428,14 @@ const RECOGNIZED_URL_PARAMS: &[&str] = &[
     "timing-mode",
     "split",
     "merge",
-    // Accepted-and-ignored for libRIST URL portability (not implemented as a
-    // single-session URL value): `srp-compat` legacy SRP mode, `recovery-priority`
-    // per-peer NACK priority (a bonded-peer concept), `reflector` one-to-many
+    // `srp-compat` (legacy pre-0.2.16 SRP mode) IS parsed and honored — see
+    // `apply_string_and_feature_params` and `with_srp_compat`.
+    "srp-compat",
+    // Accepted-and-ignored for libRIST URL portability (recognized but not yet acted
+    // on): `recovery-priority` per-peer NACK priority (a bonded-peer concept whose
+    // selection algorithm exists but is never set non-zero), `reflector` one-to-many
     // fan-out, and `local-port` caller fixed source port. Rejecting a valid libRIST
     // URL over these is the worse failure for portability.
-    "srp-compat",
     "recovery-priority",
     "reflector",
     "local-port",

@@ -24,9 +24,10 @@ use super::keyexchange::{
     new_rsa_premaster,
 };
 use super::messages::{
-    CertificateMsg, ClientHello, HandshakeType, HelloVerifyRequest, ServerHello, ServerKeyExchange,
-    client_key_exchange_ecdhe, client_key_exchange_psk, client_key_exchange_rsa,
-    parse_client_key_exchange_ecdhe, parse_client_key_exchange_psk, parse_client_key_exchange_rsa,
+    CertificateMsg, CertificateVerify, ClientHello, HandshakeType, HelloVerifyRequest, ServerHello,
+    ServerKeyExchange, certificate_request_body, client_key_exchange_ecdhe,
+    client_key_exchange_psk, client_key_exchange_rsa, parse_client_key_exchange_ecdhe,
+    parse_client_key_exchange_psk, parse_client_key_exchange_rsa,
 };
 use super::prf::{
     LABEL_CLIENT_FINISHED, LABEL_SERVER_FINISHED, PrfHash, extended_master_secret,
@@ -74,6 +75,9 @@ pub trait Transport {
 
 /// DTLS connection configuration. At least one authentication method (a PSK, or a
 /// certificate for the ECDHE / RSA-transport suites) must be set.
+// Each boolean is an orthogonal, independently-toggled policy knob on a public config;
+// folding them into an enum or bitflags would obscure the per-field documentation.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The pre-shared key enabling `TLS_PSK_WITH_AES_128_GCM_SHA256`.
@@ -89,8 +93,18 @@ pub struct Config {
     /// certificate suites.
     pub insecure_skip_verify: bool,
     /// Accept only a peer leaf whose SHA-256 fingerprint matches this pin. When set,
-    /// the client offers the certificate suites.
+    /// the client offers the certificate suites. On a server with
+    /// [`require_client_cert`](Config::require_client_cert) it additionally pins the
+    /// accepted client leaf.
     pub peer_cert_fingerprint: Option<[u8; 32]>,
+    /// Mutual authentication: when set, a certificate-suite **server** sends a
+    /// CertificateRequest and rejects a client that does not present a certificate
+    /// proven by a valid CertificateVerify (RFC 5246 §7.4.4/§7.4.8). A **client**
+    /// presents its [`certificate`](Config::certificate) whenever the server asks,
+    /// regardless of this flag. The presented client leaf is verified with the same
+    /// [`insecure_skip_verify`](Config::insecure_skip_verify) /
+    /// [`peer_cert_fingerprint`](Config::peer_cert_fingerprint) policy as a server leaf.
+    pub require_client_cert: bool,
     /// Require the peer to confirm `extended_master_secret` (RFC 7627). When
     /// `false` (the default) EMS is offered and used when the peer agrees, but its
     /// omission is tolerated for interop.
@@ -117,6 +131,7 @@ impl Default for Config {
             certificate: None,
             insecure_skip_verify: false,
             peer_cert_fingerprint: None,
+            require_client_cert: false,
             require_extended_master_secret: false,
             disabled_suites: Vec::new(),
             allow_null_cipher: false,
@@ -350,6 +365,10 @@ impl<T: Transport> Conn<T> {
 
     // --- client handshake ---
 
+    // The six DTLS flights are one linear sequence whose ordering (and the transcript
+    // hashing interleaved with it) is the logic; splitting it across helpers would hide
+    // the flow rather than clarify it. The server counterpart is structured the same way.
+    #[allow(clippy::too_many_lines)]
     fn client_handshake(&mut self) -> io::Result<()> {
         let client_random = random32()?;
 
@@ -393,17 +412,18 @@ impl<T: Transport> Conn<T> {
             return Err(proto("server omitted extended_master_secret"));
         }
 
-        // This implementation never performs client authentication, so a
-        // CertificateRequest is unexpected (and would otherwise prompt a client
-        // certificate, which a PSK handshake must never emit in the clear).
-        if f4
+        // A CertificateRequest asks the client to authenticate. It is meaningful only
+        // in a certificate handshake; in a PSK handshake honoring it would emit a
+        // certificate over the cleartext epoch-0 channel, so reject it there.
+        let cert_requested = f4
             .iter()
-            .any(|m| m.typ == HandshakeType::CertificateRequest)
-        {
-            return Err(proto("unexpected CertificateRequest"));
+            .any(|m| m.typ == HandshakeType::CertificateRequest);
+        if cert_requested && self.suite.kx == KeyExchange::Psk {
+            return Err(proto("unexpected CertificateRequest in PSK handshake"));
         }
 
-        // Flight 5: derive the premaster and the ClientKeyExchange body per the
+        // Flight 5: [Certificate,] ClientKeyExchange, [CertificateVerify,] CCS,
+        // Finished. Derive the premaster and the ClientKeyExchange body per the
         // negotiated suite's key exchange.
         let (pre_master, cke) = match self.suite.kx {
             KeyExchange::Psk => {
@@ -420,7 +440,28 @@ impl<T: Transport> Conn<T> {
             KeyExchange::Ecdhe => self.client_ecdhe(&f4, &client_random, &server_random)?,
             KeyExchange::Rsa => self.client_rsa(&f4)?,
         };
-        let cke_spec = self.emit_handshake(HandshakeType::ClientKeyExchange, &cke, 0, true);
+
+        let mut f5 = Vec::new();
+        // When asked, present our certificate — an empty chain if none is configured,
+        // which the server's `require_client_cert` then rejects. The same identity
+        // signs the CertificateVerify below.
+        let client_identity = if cert_requested {
+            self.cfg.certificate.clone()
+        } else {
+            None
+        };
+        if cert_requested {
+            let chain = client_identity
+                .as_ref()
+                .map(|id| vec![id.der().to_vec()])
+                .unwrap_or_default();
+            let cert_body = CertificateMsg { chain }.marshal_body();
+            f5.push(self.emit_handshake(HandshakeType::Certificate, &cert_body, 0, true));
+        }
+
+        f5.push(self.emit_handshake(HandshakeType::ClientKeyExchange, &cke, 0, true));
+        // The transcript now runs through ClientKeyExchange: the seed for the EMS
+        // master secret, and the region a CertificateVerify signs.
         let session_hash = self.transcript_hash();
         let master = derive_master(
             self.suite.hash,
@@ -438,19 +479,35 @@ impl<T: Transport> Conn<T> {
         ));
         self.drain_pending()?;
 
+        // Prove possession of the certificate's private key by signing the transcript
+        // through ClientKeyExchange (RFC 5246 §7.4.8); sent only when we presented a
+        // certificate.
+        if cert_requested && let Some(id) = client_identity.as_ref() {
+            let (sig_scheme, signature) =
+                cert::sign_handshake(id, &self.transcript).map_err(dtls_err)?;
+            let cv_body = CertificateVerify {
+                sig_scheme,
+                signature,
+            }
+            .marshal_body();
+            f5.push(self.emit_handshake(HandshakeType::CertificateVerify, &cv_body, 0, true));
+        }
+
+        // The client Finished covers the transcript through CertificateVerify, so its
+        // verify_data is taken after the CV is hashed (with no CV this equals the
+        // through-ClientKeyExchange hash, so the non-mutual path is unchanged).
         let client_fin = finished_verify_data(
             self.suite.hash,
             &master,
             LABEL_CLIENT_FINISHED,
-            &session_hash,
+            &self.transcript_hash(),
         );
-        let ccs = RecordSpec {
+        f5.push(RecordSpec {
             typ: ContentType::ChangeCipherSpec,
             epoch: 0,
             payload: vec![1],
-        };
-        let fin_spec = self.emit_handshake(HandshakeType::Finished, &client_fin, 1, true);
-        let f5 = vec![cke_spec, ccs, fin_spec];
+        });
+        f5.push(self.emit_handshake(HandshakeType::Finished, &client_fin, 1, true));
         self.send_flight(&f5)?;
 
         // Flight 6: ChangeCipherSpec, Finished (server).
@@ -682,6 +739,17 @@ impl<T: Transport> Conn<T> {
                 server_secret = Some(secret);
             }
         }
+        // Mutual auth: a certificate-suite server asks the client to authenticate.
+        // (A CertificateRequest is meaningless without a server certificate, so it is
+        // gated on `cert_suite`.)
+        if cert_suite && self.cfg.require_client_cert {
+            f4.push(self.emit_handshake(
+                HandshakeType::CertificateRequest,
+                &certificate_request_body(),
+                0,
+                true,
+            ));
+        }
         f4.push(self.emit_handshake(HandshakeType::ServerHelloDone, &[], 0, true));
         self.send_flight(&f4)?;
 
@@ -690,6 +758,35 @@ impl<T: Transport> Conn<T> {
         // until the keys derived from this ClientKeyExchange exist.
         let f5 = self.read_flight(HandshakeType::ClientKeyExchange, &f4)?;
         let cke_in = single(&f5, HandshakeType::ClientKeyExchange)?;
+
+        // Mutual auth: a client Certificate precedes the ClientKeyExchange. Hash it
+        // into the transcript first (preserving wire order), then parse and verify the
+        // leaf against our peer policy. The leaf is held aside, NOT authenticated: a
+        // CertificateVerify must prove possession of its private key before it counts
+        // (RFC 5246 §7.4.8) — otherwise an attacker holding only the victim's public
+        // certificate could impersonate the owner, defeating the fingerprint pin.
+        let mut client_leaf: Option<PeerKey> = None;
+        if let Some(cert_in) = f5.iter().find(|m| m.typ == HandshakeType::Certificate) {
+            self.hash_incoming(cert_in);
+            let cm = CertificateMsg::parse(&cert_in.body).map_err(dtls_err)?;
+            if cm.chain.is_empty() {
+                if self.cfg.require_client_cert {
+                    return Err(proto("client certificate required but none sent"));
+                }
+            } else {
+                client_leaf = Some(
+                    cert::verify_peer(
+                        &cm.chain,
+                        self.cfg.insecure_skip_verify,
+                        self.cfg.peer_cert_fingerprint,
+                    )
+                    .map_err(dtls_err)?,
+                );
+            }
+        } else if self.cfg.require_client_cert {
+            return Err(proto("client certificate required but none sent"));
+        }
+
         let pre_master = match self.suite.kx {
             KeyExchange::Ecdhe => {
                 let point = parse_client_key_exchange_ecdhe(&cke_in.body).map_err(dtls_err)?;
@@ -741,8 +838,39 @@ impl<T: Transport> Conn<T> {
         ));
         self.drain_pending()?; // decrypt the buffered Finished now that keys exist
 
-        // Flight 5b: the client's Finished (epoch 1).
+        // Flight 5b: the client's [CertificateVerify,] Finished (the CV is epoch 0,
+        // the Finished epoch 1).
         let fin_flight = self.read_flight(HandshakeType::Finished, &f4)?;
+
+        // A CertificateVerify proves the client holds its certificate's private key.
+        // Verify its signature over the transcript through ClientKeyExchange (the CV is
+        // not yet hashed), then fold the CV into the transcript so the Finished MAC —
+        // which the client computed over the transcript including the CV — matches.
+        let mut saw_valid_cv = false;
+        if let Some(cv_in) = fin_flight
+            .iter()
+            .find(|m| m.typ == HandshakeType::CertificateVerify)
+        {
+            let cv = CertificateVerify::parse(&cv_in.body).map_err(dtls_err)?;
+            let leaf = client_leaf
+                .as_ref()
+                .ok_or_else(|| proto("CertificateVerify without a client certificate"))?;
+            let signed = self.transcript.clone();
+            if !cert::verify_handshake_signature(leaf, cv.sig_scheme, &signed, &cv.signature) {
+                return Err(proto("client CertificateVerify signature mismatch"));
+            }
+            self.hash_incoming(cv_in);
+            saw_valid_cv = true;
+        }
+        // Proof-of-possession gate (RFC 5246 §7.4.8): a presented client certificate —
+        // or a mandated mutual auth — requires a verified CertificateVerify. The
+        // Finished MAC alone proves nothing about the certificate's private key.
+        if (client_leaf.is_some() || self.cfg.require_client_cert) && !saw_valid_cv {
+            return Err(proto(
+                "client did not authenticate (missing CertificateVerify)",
+            ));
+        }
+
         self.verify_peer_finished(&fin_flight, &master, LABEL_CLIENT_FINISHED)?;
 
         // Flight 6: ChangeCipherSpec, Finished (server).
@@ -1259,6 +1387,114 @@ mod tests {
         assert!(
             client_failed || server_failed,
             "a fingerprint mismatch must fail the handshake"
+        );
+    }
+
+    #[test]
+    fn ecdhe_mutual_auth_self_interop() {
+        // Both ends present an ECDSA certificate and pin the other's fingerprint.
+        let server_id = crate::dtls::cert::Identity::generate("mutual-server").unwrap();
+        let client_id = crate::dtls::cert::Identity::generate("mutual-client").unwrap();
+        let server_pin = crate::dtls::cert::fingerprint(server_id.der());
+        let client_pin = crate::dtls::cert::fingerprint(client_id.der());
+        let (cp, sp) = pipe();
+
+        let server = std::thread::spawn(move || {
+            let mut s = Conn::server(sp, {
+                short(Config {
+                    require_client_cert: true,
+                    peer_cert_fingerprint: Some(client_pin),
+                    ..Config::ecdhe_server(server_id)
+                })
+            });
+            s.handshake().expect("server handshake");
+            let mut buf = vec![0u8; 1500];
+            let n = s.read(&mut buf).expect("server read");
+            s.write(&buf[..n]).expect("server write");
+            s.cipher_suite()
+        });
+
+        let mut c = Conn::client(
+            cp,
+            short(Config {
+                certificate: Some(Arc::new(client_id)),
+                ..Config::ecdhe_client_pinned(server_pin)
+            }),
+        );
+        c.handshake().expect("client handshake");
+        assert_eq!(c.cipher_suite(), TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
+        c.write(b"mutual app data").expect("client write");
+        let mut buf = vec![0u8; 1500];
+        let n = c.read(&mut buf).expect("client read");
+        assert_eq!(&buf[..n], b"mutual app data");
+        assert_eq!(
+            server.join().expect("server thread"),
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        );
+    }
+
+    #[test]
+    fn mutual_auth_missing_client_cert_fails() {
+        // The server requires a client certificate; the client offers none. The
+        // server must reject (empty client Certificate, no CertificateVerify).
+        let server_id = crate::dtls::cert::Identity::generate("server").unwrap();
+        let server_pin = crate::dtls::cert::fingerprint(server_id.der());
+        let (cp, sp) = pipe();
+
+        let server = std::thread::spawn(move || {
+            let mut s = Conn::server(
+                sp,
+                short(Config {
+                    require_client_cert: true,
+                    insecure_skip_verify: true,
+                    ..Config::ecdhe_server(server_id)
+                }),
+            );
+            s.handshake().is_err()
+        });
+
+        // A pinned client with no certificate of its own.
+        let mut c = Conn::client(cp, short(Config::ecdhe_client_pinned(server_pin)));
+        let client_failed = c.handshake().is_err();
+        assert!(
+            server.join().expect("server thread"),
+            "server must reject a client that sent no certificate"
+        );
+        let _ = client_failed;
+    }
+
+    #[test]
+    fn mutual_auth_wrong_client_pin_fails() {
+        // The server pins a client fingerprint the client's leaf does not match.
+        let server_id = crate::dtls::cert::Identity::generate("server").unwrap();
+        let client_id = crate::dtls::cert::Identity::generate("client").unwrap();
+        let server_pin = crate::dtls::cert::fingerprint(server_id.der());
+        let (cp, sp) = pipe();
+
+        let server = std::thread::spawn(move || {
+            let mut s = Conn::server(
+                sp,
+                short(Config {
+                    require_client_cert: true,
+                    peer_cert_fingerprint: Some([0x11; 32]),
+                    ..Config::ecdhe_server(server_id)
+                }),
+            );
+            s.handshake().is_err()
+        });
+
+        let mut c = Conn::client(
+            cp,
+            short(Config {
+                certificate: Some(Arc::new(client_id)),
+                ..Config::ecdhe_client_pinned(server_pin)
+            }),
+        );
+        let client_failed = c.handshake().is_err();
+        let server_failed = server.join().expect("server thread");
+        assert!(
+            client_failed || server_failed,
+            "a client-fingerprint mismatch must fail the handshake"
         );
     }
 

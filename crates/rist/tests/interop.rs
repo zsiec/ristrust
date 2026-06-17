@@ -32,7 +32,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use rist::{
-    AesKeyBits, Config, MergeMode, Profile, SplitMode, dial, dial_bonded, listen, listen_bonded,
+    AesKeyBits, Config, MergeMode, NackType, Profile, SplitMode, dial, dial_bonded, listen,
+    listen_bonded,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
@@ -374,22 +375,23 @@ fn free_even_port_excluding(other: u16) -> u16 {
 
 /// libRIST `ristsender` → lossy proxy → ristrust Receiver. libRIST retransmits on
 /// ristrust's NACKs; ristrust must recognize libRIST's SSRC-LSB retransmits and
-/// recover byte-exactly.
-#[tokio::test]
-async fn interop_ristrust_rx_lossy_recovery_from_librist_tx() {
+/// recover byte-exactly. `cfg` selects the ristrust receiver's NACK wire encoding:
+/// the default RANGE, or — for the bitmask variant — RFC 4585 Generic NACK, which a
+/// real libRIST sender must decode and act on (libRIST's sender parses either NACK
+/// type). `seed` varies the loss pattern so parallel variants drop different packets.
+async fn ristrust_rx_lossy_recovery(cfg: Config, seed: u64, label: &str) {
     let Some(sender_bin) = librist_tool("ristsender") else {
-        eprintln!("interop: ristsender not found; skipping");
+        eprintln!("interop[{label}]: ristsender not found; skipping");
         return;
     };
     let go_port = free_even_port();
     let proxy_port = free_even_port_excluding(go_port);
     let feed_port = free_udp_port(&[go_port, go_port + 1, proxy_port, proxy_port + 1]);
 
-    let cfg = Config::default().with_buffer(Duration::from_millis(700));
     let mut receiver = listen(&format!("127.0.0.1:{go_port}"), cfg)
         .await
         .expect("listen");
-    let proxy = start_lossy_proxy(proxy_port, go_port, 0.10, 7).await;
+    let proxy = start_lossy_proxy(proxy_port, go_port, 0.10, seed).await;
 
     let _tool = spawn_tool(
         &sender_bin,
@@ -441,11 +443,42 @@ async fn interop_ristrust_rx_lossy_recovery_from_librist_tx() {
     }
     receiver.close().await.expect("close");
 
-    assert_eq!(got, data, "lossy byte mismatch from libRIST sender");
+    assert_eq!(
+        got, data,
+        "[{label}] lossy byte mismatch from libRIST sender"
+    );
     assert!(
         proxy.dropped() > 0,
-        "proxy dropped no media — the loss/ARQ path was not exercised"
+        "[{label}] proxy dropped no media — the loss/ARQ path was not exercised"
     );
+}
+
+/// libRIST `ristsender` → lossy proxy → ristrust Receiver, default RANGE NACK.
+#[tokio::test]
+async fn interop_ristrust_rx_lossy_recovery_from_librist_tx() {
+    ristrust_rx_lossy_recovery(
+        Config::default().with_buffer(Duration::from_millis(700)),
+        7,
+        "range-nack",
+    )
+    .await;
+}
+
+/// Same, but the ristrust receiver emits RFC 4585 BITMASK NACKs (PT 205, FMT 1). A
+/// real libRIST sender must decode them and retransmit — the byte-exact recovery is
+/// the proof that ristrust's bitmask NACK wire format is understood by libRIST (the
+/// stock libRIST CLI only ever *sends* RANGE NACKs, so this is the one direction that
+/// validates the bitmask wire against the reference).
+#[tokio::test]
+async fn interop_ristrust_rx_lossy_bitmask_nack_from_librist_tx() {
+    ristrust_rx_lossy_recovery(
+        Config::default()
+            .with_buffer(Duration::from_millis(700))
+            .with_nack_type(NackType::Bitmask),
+        13,
+        "bitmask-nack",
+    )
+    .await;
 }
 
 /// ristrust Sender → lossy proxy → libRIST `ristreceiver`. ristrust retransmits
@@ -555,8 +588,13 @@ fn main_psk_cfg(bits: AesKeyBits, buffer_ms: u64) -> Config {
 }
 
 /// ristrust Main Sender → libRIST `ristreceiver` (`-p 1`), PSK-encrypted. Proves
-/// libRIST decrypts and decodes ristrust's GRE/AES-CTR output byte-exactly.
-async fn main_librist_rx_from_ristrust_tx(bits: AesKeyBits, etype: &str) {
+/// libRIST decrypts and decodes ristrust's GRE/AES-CTR output byte-exactly. A non-zero
+/// `key_rotation` makes the ristrust sender rotate its PSK nonce + re-derived key every
+/// `key_rotation` packets; libRIST must follow the rotation (it re-derives on each nonce
+/// change) and still decrypt byte-exactly — the proof that ristrust's key-rotation wire
+/// behaviour matches the reference (the stock libRIST CLI exposes no rotation knob, so
+/// this sender-rotates direction is the one that validates it).
+async fn main_librist_rx_from_ristrust_tx(bits: AesKeyBits, etype: &str, key_rotation: u32) {
     let Some(receiver_bin) = librist_tool("ristreceiver") else {
         eprintln!("interop: ristreceiver not found; skipping");
         return;
@@ -586,9 +624,12 @@ async fn main_librist_rx_from_ristrust_tx(bits: AesKeyBits, etype: &str) {
     );
     wait_tool_ready(rx_port, Duration::from_secs(5)).await;
 
-    let sender = dial(&format!("127.0.0.1:{rx_port}"), main_psk_cfg(bits, 200))
-        .await
-        .expect("dial libRIST main receiver");
+    let sender = dial(
+        &format!("127.0.0.1:{rx_port}"),
+        main_psk_cfg(bits, 200).with_key_rotation(key_rotation),
+    )
+    .await
+    .expect("dial libRIST main receiver");
 
     let data = std::sync::Arc::new(gen_data(N));
     let send_data = data.clone();
@@ -698,12 +739,21 @@ async fn main_ristrust_rx_from_librist_tx(bits: AesKeyBits, etype: &str) {
 
 #[tokio::test]
 async fn interop_main_librist_rx_from_ristrust_tx_aes128() {
-    main_librist_rx_from_ristrust_tx(AesKeyBits::Aes128, "128").await;
+    main_librist_rx_from_ristrust_tx(AesKeyBits::Aes128, "128", 0).await;
 }
 
 #[tokio::test]
 async fn interop_main_librist_rx_from_ristrust_tx_aes256() {
-    main_librist_rx_from_ristrust_tx(AesKeyBits::Aes256, "256").await;
+    main_librist_rx_from_ristrust_tx(AesKeyBits::Aes256, "256", 0).await;
+}
+
+/// PSK key rotation interop: the ristrust sender rotates its nonce + re-derived AES-256
+/// key every 16 packets; libRIST must re-derive on each nonce change and still decrypt
+/// the whole stream byte-exactly. Validates ristrust's key-rotation wire path against
+/// the reference (the default tests never rotate; `key_rotation = 0`).
+#[tokio::test]
+async fn interop_main_librist_rx_keyrotation_from_ristrust_tx() {
+    main_librist_rx_from_ristrust_tx(AesKeyBits::Aes256, "256", 16).await;
 }
 
 #[tokio::test]

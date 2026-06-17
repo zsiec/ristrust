@@ -7,7 +7,7 @@ low-latency video over lossy IP.
 > **Status: feature-complete, pre-1.0.** All three RIST profiles (Simple / Main /
 > Advanced), SMPTE 2022-7 bonding, FEC, source adaptation, reversed-role and
 > multi-flow transport are implemented and interoperate with libRIST byte-for-byte
-> — 22 sender/receiver combinations across the profiles, clean and lossy — and
+> — 24 sender/receiver combinations across the profiles, clean and lossy — and
 > with the `ristgo` reference across a 38-case differential matrix. DTLS 1.2 is
 > optional and feature-gated. See the feature matrix below.
 
@@ -209,9 +209,10 @@ let cfg = Config::default().with_profile(Profile::Main).with_fec(FecConfig::defa
 
 ## Interoperability
 
-- **libRIST** v0.2.18-rc1 — 22 sender/receiver combinations across Simple / Main /
+- **libRIST** v0.2.18-rc1 — 24 sender/receiver combinations across Simple / Main /
   Advanced, clean and lossy, byte-exact recovery, including packet split/merge both
-  directions (behind `--features interop`, graceful-skip when the tools are absent).
+  directions, bitmask (RFC 4585) NACK, and PSK key rotation (behind `--features
+  interop`, graceful-skip when the tools are absent).
 - **ristgo** — a 38-case differential matrix (profiles × clear/AES-128/AES-256/LZ4
   × both directions × clean+lossy, plus all-profile bonding, EAP-SRP, and packet
   split/merge), driven by the ristgo example binaries (behind `--features

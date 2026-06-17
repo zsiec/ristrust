@@ -151,12 +151,15 @@ impl AdvCodec {
         self.send_key.is_some()
     }
 
-    /// Re-keys the data channel to a new PSK passphrase (the SRP session key K after
-    /// EAP-SRP authentication with no configured secret).
-    pub(crate) fn set_psk(&mut self, passphrase: &[u8]) -> Result<(), CodecError> {
+    /// Re-keys the data channel to the EAP-SRP session key K after authentication
+    /// with no configured secret. K is the raw 32-byte SRP session key (a SHA-256
+    /// digest), so it keys through the **raw** derivation (no NUL-truncation) to
+    /// match how libRIST installs an EAP-pushed passphrase — see
+    /// [`crypto::derive_key_raw`] and the Main codec's `set_session_key`.
+    pub(crate) fn set_session_key(&mut self, k: &[u8]) -> Result<(), CodecError> {
         let bits = crypto::AesKeyBits::Aes256;
-        self.send_key = Some(crypto::Key::new(passphrase, bits, 0, false)?);
-        self.recv_key = Some(crypto::Decryptor::new(passphrase, bits)?);
+        self.send_key = Some(crypto::Key::new_raw(k, bits, 0, false)?);
+        self.recv_key = Some(crypto::Decryptor::new_raw(k, bits)?);
         Ok(())
     }
 

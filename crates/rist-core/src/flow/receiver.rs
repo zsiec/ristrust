@@ -11,17 +11,22 @@
 // walk does wrap-aware modular arithmetic. The casts below convert between the
 // 32-bit sequence space, ring indices (`usize`), and signed interpacket spacing;
 // their ranges are bounded by the ring size and the half-space by construction.
+// `cast_precision_loss` covers the return-bandwidth token bucket's microsecond→f64
+// refill arithmetic (a rate, where sub-microsecond precision is irrelevant).
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
 
 use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use super::{Event, Flow, NACK_CADENCE, Output, RTT_ECHO_INTERVAL, Role, TimerId, mul_1_1};
+use super::{
+    Event, Flow, NACK_CADENCE, Output, RTT_ECHO_INTERVAL, Role, TimerId, TimingMode, mul_1_1,
+};
 use crate::clock::{Micros, Ntp64, Timestamp};
 use crate::seq::{self, Seq32};
 use crate::wire::{Feedback, FragRole, MediaPacket};
@@ -145,6 +150,21 @@ pub(super) struct ReceiverState {
     sender_max_buffer: Micros,
     loss_snap: u64,
     recovered_snap: u64,
+
+    /// The instant the source-clock offset was last (re-)anchored — the first packet,
+    /// or a wrap re-anchor. The wrap guard requires `3 * recovery_buffer` of dwell
+    /// since this instant, so a single anomalous or out-of-order timestamp cannot
+    /// trip a re-anchor (libRIST `time_offset_changed_ts`).
+    last_resync: Timestamp,
+
+    /// Return-bandwidth NACK-channel token bucket (libRIST return-bandwidth). When
+    /// `nack_seqs_per_sec > 0` the receiver spends one token per NACKed sequence,
+    /// refilling at that rate (capped at `nack_token_burst`); a sequence with no
+    /// token is left due and re-serviced next pass. `0` means unlimited.
+    nack_seqs_per_sec: f64,
+    nack_token_burst: f64,
+    nack_tokens: f64,
+    nack_tokens_time: Timestamp,
 }
 
 impl ReceiverState {
@@ -170,6 +190,11 @@ impl ReceiverState {
             sender_max_buffer: Micros::ZERO,
             loss_snap: 0,
             recovered_snap: 0,
+            last_resync: Timestamp::ZERO,
+            nack_seqs_per_sec: 0.0,
+            nack_token_burst: 0.0,
+            nack_tokens: 0.0,
+            nack_tokens_time: Timestamp::ZERO,
         }
     }
 
@@ -177,6 +202,17 @@ impl ReceiverState {
     /// receives media, so a full ring would only waste memory).
     pub(super) fn empty() -> ReceiverState {
         ReceiverState::new(1)
+    }
+
+    /// Arms the return-bandwidth NACK token bucket from a kbps cap: the rate is the
+    /// return-channel bytes/sec divided by the bytes a range-NACK spends per
+    /// sequence, and the bucket starts full at one per-pass NACK group (libRIST
+    /// arms it identically in `flow_new`).
+    pub(super) fn set_return_bandwidth(&mut self, return_maxbitrate: u32) {
+        self.nack_seqs_per_sec =
+            f64::from(return_maxbitrate) * 1000.0 / 8.0 / RIST_NACK_BYTES_PER_SEQ;
+        self.nack_token_burst = RIST_NACK_TOKEN_BURST;
+        self.nack_tokens = self.nack_token_burst;
     }
 }
 
@@ -214,11 +250,87 @@ const BUFFER_GROWTH_PER_RECOVERED: f64 = 0.02;
 /// buffer (libRIST `has_high_loss`).
 const BUFFER_HIGH_LOSS_THRESHOLD: u64 = 25;
 
+/// Source-clock wrap constants (libRIST `receiver_calculate_packet_time`).
+///
+/// A source media timestamp that jumps backward by more than half the 32-bit
+/// timestamp space is a true wrap of the 32-bit RTP-derived counter, not jitter or
+/// reordering. `source_time` crosses the wire as NTP-64; one full wrap of the 32-bit
+/// MPEG-TS counter at 90 kHz spans `(2^32 / 90000)` seconds of media time:
+///
+/// - [`SRC_WRAP_PERIOD_NTP`] is that span in NTP-64 ticks (`(UINT32_MAX << 32) /
+///   90000`), libRIST's bump amount; [`SRC_WRAP_HALF_NTP`] is half of it, the
+///   backward-delta threshold that identifies a genuine wrap.
+/// - [`SRC_WRAP_PERIOD_MICROS`] is the same span in microseconds (`2^32 * 100 / 9`),
+///   added to the stored clock offset (which the core keeps in microseconds) so the
+///   wrapped source time maps back to ~now and playout continues seamlessly.
+///
+/// The 90 kHz figure is a constant, not a profile import — the core stays
+/// profile-agnostic and never branches on payload type.
+const SRC_WRAP_PERIOD_NTP: u64 = (0xFFFF_FFFFu64 << 32) / 90000;
+/// Half [`SRC_WRAP_PERIOD_NTP`]: a backward `source_time` delta exceeding this marks
+/// a true 32-bit wrap (libRIST's `(max_source_time - source_time) > UINT32_MAX/2`,
+/// scaled to the NTP-64 `source_time` domain).
+const SRC_WRAP_HALF_NTP: u64 = SRC_WRAP_PERIOD_NTP / 2;
+/// One wrap period in microseconds (`2^32 * 100 / 9`): the offset bump applied on a
+/// detected wrap.
+const SRC_WRAP_PERIOD_MICROS: Micros = Micros::from_micros((1i64 << 32) * 100 / 9);
+
+/// Bytes a libRIST range-NACK spends per requested sequence number
+/// (`ristNackBytesPerSeq`): the divisor turning a return-bandwidth kbps cap into a
+/// NACK-sequence rate.
+const RIST_NACK_BYTES_PER_SEQ: f64 = 4.0;
+/// The return-bandwidth token-bucket burst ceiling: one full per-pass NACK group
+/// (libRIST `RIST_MAX_NACKS`).
+const RIST_NACK_TOKEN_BURST: f64 = 200.0;
+
 impl Flow {
     /// Maps a packet's NTP-64 source timestamp into the local clock domain using
     /// the offset locked at the first packet.
     fn map_source_time(&self, source_time: u64) -> Timestamp {
         Ntp64::from_bits(source_time).to_timestamp() + self.receiver.offset
+    }
+
+    /// The local instant playout schedules from for an inbound packet. In
+    /// [`TimingMode::Source`] it is the media source timestamp mapped into the local
+    /// clock (inter-packet spacing follows the source clock), with the source-clock
+    /// wrap re-anchor applied; in [`TimingMode::Arrival`] it is the arrival instant
+    /// `now`, so each packet is held a fixed recovery buffer from arrival.
+    ///
+    /// Source-clock re-anchor (libRIST `receiver_calculate_packet_time` wrap fix-up):
+    /// the 32-bit RTP-derived source counter wraps every ~13 h at 90 kHz; after a
+    /// wrap the offset locked at the first packet is one wrap period stale, so every
+    /// later packet would map into the past and be shed as too-late — a permanent
+    /// stall. A TRUE backward wrap is detected — a fresh non-retransmit whose source
+    /// time fell back by more than half the 32-bit space — gated by a
+    /// `3 * recovery_buffer` dwell so a single anomalous or out-of-order timestamp
+    /// cannot trigger it. On a wrap the offset is BUMPED by one wrap period (keeping
+    /// playout continuous) rather than snapped to now; ordinary jitter/reordering
+    /// moves the source time by milliseconds — far below the ~6.6 h half-span — so it
+    /// never triggers.
+    fn receiver_packet_time(
+        &mut self,
+        now: Timestamp,
+        source_time: u64,
+        retransmit: bool,
+    ) -> Timestamp {
+        if self.cfg.timing_mode == TimingMode::Arrival {
+            return now;
+        }
+        let mut pt = self.map_source_time(source_time);
+        let dwell = Micros::from_micros(self.recovery_buffer.as_micros().saturating_mul(3));
+        if !retransmit
+            && source_time < self.receiver.max_source_time
+            && self.receiver.max_source_time - source_time > SRC_WRAP_HALF_NTP
+            && (now - self.receiver.last_resync) >= dwell
+        {
+            self.receiver.offset = self.receiver.offset + SRC_WRAP_PERIOD_MICROS;
+            pt = self.map_source_time(source_time);
+            self.receiver.max_source_time = source_time;
+            self.receiver.last_packet_time = pt;
+            self.receiver.last_resync = now;
+            self.stats.clock_resync += 1;
+        }
+        pt
     }
 
     /// The receiver-role body of [`Flow::feed`]: first-packet init, packet-time
@@ -252,7 +364,16 @@ impl Flow {
         let seqn = pkt.seq;
         let source_time = pkt.source_time;
         let retransmit = pkt.retransmit;
-        let packet_time = self.map_source_time(source_time);
+
+        // Count every retransmit-flagged copy that reaches the started flow, before
+        // any too-late / dedup / cursor test sheds it (libRIST), so
+        // `retransmitted_received` tallies all received retransmits — including late
+        // and duplicate ones — distinct from `recovered` (gaps ARQ actually filled).
+        if retransmit {
+            self.stats.retransmitted_received += 1;
+        }
+
+        let packet_time = self.receiver_packet_time(now, source_time, retransmit);
 
         // Track the newest source timestamp and its packet time, mirroring
         // calculate_packet_time. The update runs before the out-of-order test
@@ -262,14 +383,20 @@ impl Flow {
             self.receiver.last_packet_time = packet_time;
         }
 
-        // Out-of-order / too-late shedding: only packets older than the newest
-        // packet time and not the immediate successor of last_found qualify.
+        // Out-of-order / too-late shedding by SOURCE time: only packets older than
+        // the newest packet time and not the immediate successor of last_found
+        // qualify. Skipped in ARRIVAL timing, where playout is not source-paced (the
+        // seq-based cursor guard below sheds the unrecoverable ones instead).
         let mut out_of_order = false;
-        if packet_time < self.receiver.last_packet_time
+        if self.cfg.timing_mode == TimingMode::Source
+            && packet_time < self.receiver.last_packet_time
             && seqn != self.receiver.last_found.wrapping_add(1)
         {
             if now > packet_time + self.recovery_buffer_110 {
                 self.stats.too_late += 1;
+                if retransmit {
+                    self.stats.too_late_retransmit += 1;
+                }
                 return;
             }
             if !retransmit {
@@ -283,6 +410,9 @@ impl Flow {
         // and keeps the no-late-delivery invariant exact).
         if Seq32::new(seqn).less(Seq32::new(self.receiver.deliver_next)) {
             self.stats.too_late += 1;
+            if retransmit {
+                self.stats.too_late_retransmit += 1;
+            }
             return;
         }
 
@@ -484,6 +614,7 @@ impl Flow {
             r.last_found = pkt.seq;
             r.max_source_time = pkt.source_time;
             r.last_packet_time = now; // == src + offset by construction
+            r.last_resync = now; // dwell anchor for the source-clock wrap re-anchor
             r.highest = pkt.seq;
             r.deliver_next = pkt.seq;
             r.last_path = path;
@@ -635,6 +766,20 @@ impl Flow {
             return;
         }
         let retry = self.est.retry_interval(self.cfg.rtt_min, self.cfg.rtt_max);
+        // Refill the return-bandwidth token bucket from the elapsed time (sans-I/O:
+        // the rate is applied against the explicit `now`). The bucket starts full, so
+        // the first pass — whatever `now` is — just clamps at the burst cap.
+        if self.receiver.nack_seqs_per_sec > 0.0 {
+            let elapsed = now - self.receiver.nack_tokens_time;
+            if elapsed > Micros::ZERO {
+                self.receiver.nack_tokens +=
+                    elapsed.as_micros() as f64 / 1_000_000.0 * self.receiver.nack_seqs_per_sec;
+                if self.receiver.nack_tokens > self.receiver.nack_token_burst {
+                    self.receiver.nack_tokens = self.receiver.nack_token_burst;
+                }
+            }
+            self.receiver.nack_tokens_time = now;
+        }
         let mut entries = std::mem::take(&mut self.receiver.missing);
         let mut kept: VecDeque<MissingEntry> = VecDeque::with_capacity(entries.len());
         let mut batch: Vec<u32> = Vec::new();
@@ -661,11 +806,21 @@ impl Flow {
                 self.stats.abandoned += 1;
                 continue;
             }
-            if now >= e.next_nack {
+            // A NACK is emitted only when due AND a return-bandwidth token is
+            // available (or the bucket is unlimited). With no token the entry is left
+            // due — `next_nack` is not advanced — so it is serviced on the next pass
+            // rather than dropped (recovery slows, nothing is lost), matching the
+            // RIST_MAX_NACKS per-pass cap.
+            if now >= e.next_nack
+                && (self.receiver.nack_seqs_per_sec <= 0.0 || self.receiver.nack_tokens >= 1.0)
+            {
                 e.next_nack = now + retry;
                 e.nack_count += 1;
                 batch.push(e.seq);
                 self.stats.nacks_sent += 1;
+                if self.receiver.nack_seqs_per_sec > 0.0 {
+                    self.receiver.nack_tokens -= 1.0;
+                }
             }
             kept.push_back(e);
         }
@@ -829,7 +984,7 @@ mod tests {
     use crate::flow::testutil::{
         TEST_SSRC, delivered_seqs, drain_events, drain_outputs, mk_pkt, src_ntp,
     };
-    use crate::flow::{Config, Event, Flow, Output, Role, TimerId};
+    use crate::flow::{Config, Event, Flow, Output, Role, TimerId, TimingMode};
     use crate::rtt::Estimator;
     use crate::wire::Feedback;
 
@@ -1789,5 +1944,101 @@ mod tests {
         );
         assert_eq!(f.stats().ignored_feedback, 3);
         assert!(drain_outputs(&mut f).is_empty());
+    }
+
+    #[test]
+    fn source_clock_wrap_reanchors_offset() {
+        // Anchor near the top of the 32-bit source-counter range (47000 s of media),
+        // local clock == source so the offset is 0.
+        let mut f = recv();
+        let t0: u64 = 47_000_000_000;
+        f.feed(ts(t0), 0, mk_pkt(100, t0, b"x"));
+        drain_outputs(&mut f);
+
+        // A later non-successor packet whose source time fell back to 100 s — a
+        // ~46900 s backward jump, well over the ~23864 s half-span — after more than
+        // 3 * recovery_buffer (3 s) of dwell. The receiver re-anchors (offset += one
+        // wrap period) and accepts it rather than shedding it as too-late.
+        f.feed(ts(t0 + 4_000_000), 0, mk_pkt(105, 100_000_000, b"x"));
+        assert_eq!(f.stats().clock_resync, 1, "wrap must re-anchor once");
+        assert_eq!(f.stats().received, 2, "wrapped packet must be accepted");
+        assert_eq!(f.stats().too_late, 0, "wrapped packet must not be shed");
+    }
+
+    #[test]
+    fn source_clock_wrap_respects_dwell_guard() {
+        // The same backward jump within the dwell window (< 3 * recovery_buffer) is
+        // NOT treated as a wrap (it could be a single anomalous timestamp); the
+        // far-past packet is shed instead.
+        let mut f = recv();
+        let t0: u64 = 47_000_000_000;
+        f.feed(ts(t0), 0, mk_pkt(100, t0, b"x"));
+        drain_outputs(&mut f);
+        f.feed(ts(t0 + 1_000_000), 0, mk_pkt(105, 100_000_000, b"x"));
+        assert_eq!(
+            f.stats().clock_resync,
+            0,
+            "dwell guard must suppress re-anchor"
+        );
+        assert_eq!(f.stats().too_late, 1, "far-past packet shed without a wrap");
+    }
+
+    #[test]
+    fn arrival_timing_accepts_stale_source_timestamps() {
+        // In ARRIVAL timing the source-time too-late test is skipped: a non-successor
+        // packet bearing a very old source timestamp (which SOURCE timing would shed)
+        // is accepted, paced from its arrival instant instead.
+        let mut cfg = Config::librist_defaults();
+        cfg.timing_mode = TimingMode::Arrival;
+        let mut f = Flow::new(Role::Receiver, cfg);
+        f.feed(ts(10_000_000), 0, mk_pkt(100, 10_000_000, b"x"));
+        f.feed(ts(10_005_000), 0, mk_pkt(105, 1_000_000, b"x")); // source 9 s in the past
+        assert_eq!(f.stats().received, 2, "arrival timing must accept it");
+        assert_eq!(
+            f.stats().too_late,
+            0,
+            "arrival timing must not shed by source time"
+        );
+    }
+
+    #[test]
+    fn return_bandwidth_token_bucket_throttles_nacks() {
+        // With a return-bandwidth cap, a NACK pass spends one token per sequence; when
+        // the bucket runs dry the remaining due entries are LEFT due (not abandoned)
+        // and serviced on a later pass once tokens refill.
+        let mut cfg = Config::librist_defaults();
+        cfg.return_maxbitrate = 100;
+        let mut f = Flow::new(Role::Receiver, cfg);
+        f.feed(ts(1_000_000), 0, mk_pkt(0, 0, b"x"));
+        f.feed(ts(1_005_000), 0, mk_pkt(6, 5_000, b"x")); // gap → missing 1..=5
+        let missing = f.receiver.missing.len();
+        assert!(
+            missing >= 3,
+            "expected several missing entries, got {missing}"
+        );
+        drain_outputs(&mut f);
+
+        // Only two tokens available, and pin tokens_time to the pass instant so the
+        // refill adds nothing this pass.
+        let pass = ts(1_030_000); // past every entry's first next_nack (~+15 ms)
+        f.receiver.nack_tokens = 2.0;
+        f.receiver.nack_tokens_time = pass;
+        f.process_nacks(pass);
+        assert_eq!(f.stats().nacks_sent, 2, "throttled to the available tokens");
+        assert_eq!(
+            f.receiver.missing.len(),
+            missing,
+            "throttled entries are kept, not abandoned"
+        );
+
+        // Refill and run again: the still-due entries (un-NACKed last pass) now go.
+        f.receiver.nack_tokens = 100.0;
+        f.receiver.nack_tokens_time = pass;
+        f.process_nacks(pass);
+        assert_eq!(
+            f.stats().nacks_sent as usize,
+            missing,
+            "the rest are serviced once tokens refill"
+        );
     }
 }

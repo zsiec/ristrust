@@ -54,6 +54,9 @@ pub(crate) struct SenderSpawned {
     /// Out-of-band datagrams to transmit (`Sender::write_oob`); `Some` on a
     /// Main/Advanced sender. Each is `(GRE protocol type, payload)`.
     pub(crate) oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
+    /// Reverse out-of-band datagrams received from the peer (`Sender::read_oob`);
+    /// `Some` on a Main/Advanced sender. Each is `(GRE protocol type, payload)`.
+    pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -71,6 +74,10 @@ pub(crate) struct ReceiverSpawned {
     /// Received out-of-band datagrams (`Receiver::read_oob`); `Some` on a
     /// Main/Advanced receiver. Each is `(GRE protocol type, payload)`.
     pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
+    /// Reverse out-of-band datagrams to transmit back to the sender
+    /// (`Receiver::write_oob`); `Some` on a Main/Advanced receiver. Each is
+    /// `(GRE protocol type, payload)`.
+    pub(crate) oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     /// Why the driver exited, read once the channel closes.
     pub(crate) close: crate::driver::CloseFlag,
     /// The live stats snapshot, read by the handle's `stats()`.
@@ -129,6 +136,8 @@ fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
         ssrc,
         start_seq,
         no_recovery: cfg.one_way,
+        timing_mode: cfg.timing_mode,
+        return_maxbitrate: cfg.return_bandwidth,
     }
 }
 
@@ -344,6 +353,7 @@ pub(crate) fn build_sender(
         let codec = build_main_codec(cfg, ssrc)?;
         let eap = build_eap_role(cfg, true)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = MainDriver::spawn_sender(
             flow,
             socket,
@@ -357,6 +367,7 @@ pub(crate) fn build_sender(
             eap,
             RateControl::from_config(cfg),
             oob_rx,
+            rev_oob_tx,
             build_fec(cfg),
         );
         return Ok(SenderSpawned {
@@ -365,6 +376,7 @@ pub(crate) fn build_sender(
             weight_cmd: None,
             flow_attr_cmd: None,
             oob_in: Some(oob_tx),
+            oob_out: Some(rev_oob_rx),
             close,
             stats,
             task,
@@ -381,6 +393,7 @@ pub(crate) fn build_sender(
         // The fire-and-forget flow-attribute and OOB send channels (rare, small).
         let (attr_tx, attr_rx) = mpsc::channel(16);
         let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = AdvDriver::spawn_sender(
             flow,
             socket,
@@ -396,6 +409,7 @@ pub(crate) fn build_sender(
             cfg.on_flow_attr.clone(),
             attr_rx,
             oob_rx,
+            rev_oob_tx,
             cfg.fragment_size,
             build_fec(cfg),
         );
@@ -405,6 +419,7 @@ pub(crate) fn build_sender(
             weight_cmd: None,
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
+            oob_out: Some(rev_oob_rx),
             close,
             stats,
             task,
@@ -434,6 +449,7 @@ pub(crate) fn build_sender(
         weight_cmd: None,
         flow_attr_cmd: None,
         oob_in: None,
+        oob_out: None,
         close,
         stats,
         task,
@@ -449,6 +465,9 @@ pub(crate) fn build_sender(
 /// Returns an I/O error if `local` is not a valid port for the profile, the
 /// transport sockets cannot be bound, or an invalid secret prevents PSK key
 /// derivation (Main).
+// A per-profile dispatch builder (Main / Advanced / Simple), each branch wiring the
+// full session config; splitting it would only scatter that wiring.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_receiver(
     rt: &dyn Runtime,
     cfg: &Config,
@@ -476,6 +495,7 @@ pub(crate) fn build_receiver(
         let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
         let (data_out, close, stats, task) = MainDriver::spawn_receiver(
             flow,
             socket,
@@ -488,12 +508,15 @@ pub(crate) fn build_receiver(
             eap,
             build_lqm_emitter(cfg),
             oob_tx,
+            rev_oob_rx,
+            false, // a listening receiver is not a caller; no caller-rebind
             build_fec(cfg),
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
             oob_out: Some(oob_rx),
+            oob_in: Some(rev_oob_tx),
             close,
             stats,
             task,
@@ -507,6 +530,7 @@ pub(crate) fn build_receiver(
         let adv = build_adv_codec(cfg, DEFAULT_FLOW_SSRC)?;
         let eap = build_eap_role(cfg, false)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
         let (data_out, close, stats, task) = AdvDriver::spawn_receiver(
             flow,
             socket,
@@ -520,12 +544,14 @@ pub(crate) fn build_receiver(
             build_lqm_emitter(cfg),
             cfg.on_flow_attr.clone(),
             oob_tx,
+            rev_oob_rx,
             build_fec(cfg),
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
             oob_out: Some(oob_rx),
+            oob_in: Some(rev_oob_tx),
             close,
             stats,
             task,
@@ -556,6 +582,7 @@ pub(crate) fn build_receiver(
         local: bound,
         data_out,
         oob_out: None,
+        oob_in: None,
         close,
         stats,
         task,
@@ -806,6 +833,7 @@ pub(crate) fn build_listener_sender(
     let codec = build_main_codec(cfg, ssrc)?;
     let eap = build_eap_role(cfg, true)?; // the media sender is the authenticatee
     let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
     let (app_in, close, stats, task) = MainDriver::spawn_sender(
         flow,
         socket,
@@ -819,6 +847,7 @@ pub(crate) fn build_listener_sender(
         eap,
         RateControl::from_config(cfg),
         oob_rx,
+        rev_oob_tx,
         None, // FEC + reversed-role deferred
     );
     Ok(SenderSpawned {
@@ -827,6 +856,7 @@ pub(crate) fn build_listener_sender(
         weight_cmd: None,
         flow_attr_cmd: None,
         oob_in: Some(oob_tx),
+        oob_out: Some(rev_oob_rx),
         close,
         stats,
         task,
@@ -855,7 +885,12 @@ pub(crate) fn build_caller_receiver(
     let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
     let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
     let eap = build_eap_role(cfg, false)?; // the media receiver is the authenticator
+    // A non-SRP caller-receiver may rebind its own socket to recover a NAT /
+    // dynamic-IP source-port change; an SRP session recovers via the listener-side
+    // re-association path instead (libRIST's `callerRebind = no EAP`).
+    let caller_rebind = eap.is_none();
     let (oob_tx, oob_rx) = mpsc::channel(16);
+    let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
     let (data_out, close, stats, task) = MainDriver::spawn_receiver(
         flow,
         socket,
@@ -868,12 +903,15 @@ pub(crate) fn build_caller_receiver(
         eap,
         build_lqm_emitter(cfg),
         oob_tx,
+        rev_oob_rx,
+        caller_rebind,
         None, // FEC + reversed-role deferred
     );
     Ok(ReceiverSpawned {
         local,
         data_out,
         oob_out: Some(oob_rx),
+        oob_in: Some(rev_oob_tx),
         close,
         stats,
         task,
@@ -983,6 +1021,7 @@ pub(crate) fn build_bonded_sender(
         weight_cmd: Some(weight_tx),
         flow_attr_cmd: None,
         oob_in: None,
+        oob_out: None,
         close,
         stats,
         task,
@@ -1057,6 +1096,7 @@ pub(crate) fn build_bonded_receiver(
         local: bound,
         data_out,
         oob_out: None,
+        oob_in: None,
         close,
         stats,
         task,

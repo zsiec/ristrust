@@ -39,6 +39,18 @@ use crate::stats::StatsCell;
 /// The largest datagram the driver will receive.
 const RECV_BUF: usize = 65_536;
 
+/// The most consecutive caller-receiver socket rebinds that never recover the stream
+/// before the session gives up and surfaces a timeout (libRIST `rebindMaxAttempts`).
+/// Without it a permanently-gone sender would rebind forever — each rebind resets
+/// liveness — and the consumer would never see [`Error::SessionTimeout`]. The counter
+/// resets whenever a rebind recovers the stream (real traffic arrives after it).
+const REBIND_MAX_ATTEMPTS: u32 = 10;
+
+/// Caps the linear backoff multiplier between caller-receiver socket rebinds (libRIST
+/// `REBIND_BACKOFF_CAP`), so the gap between attempts stops growing at
+/// `REBIND_BACKOFF_CAP × session_timeout`.
+const REBIND_BACKOFF_CAP: u32 = 10;
+
 /// One inbound Main-profile datagram, tagged with the socket it arrived on. The pump
 /// drains these from a channel (the injected-feed seam): a single-flow driver fills it
 /// from its own reader task; a multi-flow [`MultiReceiver`](crate::multi) fills many
@@ -227,6 +239,20 @@ pub(crate) struct MainDriver {
     /// The owned socket-reader task (single-flow); `None` when a demultiplexer feeds
     /// `inbound`. Aborted when the pump exits.
     reader: Option<tokio::task::JoinHandle<()>>,
+    /// A clone of the reader→pump inbound sender, kept so the caller-rebind path can
+    /// respawn the reader on a fresh socket feeding the same `inbound` channel.
+    in_tx: Option<mpsc::Sender<MainInbound>>,
+
+    // --- caller-receiver NAT rebind (libRIST try_caller_socket_rebind) ---
+    /// Whether this driver may rebind its own socket to recover a NAT / dynamic-IP
+    /// source-port change: a single-socket, non-bonded, non-SRP caller-receiver only.
+    caller_rebind: bool,
+    /// Consecutive rebinds that have not yet recovered the stream; bounded by
+    /// `REBIND_MAX_ATTEMPTS` so a permanently-gone sender eventually times out.
+    rebind_attempts: u32,
+    /// The instant of the last rebind (`Timestamp::ZERO` if none), for the backoff and
+    /// the recovered-stream reset.
+    last_rebind: Timestamp,
 }
 
 impl MainDriver {
@@ -246,6 +272,7 @@ impl MainDriver {
         eap: Option<EapRole>,
         rate: Option<RateControl>,
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Sender<Bytes>,
@@ -255,7 +282,7 @@ impl MainDriver {
     ) {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
-        let reader = spawn_reader(socket.clone(), in_tx);
+        let reader = spawn_reader(socket.clone(), in_tx.clone());
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -277,7 +304,7 @@ impl MainDriver {
             ssrc,
             oob_in: Some(oob_in),
             data_out: None,
-            oob_out: None,
+            oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
             eap,
@@ -292,6 +319,10 @@ impl MainDriver {
             fec,
             inbound: Some(in_rx),
             reader: Some(reader),
+            in_tx: Some(in_tx),
+            caller_rebind: false,
+            rebind_attempts: 0,
+            last_rebind: Timestamp::ZERO,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -312,6 +343,8 @@ impl MainDriver {
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
+        oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
+        caller_rebind: bool,
         fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
@@ -321,7 +354,7 @@ impl MainDriver {
     ) {
         let (tx, rx) = mpsc::channel(DATA_CAPACITY);
         let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
-        let reader = spawn_reader(socket.clone(), in_tx);
+        let reader = spawn_reader(socket.clone(), in_tx.clone());
         let authed = eap.is_none();
         let close = CloseFlag::default();
         let stats = StatsCell::default();
@@ -341,7 +374,7 @@ impl MainDriver {
             app_in: None,
             highest_sent: 0,
             ssrc,
-            oob_in: None,
+            oob_in: Some(oob_in),
             data_out: Some(tx),
             oob_out: Some(oob_out),
             learned_ssrc: None,
@@ -358,6 +391,10 @@ impl MainDriver {
             fec,
             inbound: Some(in_rx),
             reader: Some(reader),
+            in_tx: Some(in_tx),
+            caller_rebind,
+            rebind_attempts: 0,
+            last_rebind: Timestamp::ZERO,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -426,6 +463,10 @@ impl MainDriver {
             fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
             inbound: Some(in_rx),
             reader: None, // the demultiplexer feeds `inbound`
+            in_tx: None,  // no owned reader to respawn (multi-flow)
+            caller_rebind: false,
+            rebind_attempts: 0,
+            last_rebind: Timestamp::ZERO,
         };
         (in_tx, rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -521,8 +562,16 @@ impl MainDriver {
                             break;
                         }
                     } else if self.peer.expired(now) {
-                        self.close.set_session_timeout();
-                        break;
+                        // A rebind-eligible caller-receiver recovers its OWN NAT /
+                        // dynamic-IP source-port change instead of tearing down (libRIST
+                        // try_caller_socket_rebind). `maybe_rebind_caller` returns false
+                        // only when not eligible, the rebind failed, or the attempt cap is
+                        // hit — then the session times out as before. The subsequent
+                        // keepalive in this same tick re-announces from the fresh port.
+                        if !self.maybe_rebind_caller(now) {
+                            self.close.set_session_timeout();
+                            break;
+                        }
                     }
                     // Periodic keepalive — suppressed during a re-auth: the peer tuple is
                     // unproven then, so a full RTCP/GRE beacon must not be reflected to it
@@ -537,6 +586,9 @@ impl MainDriver {
                         // Advertise this sender's max recovery buffer so the receiver
                         // can auto-scale (GRE-v2 buffer negotiation; sender-only).
                         self.send_buffer_neg(now).await;
+                        // Mirror: a receiver re-advertises its current recovery buffer
+                        // back to the sender (GRE-v2 buffer negotiation; receiver-only).
+                        self.send_receiver_buffer_neg().await;
                         // Source adaptation: emit a Link Quality Message when a
                         // reporting period has elapsed (receiver only).
                         self.maybe_emit_lqm(now).await;
@@ -923,6 +975,101 @@ impl MainDriver {
         }
     }
 
+    /// Advertises this receiver's *current* recovery buffer as a GRE-v2
+    /// buffer-negotiation message `(sender_max = 0, receiver_cur = cur_ms)`, the
+    /// mirror of [`send_buffer_neg`](Self::send_buffer_neg) (libRIST
+    /// `sendReceiverBufferNeg`). Receiver-role, two-way only; lets the sender observe
+    /// the buffer the receiver settled on. A no-op until the peer is known.
+    async fn send_receiver_buffer_neg(&mut self) {
+        if self.sender || self.flow.config().no_recovery {
+            return;
+        }
+        let Some(dst) = self.peer.media() else { return };
+        let cur_ms =
+            u16::try_from(self.flow.current_recovery_buffer().as_millis()).unwrap_or(u16::MAX);
+        let bn = gre::BufferNegotiation {
+            receiver_cur_ms: cur_ms,
+            ..gre::BufferNegotiation::default()
+        };
+        if let Ok(bytes) = self.codec.encode_buffer_neg(bn) {
+            let sock = self.socket.clone();
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
+    /// Attempts a caller-receiver socket rebind to recover this side's OWN NAT /
+    /// dynamic-IP source-port change (libRIST `try_caller_socket_rebind`). Returns
+    /// `true` when the session should be KEPT ALIVE (rebound, or deliberately waiting
+    /// out the silence/backoff) and `false` when it is not eligible, the cap is hit, or
+    /// the rebind failed and the session should time out.
+    ///
+    /// It applies only to a single-socket, non-bonded, non-SRP caller-receiver (the
+    /// `caller_rebind` flag, set at build); requires silence beyond
+    /// `max(session_timeout, 4×keepalive)` so a short timeout cannot flap a live stream;
+    /// and spaces attempts by a linear backoff (`attempts × session_timeout`, capped).
+    /// On a rebind it binds a fresh ephemeral source port, swaps the socket and respawns
+    /// the reader, and gives the new socket a full session timeout to recover; the
+    /// keepalive later in the same tick re-announces from the new port so the sender
+    /// re-learns this side's address.
+    fn maybe_rebind_caller(&mut self, now: Timestamp) -> bool {
+        if !self.caller_rebind {
+            return false;
+        }
+        // Require silence beyond max(session_timeout, 4×keepalive).
+        let four_ka = Micros::from_micros(
+            i64::try_from(self.keepalive.as_micros())
+                .unwrap_or(i64::MAX)
+                .saturating_mul(4),
+        );
+        let min_silence = self.peer.timeout().max(four_ka);
+        if !self.peer.silent_for(now, min_silence) {
+            return true; // not silent enough to rebind yet, but keep the session alive
+        }
+        // If real traffic arrived after the last rebind, that rebind recovered the
+        // stream and this silence is a fresh event — reset the attempt counter.
+        if self.last_rebind != Timestamp::ZERO && self.peer.last_seen() > self.last_rebind {
+            self.rebind_attempts = 0;
+        }
+        // A permanently-gone sender must eventually surface a timeout rather than
+        // rebind forever.
+        if self.rebind_attempts >= REBIND_MAX_ATTEMPTS {
+            return false;
+        }
+        // Linear backoff (capped) between attempts.
+        let mult = self.rebind_attempts.min(REBIND_BACKOFF_CAP);
+        if self.last_rebind != Timestamp::ZERO {
+            let min_gap = Micros::from_micros(
+                i64::from(mult).saturating_mul(self.peer.timeout().as_micros()),
+            );
+            if (now - self.last_rebind) < min_gap {
+                return true; // backing off; hold the session open without rebinding yet
+            }
+        }
+        let fresh = match self.socket.rebind() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: crate::logging::SOCKET, "rist: main caller socket rebind failed: {e}");
+                return false;
+            }
+        };
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        self.socket = fresh;
+        if let Some(tx) = self.in_tx.clone() {
+            self.reader = Some(spawn_reader(self.socket.clone(), tx));
+        }
+        self.rebind_attempts += 1;
+        self.last_rebind = now;
+        self.peer.observe(now); // a full session timeout to recover on the fresh socket
+        tracing::info!(
+            target: crate::logging::SOCKET,
+            attempt = self.rebind_attempts,
+            "rist: main caller socket rebound: fresh source port for NAT/dynamic-IP recovery"
+        );
+        true
+    }
+
     /// Feeds an inbound buffer-negotiation message to the flow: a non-zero sender-max
     /// enables (and bounds) the receiver's recovery-buffer auto-scaling. A no-op on a
     /// sender-role flow (the core guards by role).
@@ -1170,7 +1317,7 @@ impl MainDriver {
         let Some(key) = self.eap.as_ref().and_then(EapRole::session_key) else {
             return;
         };
-        if let Err(e) = self.codec.set_psk(&key) {
+        if let Err(e) = self.codec.set_session_key(&key) {
             tracing::debug!(target: crate::logging::CRYPTO, "rist: main: post-auth re-key failed: {e}");
             return;
         }

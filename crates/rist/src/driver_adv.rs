@@ -170,6 +170,7 @@ impl AdvDriver {
         on_flow_attr: Option<FlowAttrCallback>,
         flow_attr_rx: mpsc::Receiver<Vec<u8>>,
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
         frag_size: usize,
         fec: Option<FecState>,
     ) -> (
@@ -213,7 +214,7 @@ impl AdvDriver {
             on_flow_attr,
             flow_attr_cmd: Some(flow_attr_rx),
             oob_in: Some(oob_in),
-            oob_out: None,
+            oob_out: Some(oob_out),
             fec,
             inbound: Some(in_rx),
             reader: Some(reader),
@@ -236,6 +237,7 @@ impl AdvDriver {
         lqm: Option<LqmEmitter>,
         on_flow_attr: Option<FlowAttrCallback>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
+        oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         fec: Option<FecState>,
     ) -> (
         mpsc::Receiver<Bytes>,
@@ -277,7 +279,7 @@ impl AdvDriver {
             rate: None,
             on_flow_attr,
             flow_attr_cmd: None,
-            oob_in: None,
+            oob_in: Some(oob_in),
             oob_out: Some(oob_out),
             fec,
             inbound: Some(in_rx),
@@ -953,8 +955,8 @@ impl AdvDriver {
         let Some(key) = self.eap.as_ref().and_then(EapRole::session_key) else {
             return;
         };
-        let _ = self.main.set_psk(&key);
-        let _ = self.adv.set_psk(&key);
+        let _ = self.main.set_session_key(&key);
+        let _ = self.adv.set_session_key(&key);
         let mut wire = Vec::new();
         rist_codec::eap::passphrase_push(PASSPHRASE_PUSH_ID).append_to(&mut wire);
         self.send_eapol(&wire).await;

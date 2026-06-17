@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rist_codec::crypto::AesKeyBits;
-use rist_core::flow::CongestionMode;
+use rist_core::flow::{CongestionMode, TimingMode};
 
 use crate::error::ConfigError;
 use crate::fec::FecConfig;
@@ -120,6 +120,15 @@ pub struct Config {
     /// How the sender paces retransmissions against `max_bitrate_kbps`. Default
     /// [`CongestionMode::Normal`] (the libRIST default).
     pub congestion_control: CongestionMode,
+    /// How the receiver schedules playout (libRIST `timing_mode`). Default
+    /// [`TimingMode::Source`] (source-paced, the libRIST default);
+    /// [`TimingMode::Arrival`] paces by arrival time, robust to a drifting or absent
+    /// source clock. Receiver-side; ignored by a sender.
+    pub timing_mode: TimingMode,
+    /// libRIST's return-bandwidth in kbps: caps the receiver's outbound NACK channel
+    /// so its retransmission requests stay within an upstream budget on an asymmetric
+    /// link. `0` (the default) means unlimited. Receiver-side; ignored by a sender.
+    pub return_bandwidth: u32,
     /// Virtual source port advertised on the wire.
     pub virt_src_port: u16,
     /// Virtual destination port advertised on the wire.
@@ -236,6 +245,8 @@ impl Default for Config {
             keepalive_interval: Duration::from_millis(1000),
             max_bitrate_kbps: 100_000,
             congestion_control: CongestionMode::Normal,
+            timing_mode: TimingMode::Source,
+            return_bandwidth: 0,
             virt_src_port: 1971,
             virt_dst_port: 1968,
             nack_type: NackType::Range,
@@ -427,6 +438,22 @@ impl Config {
     #[must_use]
     pub fn with_congestion_control(mut self, mode: CongestionMode) -> Config {
         self.congestion_control = mode;
+        self
+    }
+
+    /// Selects how the receiver schedules playout (default [`TimingMode::Source`]).
+    /// [`TimingMode::Arrival`] paces by arrival time rather than the source clock.
+    #[must_use]
+    pub fn with_timing_mode(mut self, mode: TimingMode) -> Config {
+        self.timing_mode = mode;
+        self
+    }
+
+    /// Caps the receiver's outbound NACK channel at `kbps` (libRIST return-bandwidth);
+    /// `0` (the default) means unlimited.
+    #[must_use]
+    pub fn with_return_bandwidth(mut self, kbps: u32) -> Config {
+        self.return_bandwidth = kbps;
         self
     }
 

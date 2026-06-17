@@ -17,6 +17,7 @@ pub struct Receiver {
     local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
+    oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -40,6 +41,8 @@ impl Receiver {
             local,
             data_out,
             oob_out,
+            // A demultiplexed per-flow receiver has no reverse-OOB send channel.
+            oob_in: None,
             close,
             stats,
             task,
@@ -58,6 +61,14 @@ impl Receiver {
     /// Never; the result is for API symmetry (the address is resolved at listen).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         Ok(self.local)
+    }
+
+    /// The bound local media (even) port (ristgo `LocalPort`). Convenience over
+    /// [`local_addr`](Self::local_addr) when only the port is needed — useful when
+    /// the receiver was bound to port `0` and the OS chose the port.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.local.port()
     }
 
     /// A snapshot of this receiver's counters (the receiver-half fields are
@@ -89,6 +100,37 @@ impl Receiver {
             return Err(Error::OobUnsupported);
         };
         rx.recv().await.ok_or(Error::Closed)
+    }
+
+    /// Sends one reverse out-of-band datagram back to the sender as an IPv4 GRE frame
+    /// ([`OOB_PROTOCOL_IP`](crate::OOB_PROTOCOL_IP)) — the mirror of
+    /// [`Sender::write_oob`](crate::Sender::write_oob). PSK-encrypted when a secret is
+    /// configured; never ARQ-retried; dropped until the sender's address is known.
+    ///
+    /// # Errors
+    /// As [`Receiver::write_oob_typed`].
+    pub async fn write_oob(&self, payload: &[u8]) -> Result<(), Error> {
+        self.write_oob_typed(crate::OOB_PROTOCOL_IP, payload).await
+    }
+
+    /// Sends one reverse out-of-band datagram to the sender under the GRE protocol
+    /// type `proto` (an EtherType). Fire-and-forget; the receive-side counterpart of
+    /// [`Sender::write_oob_typed`](crate::Sender::write_oob_typed).
+    ///
+    /// # Errors
+    /// Returns [`Error::OobUnsupported`] on a Simple-profile or bonded receiver,
+    /// [`Error::OobProtocol`] if `proto` is one RIST reserves for its own framing, or
+    /// [`Error::Closed`] if the session has shut down.
+    pub async fn write_oob_typed(&self, proto: u16, payload: &[u8]) -> Result<(), Error> {
+        if rist_codec::gre::is_reserved(proto) {
+            return Err(Error::OobProtocol(proto));
+        }
+        let Some(cmd) = &self.oob_in else {
+            return Err(Error::OobUnsupported);
+        };
+        cmd.send((proto, payload.to_vec()))
+            .await
+            .map_err(|_| self.close.error())
     }
 
     /// Reads the next in-order, ARQ-recovered media payload.
@@ -144,6 +186,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         local: spawned.local,
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -153,7 +196,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
 /// Dials a reversed-role **caller-receiver**: a media receiver that calls out to a
 /// [`listen_sender`](crate::listen_sender) listening at `addr` (a bare `IP:port` or `rist://` URL),
 /// announces itself so the sender learns where to send, then receives media. Main
-/// profile only; PSK supported, EAP-SRP refused.
+/// profile only; PSK and EAP-SRP supported (the caller-receiver is the authenticator).
 ///
 /// # Errors
 /// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]
@@ -186,6 +229,7 @@ pub async fn dial_receiver_with(
         local: spawned.local,
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -229,6 +273,7 @@ pub async fn listen_bonded_with(
         local: spawned.local,
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
+        oob_in: spawned.oob_in,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

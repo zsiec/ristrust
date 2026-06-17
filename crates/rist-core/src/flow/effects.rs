@@ -109,6 +109,23 @@ pub struct Stats {
     /// Packets dropped because they could no longer be delivered (older than the
     /// recovery window, or behind the in-order playout cursor).
     pub too_late: u64,
+    /// The retransmitted subset of [`too_late`](Self::too_late): too-late drops
+    /// whose packet carried the retransmit flag. The arrival rate of late-but-fresh
+    /// first transmissions is then `too_late - too_late_retransmit`, the quantity
+    /// TR-06-4 source-adaptation reports as the LQM "Late" field.
+    pub too_late_retransmit: u64,
+    /// Inbound media packets flagged as retransmissions that reached a started flow,
+    /// counted before any too-late / dedup / cursor test sheds them — so this tallies
+    /// all retransmits actually received (including late and duplicate ones),
+    /// distinct from [`recovered`](Self::recovered) (gaps an ARQ resend actually
+    /// filled).
+    pub retransmitted_received: u64,
+    /// Source-clock re-anchors: a fresh non-retransmit packet whose source time fell
+    /// backward by more than half the 32-bit timestamp space — a true wrap of the
+    /// 32-bit RTP-derived counter (~13 h at 90 kHz) — bumped the clock offset by one
+    /// wrap period so playout stays continuous (libRIST
+    /// `receiver_calculate_packet_time`). Source-timing mode only.
+    pub clock_resync: u64,
     /// Missing entries created by gap detection (each lost sequence once).
     pub missing: u64,
     /// Individual sequence numbers emitted in NACK feedback (retries included).

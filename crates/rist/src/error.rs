@@ -152,6 +152,12 @@ pub enum Error {
         /// The maximum a single write may carry, in bytes.
         max: usize,
     },
+    /// A bounded internal queue overflowed because the peer (or the application)
+    /// could not keep up: the send path's outbound queue, or a receiver's delivery
+    /// queue, was full and the datagram was dropped rather than blocking the driver.
+    /// Surfaced where ristgo returns `ErrBufferOverflow`.
+    #[error("rist: buffer overflow: {0}")]
+    BufferOverflow(&'static str),
     /// A feature that is scaffolded but not yet implemented was invoked.
     #[error("rist: not yet implemented: {0}")]
     Unimplemented(&'static str),

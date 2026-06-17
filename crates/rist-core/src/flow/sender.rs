@@ -185,18 +185,25 @@ impl Flow {
     }
 
     /// Retransmits every requested sequence still resendable, applying the
-    /// libRIST sender gates in libRIST's own evaluation order — the RTT/bloat
-    /// suppression gate before the max-retries cap:
+    /// libRIST sender gates in libRIST's own evaluation order
+    /// (`rist_retry_dequeue`): the RTT/bloat suppression gate, then the
+    /// `recovery_maxbitrate` bandwidth cap, then the max-retries cap:
     ///
     /// - slot empty or a different seq → aged out (`retransmit_skipped`);
     /// - last retransmit < one clamped RTT ago → suppressed
     ///   (`retransmit_suppressed`);
+    /// - emitting would exceed `recovery_maxbitrate` under the active congestion
+    ///   mode → withheld WITHOUT advancing retry state (`bandwidth_skipped`), so
+    ///   the entry stays resendable and is re-NACKed;
     /// - `transmit_count >= max_retries` → abandoned (`retransmit_exhausted`);
     /// - otherwise → re-send with `retransmit` set.
     ///
-    /// The gate clamps the most recent **raw** RTT sample (libRIST
-    /// `peer->last_rtt`), deliberately fresher than the EWMA the receiver uses
-    /// for its retry interval (see [`rtt`](crate::rtt)). The requested SSRC is
+    /// The bandwidth cap precedes the max-retries cap so a sequence that is both
+    /// over budget and past its retry budget is counted as a bandwidth skip,
+    /// matching libRIST (which returns on the rate check before it touches
+    /// `transmit_count`). The gate clamps the most recent **raw** RTT sample
+    /// (libRIST `peer->last_rtt`), deliberately fresher than the EWMA the receiver
+    /// uses for its retry interval (see [`rtt`](crate::rtt)). The requested SSRC is
     /// ignored: the host demuxes feedback to this flow before it arrives.
     pub(crate) fn service_nack(&mut self, now: Timestamp, missing: Vec<u32>) {
         let mut rtt = self.est.last_clamped(self.cfg.rtt_min, self.cfg.rtt_max);
@@ -232,13 +239,14 @@ impl Flow {
                 self.stats.retransmit_skipped += 1;
             } else if retried && (now - last_retry) < rtt {
                 self.stats.retransmit_suppressed += 1;
-            } else if transmit_count >= self.cfg.max_retries {
-                self.stats.retransmit_exhausted += 1;
             } else if over_budget(mode, &self.sender.data_bw, &self.sender.retry_bw, max_kbps) {
                 // Over the recovery_maxbitrate ceiling: refuse WITHOUT advancing the
                 // retry state, so the receiver re-NACKs and we accept it once the
-                // rate decays (libRIST returns before touching transmit_count).
+                // rate decays (libRIST returns before touching transmit_count). This
+                // gate precedes the max-retries cap to match libRIST's order.
                 self.stats.bandwidth_skipped += 1;
+            } else if transmit_count >= self.cfg.max_retries {
+                self.stats.retransmit_exhausted += 1;
             } else {
                 let (source_time, payload, frag) = {
                     let sl = &mut self.sender.ring[idx];

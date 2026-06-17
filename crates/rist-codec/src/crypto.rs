@@ -154,6 +154,49 @@ pub fn derive_key(
     Ok(key)
 }
 
+/// Derives an AES key from the **full** passphrase bytes — no NUL-truncation and
+/// no 127-byte cap — and the 4-byte GRE nonce salt via PBKDF2-HMAC-SHA256 with
+/// RIST's fixed 1024 iterations. The returned vector has length `bits.bytes()`.
+///
+/// This is the derivation libRIST uses when a passphrase is installed via the
+/// EAP-SRP `use_key_as_passphrase` path (`_librist_crypto_psk_set_passphrase`),
+/// which stores an explicit length and hashes every byte. The 32-byte SRP session
+/// key K is a SHA-256 digest that may contain a NUL (≈12% of keys do), so it MUST
+/// key through this path to derive the same AES key a libRIST peer would — keying
+/// it through [`derive_key`] would truncate at that NUL and diverge. The
+/// configured-`Secret` string path keeps [`derive_key`]'s NUL-truncation (libRIST's
+/// `strnlen`-bounded `rist_key_init`).
+pub fn derive_key_raw(
+    password: &[u8],
+    nonce4: &[u8],
+    bits: AesKeyBits,
+) -> Result<Vec<u8>, CryptoError> {
+    if password.is_empty() {
+        return Err(CryptoError::EmptyPassword);
+    }
+    if nonce4.len() != NONCE_SIZE {
+        return Err(CryptoError::InvalidNonceLength);
+    }
+    let mut key = vec![0u8; bits.bytes()];
+    pbkdf2_hmac::<Sha256>(password, nonce4, PBKDF2_ITERATIONS, &mut key);
+    Ok(key)
+}
+
+/// Dispatches to [`derive_key_raw`] (full bytes) or [`derive_key`] (NUL-truncated)
+/// per the `raw` flag a stateful [`Key`]/[`Decryptor`] was constructed with.
+fn derive_dispatch(
+    raw: bool,
+    password: &[u8],
+    nonce4: &[u8],
+    bits: AesKeyBits,
+) -> Result<Vec<u8>, CryptoError> {
+    if raw {
+        derive_key_raw(password, nonce4, bits)
+    } else {
+        derive_key(password, nonce4, bits)
+    }
+}
+
 /// Constructs the 16-byte AES-CTR IV for a GRE sequence number: the sequence
 /// big-endian in `[0:4]`, then twelve zero bytes. AES-CTR increments the low
 /// bytes, so the per-packet seq in the high bytes gives every packet a disjoint
@@ -211,6 +254,10 @@ pub struct Key {
     /// 0 selects "rotate only at the reuse-limit ceiling" (the library default).
     key_rotation: u32,
     odd: bool,
+    /// Selects [`derive_key_raw`] (no NUL-truncation) over [`derive_key`]. Set for a
+    /// key derived from the SRP session key K (EAP `use_key_as_passphrase`), which
+    /// libRIST hashes in full.
+    raw: bool,
     nonce: [u8; NONCE_SIZE],
     key: Vec<u8>,
     used_times: u32,
@@ -227,6 +274,29 @@ impl Key {
         key_rotation: u32,
         odd: bool,
     ) -> Result<Key, CryptoError> {
+        Key::new_inner(password, bits, key_rotation, odd, false)
+    }
+
+    /// [`Key::new`] for a passphrase whose **full** bytes are hashed without
+    /// NUL-truncation or the 127-byte cap — used to key the data channel from the
+    /// 32-byte SRP session key K (EAP `use_key_as_passphrase`). See
+    /// [`derive_key_raw`].
+    pub fn new_raw(
+        password: &[u8],
+        bits: AesKeyBits,
+        key_rotation: u32,
+        odd: bool,
+    ) -> Result<Key, CryptoError> {
+        Key::new_inner(password, bits, key_rotation, odd, true)
+    }
+
+    fn new_inner(
+        password: &[u8],
+        bits: AesKeyBits,
+        key_rotation: u32,
+        odd: bool,
+        raw: bool,
+    ) -> Result<Key, CryptoError> {
         if password.is_empty() {
             return Err(CryptoError::EmptyPassword);
         }
@@ -235,6 +305,7 @@ impl Key {
             bits,
             key_rotation,
             odd,
+            raw,
             nonce: [0; NONCE_SIZE],
             key: Vec::new(),
             used_times: 0,
@@ -254,7 +325,7 @@ impl Key {
     /// key, and resets the used-times counter.
     fn rekey(&mut self) -> Result<(), CryptoError> {
         self.nonce = generate_nonce(self.odd)?;
-        self.key = derive_key(&self.password, &self.nonce, self.bits)?;
+        self.key = derive_dispatch(self.raw, &self.password, &self.nonce, self.bits)?;
         self.used_times = 0;
         Ok(())
     }
@@ -288,6 +359,9 @@ impl Key {
 pub struct Decryptor {
     password: Vec<u8>,
     bits: AesKeyBits,
+    /// Selects [`derive_key_raw`] (no NUL-truncation) over [`derive_key`]. Set for a
+    /// key derived from the SRP session key K (EAP `use_key_as_passphrase`).
+    raw: bool,
     nonce: [u8; NONCE_SIZE],
     key: Vec<u8>,
     has_nonce: bool,
@@ -309,12 +383,25 @@ impl Decryptor {
     /// Constructs a `Decryptor`. It derives no key until the first packet arrives;
     /// the inbound nonce on that packet selects the key.
     pub fn new(password: &[u8], bits: AesKeyBits) -> Result<Decryptor, CryptoError> {
+        Decryptor::new_inner(password, bits, false)
+    }
+
+    /// [`Decryptor::new`] for a passphrase whose **full** bytes are hashed without
+    /// NUL-truncation or the 127-byte cap — the receive-side counterpart for keying
+    /// off the 32-byte SRP session key K (EAP `use_key_as_passphrase`). See
+    /// [`derive_key_raw`].
+    pub fn new_raw(password: &[u8], bits: AesKeyBits) -> Result<Decryptor, CryptoError> {
+        Decryptor::new_inner(password, bits, true)
+    }
+
+    fn new_inner(password: &[u8], bits: AesKeyBits, raw: bool) -> Result<Decryptor, CryptoError> {
         if password.is_empty() {
             return Err(CryptoError::EmptyPassword);
         }
         Ok(Decryptor {
             password: password.to_vec(),
             bits,
+            raw,
             nonce: [0; NONCE_SIZE],
             key: Vec::new(),
             has_nonce: false,
@@ -339,7 +426,7 @@ impl Decryptor {
         {
             return;
         }
-        if let Ok(key) = derive_key(&self.password, &nonce, bits) {
+        if let Ok(key) = derive_dispatch(self.raw, &self.password, &nonce, bits) {
             self.next_nonce = nonce;
             self.next_bits = bits;
             self.next_key = key;
@@ -376,7 +463,7 @@ impl Decryptor {
                 self.key = std::mem::take(&mut self.next_key);
                 self.has_next = false;
             } else {
-                self.key = derive_key(&self.password, &nonce, self.bits)?;
+                self.key = derive_dispatch(self.raw, &self.password, &nonce, self.bits)?;
             }
             self.nonce = nonce;
             self.has_nonce = true;
@@ -684,6 +771,63 @@ mod tests {
             d.decrypt(nonce_a, seq, &ct_a).unwrap(),
             pt,
             "rekey back failed"
+        );
+    }
+
+    #[test]
+    fn derive_key_raw_matches_derive_key_without_nul() {
+        // With no embedded NUL and ≤127 bytes, bound_password is a no-op, so the raw
+        // and truncating derivations must agree byte-for-byte.
+        let pw = b"Reliable Internet Stream Transport";
+        let nonce = [0x52, 0x49, 0x53, 0x54];
+        for bits in [AesKeyBits::Aes128, AesKeyBits::Aes256] {
+            assert_eq!(
+                derive_key_raw(pw, &nonce, bits).unwrap(),
+                derive_key(pw, &nonce, bits).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn derive_key_raw_differs_from_derive_key_on_embedded_nul() {
+        // A 32-byte SRP session key K containing a NUL: the truncating derivation
+        // hashes only the bytes before it, so the two derivations MUST diverge — this
+        // is the interop bug raw keying fixes.
+        let mut k = [0xAAu8; 32];
+        k[5] = 0x00;
+        let nonce = [0x01, 0x02, 0x03, 0x04];
+        let raw = derive_key_raw(&k, &nonce, AesKeyBits::Aes256).unwrap();
+        let truncated = derive_key(&k, &nonce, AesKeyBits::Aes256).unwrap();
+        assert_ne!(raw, truncated);
+        // The truncating key equals hashing just the 5 bytes before the NUL.
+        assert_eq!(
+            truncated,
+            derive_key(&k[..5], &nonce, AesKeyBits::Aes256).unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_keyed_round_trip_survives_nul_where_truncating_diverges() {
+        // A raw-keyed sender and a raw-keyed receiver interoperate over a K with a
+        // NUL; a truncating receiver derives a different key and cannot recover the
+        // plaintext — the concrete failure the raw path prevents against libRIST.
+        let mut k = [0x5Au8; 32];
+        k[10] = 0x00;
+        let seq = 7u32;
+        let pt = seq_bytes(200);
+
+        let mut send = Key::new_raw(&k, AesKeyBits::Aes256, 0, false).unwrap();
+        let ct = send.encrypt(seq, &pt).unwrap();
+        let nonce = send.nonce();
+
+        let mut recv_raw = Decryptor::new_raw(&k, AesKeyBits::Aes256).unwrap();
+        assert_eq!(recv_raw.decrypt(nonce, seq, &ct).unwrap(), pt);
+
+        let mut recv_trunc = Decryptor::new(&k, AesKeyBits::Aes256).unwrap();
+        assert_ne!(
+            recv_trunc.decrypt(nonce, seq, &ct).unwrap(),
+            pt,
+            "a truncating receiver must NOT recover a raw-keyed sender's media"
         );
     }
 }

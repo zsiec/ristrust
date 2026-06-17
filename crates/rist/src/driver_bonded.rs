@@ -847,7 +847,7 @@ impl BondedDriver {
         let Some(key) = self.paths[i].eap.as_ref().and_then(EapRole::session_key) else {
             return;
         };
-        if let Err(e) = self.paths[i].codec.set_psk(&key) {
+        if let Err(e) = self.paths[i].codec.set_session_key(&key) {
             tracing::debug!(target: crate::logging::CRYPTO, path = i, "rist: bonded post-auth re-key failed: {e}");
             return;
         }

@@ -56,6 +56,10 @@ pub use rist_codec::crypto::AesKeyBits;
 /// [`Config::with_congestion_control`].
 pub use rist_core::flow::CongestionMode;
 
+/// The receiver's playout-scheduling clock, re-exported for use with
+/// [`Config::with_timing_mode`].
+pub use rist_core::flow::TimingMode;
+
 /// The DTLS connection configuration (PSK or ECDHE-ECDSA), re-exported for use with
 /// [`Config::with_dtls`]. [`DtlsIdentity`] is the certificate + key an ECDHE server
 /// presents (generate a self-signed one with [`DtlsIdentity::generate`]). (Feature
@@ -73,3 +77,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// values tunnel an arbitrary protocol between two ristrust peers, dispatched on
 /// via the protocol type [`Receiver::read_oob`] returns.
 pub const OOB_PROTOCOL_IP: u16 = rist_codec::gre::PROTO_FULL;
+
+/// The largest media payload a single [`Sender::send`] can carry that still leaves
+/// room for the heaviest per-profile framing within a standard 1500-byte MTU. A
+/// payload at this limit fits the lightest profiles but, with the heaviest framing
+/// (Advanced + AES, or Main + DTLS), is IP-fragmented on a strict-MTU path. For a
+/// size safe on *every* profile, keep each write at or below [`SAFE_MEDIA_PAYLOAD`].
+pub const MAX_MEDIA_PAYLOAD: usize = 1460;
+
+/// The largest media payload that fits without IP fragmentation on *any* profile,
+/// including Main+DTLS, on a standard 1500-byte MTU path. It is the 7-cell MPEG-TS
+/// payload (`7 × 188`); chunking writes to this size never fragments regardless of
+/// profile or encryption.
+pub const SAFE_MEDIA_PAYLOAD: usize = 1316;

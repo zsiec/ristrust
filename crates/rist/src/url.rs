@@ -4,7 +4,9 @@
 //! (`host:port`) and a [`Config`] with the query parameters folded in. The
 //! accepted parameter names match libRIST's (`parse_url_options`) so the same URL
 //! works against ffmpeg/libRIST. A bare `host:port` (no scheme) is returned
-//! unchanged. Unknown parameters are ignored, matching libRIST.
+//! unchanged. An unknown parameter is rejected (a typo fails loudly rather than
+//! silently running with a default), matching libRIST and ristgo; the
+//! valid-but-unimplemented libRIST keys are accept-and-ignored.
 //!
 //! To keep the dependency footprint minimal (the project's posture), the simple
 //! `rist://` structure is hand-parsed rather than pulling in a general URL crate;
@@ -15,9 +17,9 @@ use std::time::Duration;
 
 use rist_codec::crypto::AesKeyBits;
 
-use crate::CongestionMode;
 use crate::config::{Config, Profile};
 use crate::error::Error;
+use crate::{CongestionMode, TimingMode};
 
 /// A millisecond-valued query parameter ceiling: one week, far above any sane
 /// RIST timing value yet far below where `Duration::from_millis` could approach
@@ -139,6 +141,7 @@ fn percent_decode(s: &str) -> String {
 /// Folds the parsed query parameters into `cfg`, in a fixed order so the explicit
 /// `-min`/`-max` keys win over `buffer`/`rtt` regardless of URL order.
 fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Error> {
+    reject_unknown_params(q)?;
     let millis = |key: &str| -> Result<Option<Duration>, Error> {
         match q.get(key) {
             None => Ok(None),
@@ -327,6 +330,84 @@ fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<()
             }
         };
     }
+    // `return-bandwidth`: receiver NACK-channel cap in kbps (0 = unlimited).
+    if let Some(n) = int("return-bandwidth")? {
+        cfg.return_bandwidth = clamp_u32("return-bandwidth", n)?;
+    }
+    // `timing-mode` on libRIST's numbering: 0=source, 1=arrival, 2=rtc (mapped to
+    // arrival, as ristgo does — ristrust has no separate RTC playout clock).
+    if let Some(n) = int("timing-mode")? {
+        cfg.timing_mode = match n {
+            0 => TimingMode::Source,
+            1 | 2 => TimingMode::Arrival,
+            other => {
+                return Err(Error::Url(format!(
+                    "timing-mode={other} must be 0 (source), 1 (arrival), or 2 (rtc)"
+                )));
+            }
+        };
+    }
+    Ok(())
+}
+
+/// The set of `rist://` query parameters [`parse_url`] accepts. It is every key
+/// the `apply_*` helpers act on PLUS the libRIST parameters ristrust does not
+/// implement but tolerates (accept-and-ignore) so a URL authored for libRIST is
+/// not rejected over a valid-but-unsupported option. Any key absent here is treated
+/// as a typo and rejected (see [`reject_unknown_params`]), matching libRIST and
+/// ristgo.
+const RECOGNIZED_URL_PARAMS: &[&str] = &[
+    "buffer",
+    "buffer-min",
+    "buffer-max",
+    "rtt",
+    "rtt-min",
+    "rtt-max",
+    "rtt-multiplier",
+    "reorder-buffer",
+    "session-timeout",
+    "keepalive",
+    "keepalive-interval",
+    "bandwidth",
+    "return-bandwidth",
+    "weight",
+    "aes-type",
+    "key-rotation",
+    "min-retries",
+    "max-retries",
+    "virt-src-port",
+    "virt-dst-port",
+    "profile",
+    "cname",
+    "secret",
+    "username",
+    "password",
+    "compression",
+    "miface",
+    "ttl",
+    "source",
+    "congestion-control",
+    "timing-mode",
+    // Accepted-and-ignored for libRIST URL portability (not implemented as a
+    // single-session URL value): `srp-compat` legacy SRP mode, `recovery-priority`
+    // per-peer NACK priority (a bonded-peer concept), `reflector` one-to-many
+    // fan-out, and `local-port` caller fixed source port. Rejecting a valid libRIST
+    // URL over these is the worse failure for portability.
+    "srp-compat",
+    "recovery-priority",
+    "reflector",
+    "local-port",
+];
+
+/// Rejects any query parameter not in [`RECOGNIZED_URL_PARAMS`], so a typo'd key
+/// fails loudly rather than silently running with a default (matching libRIST and
+/// ristgo's `recognizedURLParams` gate).
+fn reject_unknown_params(q: &HashMap<String, String>) -> Result<(), Error> {
+    for key in q.keys() {
+        if !RECOGNIZED_URL_PARAMS.contains(&key.as_str()) {
+            return Err(Error::Url(format!("unknown parameter {key:?}")));
+        }
+    }
     Ok(())
 }
 
@@ -397,6 +478,42 @@ mod tests {
         }
         // Out-of-range value is rejected, not silently clamped.
         assert!(parse_url("rist://h:5000?congestion-control=3", Config::default()).is_err());
+    }
+
+    #[test]
+    fn timing_mode_and_return_bandwidth_fold_in() {
+        for (n, want) in [
+            (0, TimingMode::Source),
+            (1, TimingMode::Arrival),
+            (2, TimingMode::Arrival), // rtc maps to arrival
+        ] {
+            let raw = format!("rist://h:5000?timing-mode={n}");
+            let (_, cfg) = parse_url(&raw, Config::default()).unwrap();
+            assert_eq!(cfg.timing_mode, want, "timing-mode={n}");
+        }
+        assert!(parse_url("rist://h:5000?timing-mode=9", Config::default()).is_err());
+
+        let (_, cfg) = parse_url("rist://h:5000?return-bandwidth=2000", Config::default()).unwrap();
+        assert_eq!(cfg.return_bandwidth, 2000);
+    }
+
+    #[test]
+    fn unknown_param_is_rejected_but_libwrist_extras_are_tolerated() {
+        // A typo'd key fails loudly rather than silently defaulting.
+        assert!(parse_url("rist://h:5000?bufer=1000", Config::default()).is_err());
+        assert!(parse_url("rist://h:5000?timing_mode=1", Config::default()).is_err());
+        // Valid-but-unimplemented libRIST keys are accepted (ignored) for URL portability.
+        for raw in [
+            "rist://h:5000?reflector=1",
+            "rist://h:5000?local-port=7000",
+            "rist://h:5000?recovery-priority=3",
+            "rist://h:5000?srp-compat=1",
+        ] {
+            assert!(
+                parse_url(raw, Config::default()).is_ok(),
+                "{raw} must parse"
+            );
+        }
     }
 
     #[test]

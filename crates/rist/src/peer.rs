@@ -91,6 +91,17 @@ impl Peer {
         self.seen = true;
     }
 
+    /// The instant traffic was last seen from the peer (`Timestamp::ZERO` if never).
+    /// Used by the caller-rebind path to tell whether a rebind recovered the stream
+    /// (fresh traffic arrived after it) so the attempt counter can reset.
+    pub(crate) fn last_seen(&self) -> Timestamp {
+        if self.seen {
+            self.last_seen
+        } else {
+            Timestamp::ZERO
+        }
+    }
+
     /// Replaces the peer's media and RTCP return addresses with `addr` — the
     /// deliberate override (unlike `learn_*`, which lock the first source) that
     /// migrates the tuple during a NAT source-port rebind recovery. The caller MUST
@@ -115,6 +126,13 @@ impl Peer {
     /// has never been seen does not expire (the session is still forming).
     pub(crate) fn expired(&self, now: Timestamp) -> bool {
         self.silent_for(now, self.timeout)
+    }
+
+    /// The configured session timeout — the silence span after which the peer
+    /// expires. Used by the caller-rebind path to size its (stricter) rebind silence
+    /// threshold and backoff.
+    pub(crate) fn timeout(&self) -> Micros {
+        self.timeout
     }
 }
 

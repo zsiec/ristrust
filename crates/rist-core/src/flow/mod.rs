@@ -57,6 +57,22 @@ const NACK_CADENCE: Micros = Micros::from_millis(5);
 /// Both roles originate echoes to measure their own RTT.
 const RTT_ECHO_INTERVAL: Micros = Micros::from_millis(100);
 
+/// How the receiver schedules in-order playout (libRIST `timing_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimingMode {
+    /// Pace playout by the media SOURCE timestamps (libRIST default): inter-packet
+    /// spacing follows the sender's clock, so the receiver reproduces the source's
+    /// timing. The source-clock wrap re-anchor and the source-time reorder/too-late
+    /// test apply only in this mode.
+    #[default]
+    Source,
+    /// Pace playout by ARRIVAL time: each packet is held a fixed recovery buffer
+    /// from when it arrived rather than from its source timestamp, so a drifting or
+    /// absent source clock cannot stall playout. Shedding of unrecoverable packets
+    /// falls to the seq-based playout-cursor guard.
+    Arrival,
+}
+
 /// Which half of a RIST flow this instance is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -116,6 +132,15 @@ pub struct Config {
     /// receiver queues no missing entries (so requests no NACKs) and originates no
     /// RTT echo, reclaiming an unrecoverable hole by playout-skip rather than ARQ.
     pub no_recovery: bool,
+    /// How the receiver schedules playout (libRIST `timing_mode`). Receiver-only;
+    /// the default [`TimingMode::Source`] matches libRIST.
+    pub timing_mode: TimingMode,
+    /// libRIST's return-bandwidth in kbps: a cap on the receiver's outbound NACK
+    /// channel so its retransmission requests stay within an upstream budget on an
+    /// asymmetric link. `0` (the default) means unlimited. Receiver-only. A NACK
+    /// sequence with no token is left due (re-serviced on the next pass), so
+    /// recovery slows but is never broken.
+    pub return_maxbitrate: u32,
 }
 
 impl Config {
@@ -138,6 +163,8 @@ impl Config {
             ssrc: 0,
             start_seq: 0,
             no_recovery: false,
+            timing_mode: TimingMode::Source,
+            return_maxbitrate: 0,
         }
     }
 
@@ -214,13 +241,18 @@ impl Flow {
         let recovery_buffer = cfg.recovery_buffer();
         let recovery_buffer_110 = mul_1_1(recovery_buffer);
         let est = Estimator::new(cfg.rtt_min);
-        let (receiver, sender) = match role {
+        let (mut receiver, sender) = match role {
             Role::Receiver => (ReceiverState::new(size), SenderState::empty()),
             Role::Sender => (
                 ReceiverState::empty(),
                 SenderState::new(size, cfg.ssrc, cfg.start_seq),
             ),
         };
+        // A receiver with a return-bandwidth cap arms its NACK-channel token bucket
+        // (libRIST return-bandwidth); a `0` cap leaves it unlimited.
+        if role == Role::Receiver && cfg.return_maxbitrate > 0 {
+            receiver.set_return_bandwidth(cfg.return_maxbitrate);
+        }
         let missing_counter_max = congestion::derive_missing_counter_max(&cfg);
         let max_nacks_per_loop = congestion::derive_max_nacks_per_loop(&cfg);
         Flow {

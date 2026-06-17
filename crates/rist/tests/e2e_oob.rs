@@ -70,6 +70,81 @@ async fn oob_round_trip(profile: Profile, secret: Option<&str>, proto: u16) {
     receiver.close().await.expect("close receiver");
 }
 
+/// Drives one OOB datagram receiver → sender (the reverse direction) and asserts it
+/// arrives byte-exact, on the given profile/secret.
+async fn reverse_oob_round_trip(profile: Profile, secret: Option<&str>) {
+    let c = cfg(profile, secret);
+    let (mut receiver, port) = listen_free(&c).await;
+    let mut sender = dial_with(&format!("127.0.0.1:{port}"), c.clone(), &TokioRuntime)
+        .await
+        .expect("dial");
+
+    // Warm up so the receiver learns the sender's return address (reverse OOB is
+    // dropped until the peer is known).
+    sender.send(b"media-warmup").await.expect("send media");
+    let _ = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("media did not arrive")
+        .expect("session open");
+
+    let payload = b"reverse-oob-from-the-receiver";
+    receiver
+        .write_oob(payload)
+        .await
+        .expect("receiver write oob");
+
+    let (got_proto, got) = tokio::time::timeout(Duration::from_secs(5), sender.read_oob_typed())
+        .await
+        .expect("reverse oob did not arrive")
+        .expect("sender oob channel open");
+    assert_eq!(
+        got_proto, OOB_PROTOCOL_IP,
+        "reverse OOB protocol type mismatch"
+    );
+    assert_eq!(got.as_ref(), payload, "reverse OOB payload mismatch");
+
+    sender.close().await.expect("close sender");
+    receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
+async fn reverse_oob_round_trips_main_cleartext() {
+    reverse_oob_round_trip(Profile::Main, None).await;
+}
+
+#[tokio::test]
+async fn reverse_oob_round_trips_main_aes256() {
+    reverse_oob_round_trip(Profile::Main, Some("rev-oob-secret")).await;
+}
+
+#[tokio::test]
+async fn reverse_oob_round_trips_advanced() {
+    reverse_oob_round_trip(Profile::Advanced, Some("rev-adv-oob")).await;
+}
+
+#[tokio::test]
+async fn receiver_write_oob_rejected_on_simple() {
+    // A Simple-profile receiver has no OOB side channel.
+    let (rx, _port) = {
+        let c = Config::default(); // Simple
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
+        let mut port = probe.local_addr().expect("addr").port();
+        if !port.is_multiple_of(2) {
+            port = port.wrapping_sub(1);
+        }
+        drop(probe);
+        let r = listen(&format!("127.0.0.1:{port}"), c)
+            .await
+            .expect("listen simple");
+        (r, port)
+    };
+    assert!(matches!(
+        rx.write_oob(b"x").await,
+        Err(Error::OobUnsupported)
+    ));
+    rx.close().await.ok();
+}
+
 #[tokio::test]
 async fn oob_round_trips_main_cleartext() {
     oob_round_trip(Profile::Main, None, OOB_PROTOCOL_IP).await;

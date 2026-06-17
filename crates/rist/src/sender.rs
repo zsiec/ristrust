@@ -29,6 +29,7 @@ pub struct Sender {
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
+    oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -53,6 +54,13 @@ impl Sender {
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    /// The bound local media (even) port (ristgo `LocalPort`). Convenience over
+    /// [`local_addr`](Self::local_addr) when only the port is needed.
+    #[must_use]
+    pub fn local_port(&self) -> u16 {
+        self.local.port()
     }
 
     /// A snapshot of this sender's counters (the sender-half fields are populated;
@@ -124,6 +132,30 @@ impl Sender {
         cmd.send((proto, payload.to_vec()))
             .await
             .map_err(|_| self.close.error())
+    }
+
+    /// Reads the next reverse out-of-band datagram's payload sent by the receiver
+    /// (the protocol type is discarded; use [`Sender::read_oob_typed`] to keep it).
+    ///
+    /// # Errors
+    /// As [`Sender::read_oob_typed`].
+    pub async fn read_oob(&mut self) -> Result<Bytes, Error> {
+        self.read_oob_typed().await.map(|(_, payload)| payload)
+    }
+
+    /// Reads the next reverse out-of-band datagram from the receiver as `(GRE
+    /// protocol type, payload)`. OOB bypasses the flow core (no reordering or ARQ);
+    /// it is delivered in arrival order, decrypted under the PSK when one is
+    /// configured. The mirror of [`Receiver::write_oob`](crate::Receiver::write_oob).
+    ///
+    /// # Errors
+    /// Returns [`Error::OobUnsupported`] on a Simple-profile or bonded sender, or
+    /// [`Error::Closed`] when the session has shut down.
+    pub async fn read_oob_typed(&mut self) -> Result<(u16, Bytes), Error> {
+        let Some(rx) = self.oob_out.as_mut() else {
+            return Err(Error::OobUnsupported);
+        };
+        rx.recv().await.ok_or(Error::Closed)
     }
 
     /// Submits one media payload for reliable transmission. Applies back-pressure
@@ -205,6 +237,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -253,6 +286,7 @@ pub async fn dial_bonded_with(
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -308,6 +342,7 @@ pub async fn dial_bonded_weighted_with(
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -317,7 +352,8 @@ pub async fn dial_bonded_weighted_with(
 /// Binds a reversed-role **listener-sender**: a media sender that listens on `addr`
 /// (a bare `IP:port` or a `rist://` URL) and waits for a [`dial_receiver`](crate::dial_receiver) caller to
 /// announce itself, then sends media to it. Media submitted via [`Sender::send`] is
-/// held until the caller connects. Main profile only; PSK supported, EAP-SRP refused.
+/// held until the caller connects. Main profile only; PSK and EAP-SRP supported (the
+/// listener-sender is the authenticatee).
 ///
 /// # Errors
 /// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]
@@ -354,6 +390,7 @@ pub async fn listen_sender_with(
         weight_cmd: spawned.weight_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
+        oob_out: spawned.oob_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

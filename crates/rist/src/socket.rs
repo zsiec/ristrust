@@ -343,6 +343,24 @@ impl MainSocket {
         }
     }
 
+    /// Recovers a caller-receiver NAT / dynamic-IP source-port change (libRIST
+    /// `try_caller_socket_rebind`): binds a FRESH ephemeral socket on the same host
+    /// family and returns it as a new [`MainSocket`] (no FEC sockets — caller-receiver
+    /// reversed-role carries no separate-port FEC). The fresh local port makes the
+    /// peer re-learn this side's source on the next outbound keepalive. The driver
+    /// swaps `self` for the result and respawns its reader on it.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the current local address cannot be read or the fresh
+    /// socket cannot be bound.
+    pub(crate) fn rebind(&self) -> io::Result<MainSocket> {
+        let ipv6 = self.local()?.is_ipv6();
+        // A caller-rebind is a production NAT-recovery path; bind directly via the
+        // default tokio runtime (matching ristgo's direct rebind), independent of any
+        // injected runtime.
+        MainSocket::dial_ephemeral(&crate::runtime::TokioRuntime, ipv6, None)
+    }
+
     /// The local address the transport is bound to.
     ///
     /// # Errors
@@ -385,6 +403,24 @@ mod tests {
         assert_ne!(media.port(), 0);
         assert_ne!(rtcp.port(), 0);
         assert_ne!(media.port(), rtcp.port());
+    }
+
+    #[tokio::test]
+    async fn main_rebind_binds_a_fresh_distinct_port_same_family() {
+        let rt = TokioRuntime;
+        for ipv6 in [false, true] {
+            let Ok(s) = MainSocket::dial_ephemeral(&rt, ipv6, None) else {
+                continue; // host may lack IPv6
+            };
+            let old = s.local().unwrap();
+            let fresh = s.rebind().expect("rebind");
+            let new = fresh.local().unwrap();
+            assert_eq!(old.is_ipv6(), new.is_ipv6(), "rebind must keep the family");
+            assert_ne!(new.port(), 0);
+            // The old socket is still open here (the driver closes it), so the OS must
+            // pick a different port for the fresh one.
+            assert_ne!(old.port(), new.port(), "rebind must pick a fresh port");
+        }
     }
 
     #[tokio::test]

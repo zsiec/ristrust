@@ -211,14 +211,21 @@ impl MainCodec {
         self.send_key.is_some()
     }
 
-    /// Re-keys the data channel to a new PSK passphrase, deriving a fresh send
-    /// [`crypto::Key`] and receive [`crypto::Decryptor`] over it. After EAP-SRP
-    /// authentication libRIST sets the data passphrase to the SRP session key K (or
-    /// a pushed passphrase), so the host calls this with K to flow encrypted media.
-    pub(crate) fn set_psk(&mut self, passphrase: &[u8]) -> Result<(), CodecError> {
+    /// Re-keys the data channel to the EAP-SRP session key K, deriving a fresh send
+    /// [`crypto::Key`] and receive [`crypto::Decryptor`] over it. After
+    /// authentication libRIST sets the data passphrase to K (the `use_key_as_passphrase`
+    /// mode), so the host calls this with K to flow encrypted media.
+    ///
+    /// K is the raw 32-byte SRP session key (a SHA-256 digest), so it keys through
+    /// the **raw** derivation ([`crypto::Key::new_raw`] / [`crypto::Decryptor::new_raw`]):
+    /// libRIST installs an EAP-pushed passphrase via `_librist_crypto_psk_set_passphrase`,
+    /// which hashes the full bytes. Keying it through the NUL-truncating
+    /// configured-`Secret` path would diverge from a libRIST peer whenever K contains
+    /// a NUL byte (≈12% of keys), so media would fail to decrypt for those sessions.
+    pub(crate) fn set_session_key(&mut self, k: &[u8]) -> Result<(), CodecError> {
         let bits = crypto::AesKeyBits::Aes256;
-        self.send_key = Some(crypto::Key::new(passphrase, bits, 0, false)?);
-        self.recv_key = Some(crypto::Decryptor::new(passphrase, bits)?);
+        self.send_key = Some(crypto::Key::new_raw(k, bits, 0, false)?);
+        self.recv_key = Some(crypto::Decryptor::new_raw(k, bits)?);
         self.key_size_256 = true;
         Ok(())
     }

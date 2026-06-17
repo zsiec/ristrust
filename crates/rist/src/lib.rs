@@ -28,6 +28,7 @@ mod receiver;
 mod sender;
 mod session;
 mod socket;
+pub mod split;
 mod stats;
 
 pub use config::{Config, FlowAttrCallback, NackType, Profile, RateCallback};
@@ -46,6 +47,7 @@ pub use sender::{
     MAX_FRAGMENTS_PER_WRITE, Sender, dial, dial_bonded, dial_bonded_weighted,
     dial_bonded_weighted_with, dial_bonded_with, dial_with, listen_sender, listen_sender_with,
 };
+pub use split::{MergeMode, SplitMode};
 pub use stats::Stats;
 pub use url::parse_url;
 

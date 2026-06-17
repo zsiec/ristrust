@@ -360,8 +360,8 @@ pub async fn dial_bonded_weighted_with(
 /// Binds a reversed-role **listener-sender**: a media sender that listens on `addr`
 /// (a bare `IP:port` or a `rist://` URL) and waits for a [`dial_receiver`](crate::dial_receiver) caller to
 /// announce itself, then sends media to it. Media submitted via [`Sender::send`] is
-/// held until the caller connects. Main profile only; PSK and EAP-SRP supported (the
-/// listener-sender is the authenticatee).
+/// held until the caller connects. Main and Advanced profiles; PSK and EAP-SRP
+/// supported (the listener-sender is the authenticatee).
 ///
 /// # Errors
 /// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]

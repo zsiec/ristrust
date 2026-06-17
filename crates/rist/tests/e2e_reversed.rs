@@ -1,17 +1,17 @@
 //! End-to-end reversed-role transport: the media *sender* listens and the media
 //! *receiver* dials it (the inverse of the usual roles), for pull / NAT-traversal
 //! topologies. The caller-receiver announces itself; the listener-sender learns the
-//! return address and then streams media, held until the caller connects. Main
-//! profile, cleartext and PSK-encrypted.
+//! return address and then streams media, held until the caller connects. Main and
+//! Advanced profiles, cleartext and PSK-encrypted.
 
 use std::time::Duration;
 
 use rist::{AesKeyBits, Config, Error, Profile, Sender, dial_receiver, listen_sender};
 
-/// A reversed-role (Main) base config with a short recovery buffer.
-fn rev_cfg(secret: Option<&str>) -> Config {
+/// A reversed-role base config for `profile` with a short recovery buffer.
+fn rev_cfg(profile: Profile, secret: Option<&str>) -> Config {
     let mut c = Config::default()
-        .with_profile(Profile::Main)
+        .with_profile(profile)
         .with_buffer(Duration::from_millis(150));
     if let Some(s) = secret {
         c = c.with_secret(s).with_aes_key_bits(AesKeyBits::Aes256);
@@ -38,9 +38,9 @@ async fn listen_sender_free(cfg: &Config) -> (Sender, u16) {
 
 /// Drives `N` payloads from a listener-sender to a caller-receiver and asserts
 /// in-order byte integrity.
-async fn reversed_round_trip(secret: Option<&str>) {
+async fn reversed_round_trip(profile: Profile, secret: Option<&str>) {
     const N: usize = 30;
-    let cfg = rev_cfg(secret);
+    let cfg = rev_cfg(profile, secret);
     let (sender, port) = listen_sender_free(&cfg).await;
     let mut receiver = dial_receiver(&format!("127.0.0.1:{port}"), cfg.clone())
         .await
@@ -74,23 +74,33 @@ async fn reversed_round_trip(secret: Option<&str>) {
 
 #[tokio::test]
 async fn reversed_role_delivers_cleartext() {
-    reversed_round_trip(None).await;
+    reversed_round_trip(Profile::Main, None).await;
 }
 
 #[tokio::test]
 async fn reversed_role_delivers_aes256() {
-    reversed_round_trip(Some("reversed-secret")).await;
+    reversed_round_trip(Profile::Main, Some("reversed-secret")).await;
 }
 
 #[tokio::test]
-async fn listen_sender_rejects_non_main() {
-    // The default profile is Simple; reversed-role currently requires Main.
+async fn reversed_role_delivers_advanced_cleartext() {
+    reversed_round_trip(Profile::Advanced, None).await;
+}
+
+#[tokio::test]
+async fn reversed_role_delivers_advanced_aes256() {
+    reversed_round_trip(Profile::Advanced, Some("reversed-adv-secret")).await;
+}
+
+#[tokio::test]
+async fn listen_sender_rejects_simple() {
+    // The default profile is Simple; reversed-role requires Main or Advanced.
     let err = listen_sender("127.0.0.1:5000", Config::default())
         .await
         .unwrap_err();
     assert!(
         matches!(err, Error::Io(_)),
-        "expected the non-Main rejection"
+        "expected the Simple-profile rejection"
     );
 }
 
@@ -102,7 +112,7 @@ async fn reversed_role_delivers_authenticated_srp() {
     // authenticates, then flows in order. Combined with a PSK so the
     // authenticated + encrypted reversed-role path is exercised end to end.
     const N: usize = 30;
-    let cfg = rev_cfg(Some("rev-psk")).with_srp_credentials("rist", "reversed");
+    let cfg = rev_cfg(Profile::Main, Some("rev-psk")).with_srp_credentials("rist", "reversed");
     let (sender, port) = listen_sender_free(&cfg).await;
     let mut receiver = dial_receiver(&format!("127.0.0.1:{port}"), cfg.clone())
         .await

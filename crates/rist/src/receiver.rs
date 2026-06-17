@@ -211,8 +211,8 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
 
 /// Dials a reversed-role **caller-receiver**: a media receiver that calls out to a
 /// [`listen_sender`](crate::listen_sender) listening at `addr` (a bare `IP:port` or `rist://` URL),
-/// announces itself so the sender learns where to send, then receives media. Main
-/// profile only; PSK and EAP-SRP supported (the caller-receiver is the authenticator).
+/// announces itself so the sender learns where to send, then receives media. Main and
+/// Advanced profiles; PSK and EAP-SRP supported (the caller-receiver is the authenticator).
 ///
 /// # Errors
 /// Returns [`Error::Url`]/[`Error::InvalidAddr`] for a bad address, [`Error::Config`]

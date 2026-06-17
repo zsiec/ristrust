@@ -391,7 +391,10 @@ impl AdvDriver {
                     Some((data, src)) => self.on_recv(src, &data).await,
                     None => break, // the reader exited (socket error) or the demuxer closed
                 },
-                payload = recv_app_gated(&mut self.app_in, self.authed) => match payload {
+                // Hold media until authenticated AND the peer's address is known. A
+                // normal sender knows its peer up front (so this is just `authed`); a
+                // reversed-role listener-sender holds media until the caller announces.
+                payload = recv_app_gated(&mut self.app_in, self.authed && self.peer.media().is_some()) => match payload {
                     Some(p) => {
                         let now = self.now();
                         self.push_app(now, &p);

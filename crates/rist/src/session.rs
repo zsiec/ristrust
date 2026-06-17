@@ -789,11 +789,11 @@ pub(crate) fn build_injected_bonded(
 /// supported (the single bidirectional GRE socket carries the handshake once the
 /// peer is learned — the media sender is the authenticatee whichever side dials),
 /// but DTLS is not.
-fn require_reversible_main(cfg: &Config) -> io::Result<()> {
-    if cfg.profile != Profile::Main {
+fn require_reversible(cfg: &Config) -> io::Result<()> {
+    if cfg.profile == Profile::Simple {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "rist: reversed-role transport currently requires the Main profile",
+            "rist: reversed-role transport requires the Main or Advanced profile",
         ));
     }
     // Reversed-role peer-learning (a sender that waits, or a receiver that dials an
@@ -821,7 +821,7 @@ pub(crate) fn build_listener_sender(
     cfg: &Config,
     local: SocketAddr,
 ) -> io::Result<SenderSpawned> {
-    require_reversible_main(cfg)?;
+    require_reversible(cfg)?;
     let ssrc = random_even_ssrc();
     let start_seq = random_start_seq();
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
@@ -830,6 +830,49 @@ pub(crate) fn build_listener_sender(
     let bound = socket.local()?;
     // Empty peer: the caller-receiver's announcement teaches us where to send.
     let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+
+    // Advanced reversed-role listener-sender: same single-GRE-port listen + learn-the-
+    // caller setup, driven by the Advanced codec (the AdvDriver holds media until the
+    // peer is known, like the Main path). Caller-side socket rebind is Main-only.
+    if cfg.profile == Profile::Advanced {
+        let main = build_main_codec(cfg, ssrc)?;
+        let adv = build_adv_codec(cfg, ssrc)?;
+        let eap = build_eap_role(cfg, true)?; // the media sender is the authenticatee
+        let (attr_tx, attr_rx) = mpsc::channel(16);
+        let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+        let (app_in, close, stats, task) = AdvDriver::spawn_sender(
+            flow,
+            socket,
+            peer,
+            main,
+            adv,
+            ssrc,
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            start_seq,
+            eap,
+            RateControl::from_config(cfg),
+            cfg.on_flow_attr.clone(),
+            attr_rx,
+            oob_rx,
+            rev_oob_tx,
+            cfg.fragment_size,
+            None, // FEC + reversed-role deferred
+        );
+        return Ok(SenderSpawned {
+            local: bound,
+            app_in,
+            weight_cmd: None,
+            flow_attr_cmd: Some(attr_tx),
+            oob_in: Some(oob_tx),
+            oob_out: Some(rev_oob_rx),
+            close,
+            stats,
+            task,
+        });
+    }
+
     let codec = build_main_codec(cfg, ssrc)?;
     let eap = build_eap_role(cfg, true)?; // the media sender is the authenticatee
     let (oob_tx, oob_rx) = mpsc::channel(16);
@@ -876,13 +919,50 @@ pub(crate) fn build_caller_receiver(
     cfg: &Config,
     remote: SocketAddr,
 ) -> io::Result<ReceiverSpawned> {
-    require_reversible_main(cfg)?;
+    require_reversible(cfg)?;
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let egress = crate::multicast::sender_egress(cfg, remote)?;
     let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
     let local = socket.local()?;
     // The sender's address is known up front (we dialled it), so we announce to it.
     let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
+
+    // Advanced reversed-role caller-receiver: same dial-and-announce setup driven by
+    // the Advanced codec. Caller-side socket rebind is a Main-only feature, so an
+    // Advanced caller-receiver does not rebind (it relies on the announce/keepalive).
+    if cfg.profile == Profile::Advanced {
+        let main = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
+        let adv = build_adv_codec(cfg, DEFAULT_FLOW_SSRC)?;
+        let eap = build_eap_role(cfg, false)?; // the media receiver is the authenticator
+        let (oob_tx, oob_rx) = mpsc::channel(16);
+        let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+        let (data_out, close, stats, task) = AdvDriver::spawn_receiver(
+            flow,
+            socket,
+            peer,
+            main,
+            adv,
+            DEFAULT_FLOW_SSRC,
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            eap,
+            build_lqm_emitter(cfg),
+            cfg.on_flow_attr.clone(),
+            oob_tx,
+            rev_oob_rx,
+            None, // FEC + reversed-role deferred
+        );
+        return Ok(ReceiverSpawned {
+            local,
+            data_out,
+            oob_out: Some(oob_rx),
+            oob_in: Some(rev_oob_tx),
+            close,
+            stats,
+            task,
+        });
+    }
+
     let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
     let eap = build_eap_role(cfg, false)?; // the media receiver is the authenticator
     // A non-SRP caller-receiver may rebind its own socket to recover a NAT /

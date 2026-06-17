@@ -34,6 +34,7 @@ use sha2::Sha256;
 /// AES-CTR with a 128-bit big-endian counter — the full 16-byte IV is the
 /// counter, incremented per block, matching libRIST's `BuildIV` layout.
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+type Aes192Ctr = ctr::Ctr128BE<aes::Aes192>;
 type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
 /// Errors returned by the PSK crypto layer. `Display` strings are prefixed
@@ -91,39 +92,57 @@ const MAX_PASSWORD_LEN: usize = 127;
 /// Bit 7 of `nonce[0]`: the odd/even passphrase marker.
 const NONCE_B_BIT_MASK: u8 = 1 << 7;
 
-/// The AES key size, restricted to the two widths RIST signals via the GRE H bit.
+/// The AES key size. Making it an enum renders an invalid key size unrepresentable.
 ///
-/// libRIST also supports 192-bit keys, but it can never be signalled (the single
-/// H bit selects 128 or 256); ristrust matches ristgo in offering only these two.
-/// Making it an enum renders an invalid key size unrepresentable.
+/// 192-bit keys are usable only in the **Advanced** profile, where the key size is
+/// signalled explicitly in the PSK future-nonce control field (`key_size_bits`,
+/// TR-06-3 §5.3.9). On the **Main** GRE wire the single H bit encodes only 128 vs
+/// 256 — libRIST's own receiver forces the key size from it — so 192 cannot be
+/// signalled there and [`from_h_bit`](AesKeyBits::from_h_bit) never yields it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AesKeyBits {
     /// 128-bit key (16 bytes); GRE H bit clear.
     Aes128,
+    /// 192-bit key (24 bytes); Advanced profile only (the Main wire cannot signal it).
+    Aes192,
     /// 256-bit key (32 bytes); GRE H bit set.
     Aes256,
 }
 
 impl AesKeyBits {
-    /// The key length in bytes (16 or 32).
+    /// The key length in bytes (16, 24, or 32).
     #[must_use]
     pub fn bytes(self) -> usize {
         match self {
             AesKeyBits::Aes128 => 16,
+            AesKeyBits::Aes192 => 24,
             AesKeyBits::Aes256 => 32,
         }
     }
 
-    /// The key length in bits (128 or 256).
+    /// The key length in bits (128, 192, or 256).
     #[must_use]
     pub fn bits(self) -> u16 {
         match self {
             AesKeyBits::Aes128 => 128,
+            AesKeyBits::Aes192 => 192,
             AesKeyBits::Aes256 => 256,
         }
     }
 
-    /// The key size the GRE H bit indicates (`true` => 256, `false` => 128).
+    /// Maps an Advanced `key_size_bits` value to a key size, or `None` if unsupported.
+    #[must_use]
+    pub fn from_bits(bits: u16) -> Option<AesKeyBits> {
+        match bits {
+            128 => Some(AesKeyBits::Aes128),
+            192 => Some(AesKeyBits::Aes192),
+            256 => Some(AesKeyBits::Aes256),
+            _ => None,
+        }
+    }
+
+    /// The key size the GRE H bit indicates (`true` => 256, `false` => 128). 192 is
+    /// never produced — the Main wire cannot signal it (see the type doc).
     #[must_use]
     pub fn from_h_bit(h: bool) -> AesKeyBits {
         if h {
@@ -228,11 +247,11 @@ pub fn build_iv(seq: u32) -> [u8; IV_SIZE] {
 /// `derive_key`-produced `key` (16 or 32 bytes) and the 16-byte `iv`. `pub(crate)` so
 /// the Advanced AEAD module reuses the identical keystream for AES-CTR-HMAC (mode 3).
 pub(crate) fn aes_ctr_apply(key: &[u8], iv: &[u8; IV_SIZE], buf: &mut [u8]) {
-    if key.len() == 32 {
-        Aes256Ctr::new(key.into(), iv.into()).apply_keystream(buf);
-    } else {
-        // `derive_key` only ever yields a 16- or 32-byte key.
-        Aes128Ctr::new(key.into(), iv.into()).apply_keystream(buf);
+    match key.len() {
+        32 => Aes256Ctr::new(key.into(), iv.into()).apply_keystream(buf),
+        24 => Aes192Ctr::new(key.into(), iv.into()).apply_keystream(buf),
+        // `derive_key` only ever yields a 16-, 24-, or 32-byte key.
+        _ => Aes128Ctr::new(key.into(), iv.into()).apply_keystream(buf),
     }
 }
 

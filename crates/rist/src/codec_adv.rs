@@ -236,11 +236,10 @@ impl AdvCodec {
             adv::CI_PSK_NONCE => {
                 // Pre-derive the announced future nonce's key (a decryptor concern).
                 if let (Ok(pn), Some(key)) = (adv::PskNonce::parse(&body), self.recv_key.as_mut()) {
-                    let bits = if pn.key_bits == 256 {
-                        crypto::AesKeyBits::Aes256
-                    } else {
-                        crypto::AesKeyBits::Aes128
-                    };
+                    // Honor the announced key size (128/192/256 — TR-06-3 §5.3.9); an
+                    // unrecognized value falls back to 128 rather than mis-deriving.
+                    let bits = crypto::AesKeyBits::from_bits(pn.key_bits)
+                        .unwrap_or(crypto::AesKeyBits::Aes128);
                     key.precompute(pn.nonce, bits);
                 }
                 Ok(Decoded::Ignored)
@@ -669,6 +668,7 @@ mod tests {
             ("clear", None, false),
             ("lz4", None, true),
             ("aes128", Some(AesKeyBits::Aes128), false),
+            ("aes192", Some(AesKeyBits::Aes192), false),
             ("aes256+lz4", Some(AesKeyBits::Aes256), true),
         ];
         for &(name, bits, comp) in cases {

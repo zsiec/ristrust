@@ -33,7 +33,7 @@ const MAX_URL_MILLIS: u64 = 7 * 24 * 3600 * 1000;
 /// Accepted parameters (all durations in milliseconds): `buffer`, `buffer-min`,
 /// `buffer-max`, `rtt`, `rtt-min`, `rtt-max`, `reorder-buffer`,
 /// `session-timeout`, `keepalive` / `keepalive-interval`; `rtt-multiplier`,
-/// `bandwidth` (kbps), `min-retries`, `max-retries`, `aes-type` (128/256),
+/// `bandwidth` (kbps), `min-retries`, `max-retries`, `aes-type` (128/192/256),
 /// `key-rotation`, `weight`, `virt-src-port`, `virt-dst-port`, `profile`,
 /// `cname`, `secret`, `username`, `password`, `compression` (0/1), and the
 /// multicast `miface`/`ttl`/`source`. `buffer` sets both buffer bounds and `rtt`
@@ -308,8 +308,13 @@ fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<()
     if let Some(n) = int("aes-type")? {
         cfg.aes_key_bits = Some(match n {
             128 => AesKeyBits::Aes128,
+            192 => AesKeyBits::Aes192,
             256 => AesKeyBits::Aes256,
-            other => return Err(Error::Url(format!("aes-type={other} must be 128 or 256"))),
+            other => {
+                return Err(Error::Url(format!(
+                    "aes-type={other} must be 128, 192, or 256"
+                )));
+            }
         });
     }
     if let Some(n) = int("profile")? {
@@ -580,6 +585,25 @@ mod tests {
     }
 
     #[test]
+    fn aes_type_192_advanced() {
+        // 192-bit AES is accepted (Advanced profile signals it via key_size_bits).
+        let (_, cfg) = parse_url(
+            "rist://h:5000?profile=2&secret=k&aes-type=192",
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.aes_key_bits, Some(AesKeyBits::Aes192));
+        assert!(cfg.validate().is_ok(), "192 is valid on Advanced");
+        // …but rejected on Main, where the H bit cannot signal it.
+        let (_, main) = parse_url(
+            "rist://h:5000?profile=1&secret=k&aes-type=192",
+            Config::default(),
+        )
+        .unwrap();
+        assert!(main.validate().is_err(), "192 must be rejected on Main");
+    }
+
+    #[test]
     fn ipv6_authority() {
         let (addr, _) = parse_url("rist://[::1]:5000?buffer=500", Config::default()).unwrap();
         assert_eq!(addr, "[::1]:5000");
@@ -593,7 +617,7 @@ mod tests {
             "rist://h:5000?buffer=abc",          // non-integer buffer
             "rist://h:5000?rtt-min=fast",        // non-integer rtt-min
             "rist://h:5000?virt-dst-port=99999", // port out of range
-            "rist://h:5000?aes-type=192",        // unsupported AES size
+            "rist://h:5000?aes-type=200",        // unsupported AES size (not 128/192/256)
             "rist://h:5000?profile=9",           // unknown profile
         ];
         for raw in cases {

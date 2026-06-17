@@ -638,6 +638,12 @@ impl Config {
                     // Payload fragmentation (F/L bits) is Advanced-profile only.
                     return Err(unsupported("payload fragmentation", "Main"));
                 }
+                if self.aes_key_bits == Some(AesKeyBits::Aes192) {
+                    // 192-bit AES is signalable only on the Advanced profile (the
+                    // key_size_bits control field). The Main GRE H bit encodes only
+                    // 128 vs 256, so libRIST's receiver can't carry 192 either.
+                    return Err(unsupported("192-bit AES keys", "Main"));
+                }
             }
             Profile::Advanced => {
                 if self.null_packet_deletion {

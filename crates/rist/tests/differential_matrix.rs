@@ -27,7 +27,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rist::{AesKeyBits, Config, Profile, dial, listen};
+use rist::{AesKeyBits, Config, Profile, dial, dial_bonded, listen, listen_bonded};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::process::{Child, Command};
@@ -127,6 +127,12 @@ struct Scenario {
     aes: Option<AesKeyBits>,
     compression: bool,
     buffer_ms: u64,
+    /// EAP-SRP credentials (`username`/`password`). When set with no `secret`, the
+    /// media key is derived from the SRP session key K — the raw (no NUL-truncation)
+    /// PBKDF2 path, exactly the interop case the session's raw-key fix targeted.
+    srp: Option<(&'static str, &'static str)>,
+    /// Negotiate the legacy unpadded EAPOL v2 SRP variant (libRIST `srp-compat`).
+    srp_compat: bool,
 }
 
 impl Scenario {
@@ -143,6 +149,12 @@ impl Scenario {
         }
         if self.compression {
             c = c.with_compression(true);
+        }
+        if let Some((u, p)) = self.srp {
+            c = c.with_srp_credentials(u, p);
+        }
+        if self.srp_compat {
+            c = c.with_srp_compat(true);
         }
         c
     }
@@ -161,6 +173,12 @@ impl Scenario {
                 AesKeyBits::Aes256 => 256,
             };
             write!(q, "&aes-type={n}").unwrap();
+        }
+        if let Some((u, p)) = self.srp {
+            write!(q, "&username={u}&password={p}").unwrap();
+        }
+        if self.srp_compat {
+            q.push_str("&srp-compat=1");
         }
         if self.compression && sender {
             q.push_str("&compression=1");
@@ -391,64 +409,81 @@ async fn ristrust_rx_from_tx(label: &str, s: Scenario, loss: f64) {
 // Scenario constructors
 // ---------------------------------------------------------------------------
 
-fn simple() -> Scenario {
+/// The shared scenario baseline (no encryption, no SRP, 300 ms buffer); each
+/// constructor overrides only the fields it varies.
+fn base(profile: Profile, profile_n: u8) -> Scenario {
     Scenario {
-        profile: Profile::Simple,
-        profile_n: 0,
+        profile,
+        profile_n,
         secret: None,
         aes: None,
         compression: false,
         buffer_ms: 300,
+        srp: None,
+        srp_compat: false,
     }
 }
+fn simple() -> Scenario {
+    base(Profile::Simple, 0)
+}
 fn main_clear() -> Scenario {
-    Scenario {
-        profile: Profile::Main,
-        profile_n: 1,
-        secret: None,
-        aes: None,
-        compression: false,
-        buffer_ms: 300,
-    }
+    base(Profile::Main, 1)
 }
 fn main_aes(bits: AesKeyBits) -> Scenario {
     Scenario {
-        profile: Profile::Main,
-        profile_n: 1,
         secret: Some(SECRET),
         aes: Some(bits),
-        compression: false,
-        buffer_ms: 300,
+        ..base(Profile::Main, 1)
     }
 }
 fn adv_clear() -> Scenario {
-    Scenario {
-        profile: Profile::Advanced,
-        profile_n: 2,
-        secret: None,
-        aes: None,
-        compression: false,
-        buffer_ms: 300,
-    }
+    base(Profile::Advanced, 2)
 }
 fn adv_aes256() -> Scenario {
     Scenario {
-        profile: Profile::Advanced,
-        profile_n: 2,
         secret: Some(SECRET),
         aes: Some(AesKeyBits::Aes256),
-        compression: false,
-        buffer_ms: 300,
+        ..base(Profile::Advanced, 2)
     }
 }
 fn adv_lz4() -> Scenario {
     Scenario {
-        profile: Profile::Advanced,
-        profile_n: 2,
-        secret: None,
-        aes: None,
         compression: true,
-        buffer_ms: 300,
+        ..base(Profile::Advanced, 2)
+    }
+}
+
+// EAP-SRP credentials shared by the SRP scenarios.
+const SRP_USER: &str = "diff-srp-user";
+const SRP_PASS: &str = "diff-srp-password";
+
+// Only the *combined* EAP-SRP-plus-PSK-secret mode is cross-stack interoperable, so
+// every SRP scenario here sets a `secret`. The pure-SRP (no-secret,
+// use_key_as_passphrase) mode keys the media from the SRP session key K; a libRIST /
+// ristgo listener rejects it ("configured without keysize") because its keysize gate
+// inspects the PSK passphrase, not the SRP-derived key — so it is a ristrust↔ristrust
+// (and ristgo↔ristgo) mode, covered by the in-crate e2e tests, not here. EAP-SRP is
+// also Main-only on both stacks, so there is no Advanced SRP case.
+
+/// Main profile, EAP-SRP authentication with an AES-256 PSK secret (the libRIST-
+/// interoperable combined mode): SRP gates the session, the secret keys the media.
+fn main_srp() -> Scenario {
+    Scenario {
+        secret: Some(SECRET),
+        aes: Some(AesKeyBits::Aes256),
+        srp: Some((SRP_USER, SRP_PASS)),
+        ..base(Profile::Main, 1)
+    }
+}
+/// As [`main_srp`], but negotiating the legacy unpadded EAPOL v2 SRP variant
+/// (libRIST `srp-compat`).
+fn main_srp_legacy() -> Scenario {
+    Scenario {
+        secret: Some(SECRET),
+        aes: Some(AesKeyBits::Aes256),
+        srp: Some((SRP_USER, SRP_PASS)),
+        srp_compat: true,
+        ..base(Profile::Main, 1)
     }
 }
 
@@ -551,9 +586,289 @@ async fn diff_adv_clear_lossy_ristrust_rx() {
     ristrust_rx_from_tx("adv/clear lossy ristrust-rx", adv_clear(), 0.12).await;
 }
 
-// SMPTE 2022-7 bonding is intentionally NOT in this matrix: ristrust (like
-// libRIST) only bonds on the Main profile, but ristgo's `bonded-sender` example
-// is hard-wired to Simple (no profile CLI knob), so it cannot drive a ristrust
-// bonded receiver. Bonding interop is covered transitively instead — the Main
-// GRE wire is proven byte-exact here (main/* combos), and ristrust's 2022-7
-// dedup + seamless failover are proven against libRIST in `interop.rs`.
+// ---------------------------------------------------------------------------
+// EAP-SRP authentication (Main profile, combined SRP+secret mode) — both
+// directions. The sender authenticates as the SRP user; the receiver verifies and,
+// once authenticated, the PSK secret keys the media. Modern (EAPOL v3) and legacy
+// (EAPOL v2 / `srp-compat`) handshakes on a clean link. (The lossy variants are
+// `#[ignore]`d — see the note below: the EAP handshake itself is not retransmitted.)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn diff_main_srp_ristgo_rx() {
+    rx_from_ristrust_tx("main/srp ristgo-rx", main_srp(), 0.0).await;
+}
+#[tokio::test]
+async fn diff_main_srp_ristrust_rx() {
+    ristrust_rx_from_tx("main/srp ristrust-rx", main_srp(), 0.0).await;
+}
+
+#[tokio::test]
+async fn diff_main_srp_legacy_ristgo_rx() {
+    rx_from_ristrust_tx("main/srp-legacy ristgo-rx", main_srp_legacy(), 0.0).await;
+}
+#[tokio::test]
+async fn diff_main_srp_legacy_ristrust_rx() {
+    ristrust_rx_from_tx("main/srp-legacy ristrust-rx", main_srp_legacy(), 0.0).await;
+}
+
+// EAP-SRP under ~12% loss. IGNORED — these document a real, known robustness gap
+// rather than a passing guarantee: neither ristrust nor ristgo retransmits EAP-SRP
+// handshake frames (both drive the exchange purely reactively; the EAPOL-START is sent
+// exactly once and every reply is sent only in response to an inbound frame). So a
+// single dropped handshake datagram deadlocks authentication, and at ~12% loss the
+// handshake never completes (0 bytes delivered) — whereas the clean handshake (above)
+// interops perfectly. libRIST is more robust here: it keeps EAP wire timers + retry
+// counts in the host, which neither port implements. The correct fix is to make the
+// EAP core retransmit-idempotent — cache each role's last reply keyed by the request
+// identifier and replay it on a duplicate, rather than recomputing fresh SRP ephemerals
+// (a retransmitted Challenge/IdentityResponse currently rebuilds the SRP client/server
+// with new randomness and desyncs) — plus a host retransmit timer and a proactive
+// authenticator IDENTITY REQUEST. That is a careful, security-sensitive change to the
+// hardened EAP state machine, tracked as a focused follow-up. Run with `--ignored`.
+#[tokio::test]
+#[ignore = "EAP-SRP handshake has no retransmission (shared with ristgo); deadlocks under loss"]
+async fn diff_main_srp_lossy_ristgo_rx() {
+    rx_from_ristrust_tx("main/srp lossy ristgo-rx", main_srp(), 0.12).await;
+}
+#[tokio::test]
+#[ignore = "EAP-SRP handshake has no retransmission (shared with ristgo); deadlocks under loss"]
+async fn diff_main_srp_lossy_ristrust_rx() {
+    ristrust_rx_from_tx("main/srp lossy ristrust-rx", main_srp(), 0.12).await;
+}
+
+// ---------------------------------------------------------------------------
+// SMPTE 2022-7 bonding — both directions, all three profiles. Driven by the
+// URL-configurable ristgo `bonded-tx`/`bonded-rx` examples (the stock
+// `bonded-sender` is fixed to default config). Each path is full redundancy, so a
+// clean link must deliver every chunk after the receiver dedups across paths.
+// ---------------------------------------------------------------------------
+
+const BONDED_PATHS: usize = 2;
+
+/// `n` distinct free even ports (RIST media; the Simple profile's RTCP takes the
+/// adjacent odd). Sockets are held until all `n` are chosen so none repeat.
+fn free_even_ports(n: usize) -> Vec<u16> {
+    let mut held = Vec::new();
+    let mut ports = Vec::new();
+    for _ in 0..(n * 50) {
+        if ports.len() == n {
+            break;
+        }
+        if let Ok(s) = StdUdpSocket::bind("127.0.0.1:0") {
+            let even = s.local_addr().unwrap().port() & !1;
+            // Keep a 2-port gap so an even port and the next path never collide with
+            // a Simple-profile RTCP odd port.
+            if even != 0 && ports.iter().all(|p: &u16| p.abs_diff(even) >= 4) {
+                ports.push(even);
+            }
+            held.push(s);
+        }
+    }
+    assert_eq!(ports.len(), n, "could not reserve {n} free even ports");
+    ports
+}
+
+/// ristrust bonded Sender -> ristgo bonded receiver (`bonded-rx`). Byte-exact.
+async fn bonded_rx_from_ristrust_tx(label: &str, s: Scenario, paths: usize) {
+    let Some(rx_bin) = build_ristgo("bonded-rx").await else {
+        eprintln!("differential[{label}]: ristgo/go toolchain not available; skipping");
+        return;
+    };
+    let ports = free_even_ports(paths);
+    let urls: Vec<String> = ports
+        .iter()
+        .map(|p| format!("rist://:{p}{}", s.query(false)))
+        .collect();
+
+    let mut child = Command::new(&rx_bin)
+        .args(&urls)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ristgo bonded-rx");
+    let mut stdout = child.stdout.take().expect("bonded-rx stdout");
+    let _guard = ChildGuard(child);
+    for p in &ports {
+        wait_bound(*p, Duration::from_secs(5)).await;
+    }
+
+    let dests: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+    let refs: Vec<&str> = dests.iter().map(String::as_str).collect();
+    let sender = dial_bonded(&refs, s.cfg())
+        .await
+        .expect("dial_bonded ristgo bonded-rx");
+
+    let data = Arc::new(gen_data(N));
+    let send_data = data.clone();
+    let send = tokio::spawn(async move {
+        for i in 0..N {
+            sender
+                .send(&send_data[i * CHUNK..(i + 1) * CHUNK])
+                .await
+                .expect("send");
+            if i % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        sender
+    });
+
+    let want = N * CHUNK;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut got = vec![0u8; want];
+    let mut filled = 0;
+    while filled < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, stdout.read(&mut got[filled..])).await {
+            Ok(Ok(n)) if n > 0 => filled += n,
+            _ => break,
+        }
+    }
+    let sender = send.await.expect("send task");
+    sender.close().await.expect("close");
+
+    assert_eq!(
+        filled, want,
+        "[{label}] ristgo bonded got {filled}/{want} bytes"
+    );
+    assert_eq!(
+        got, *data,
+        "[{label}] byte mismatch in the ristgo bonded stream"
+    );
+}
+
+/// ristgo bonded sender (`bonded-tx`) -> ristrust bonded Receiver. Byte-exact.
+async fn bonded_ristrust_rx_from_tx(label: &str, s: Scenario, paths: usize) {
+    let Some(tx_bin) = build_ristgo("bonded-tx").await else {
+        eprintln!("differential[{label}]: ristgo/go toolchain not available; skipping");
+        return;
+    };
+    let ports = free_even_ports(paths);
+    let addrs: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+    let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let mut receiver = listen_bonded(&refs, s.cfg())
+        .await
+        .expect("listen_bonded for ristgo bonded-tx");
+
+    let urls: Vec<String> = ports
+        .iter()
+        .map(|p| format!("rist://127.0.0.1:{p}{}", s.query(true)))
+        .collect();
+    let mut child = Command::new(&tx_bin)
+        .args(&urls)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ristgo bonded-tx");
+    let mut stdin = child.stdin.take().expect("bonded-tx stdin");
+    let _guard = ChildGuard(child);
+
+    let data = gen_data(N);
+    let feed_data = data.clone();
+    let feeder = tokio::spawn(async move {
+        for i in 0..N {
+            if stdin
+                .write_all(&feed_data[i * CHUNK..(i + 1) * CHUNK])
+                .await
+                .is_err()
+            {
+                return stdin;
+            }
+            if i % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        let _ = stdin.flush().await;
+        stdin
+    });
+
+    let mut got = Vec::with_capacity(N * CHUNK);
+    let mut count = 0usize;
+    for _ in 0..N {
+        match timeout(Duration::from_secs(30), receiver.recv()).await {
+            Ok(Ok(payload)) => {
+                got.extend_from_slice(&payload);
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+    let _stdin = feeder.await.expect("feeder");
+    receiver.close().await.expect("close");
+
+    assert_eq!(count, N, "[{label}] ristrust bonded got {count}/{N} chunks");
+    assert_eq!(
+        got.as_slice(),
+        &data[..],
+        "[{label}] byte mismatch in the bonded stream"
+    );
+}
+
+fn bonded_main() -> Scenario {
+    base(Profile::Main, 1)
+}
+fn bonded_simple() -> Scenario {
+    base(Profile::Simple, 0)
+}
+fn bonded_advanced() -> Scenario {
+    base(Profile::Advanced, 2)
+}
+fn bonded_main_aes() -> Scenario {
+    Scenario {
+        secret: Some(SECRET),
+        aes: Some(AesKeyBits::Aes256),
+        ..base(Profile::Main, 1)
+    }
+}
+
+#[tokio::test]
+async fn diff_bonded_main_ristgo_rx() {
+    bonded_rx_from_ristrust_tx("bonded main ristgo-rx", bonded_main(), BONDED_PATHS).await;
+}
+#[tokio::test]
+async fn diff_bonded_main_ristrust_rx() {
+    bonded_ristrust_rx_from_tx("bonded main ristrust-rx", bonded_main(), BONDED_PATHS).await;
+}
+
+#[tokio::test]
+async fn diff_bonded_simple_ristgo_rx() {
+    bonded_rx_from_ristrust_tx("bonded simple ristgo-rx", bonded_simple(), BONDED_PATHS).await;
+}
+#[tokio::test]
+async fn diff_bonded_simple_ristrust_rx() {
+    bonded_ristrust_rx_from_tx("bonded simple ristrust-rx", bonded_simple(), BONDED_PATHS).await;
+}
+
+#[tokio::test]
+async fn diff_bonded_advanced_ristgo_rx() {
+    bonded_rx_from_ristrust_tx("bonded advanced ristgo-rx", bonded_advanced(), BONDED_PATHS).await;
+}
+#[tokio::test]
+async fn diff_bonded_advanced_ristrust_rx() {
+    bonded_ristrust_rx_from_tx(
+        "bonded advanced ristrust-rx",
+        bonded_advanced(),
+        BONDED_PATHS,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn diff_bonded_main_aes_ristgo_rx() {
+    bonded_rx_from_ristrust_tx("bonded main/aes ristgo-rx", bonded_main_aes(), BONDED_PATHS).await;
+}
+#[tokio::test]
+async fn diff_bonded_main_aes_ristrust_rx() {
+    bonded_ristrust_rx_from_tx(
+        "bonded main/aes ristrust-rx",
+        bonded_main_aes(),
+        BONDED_PATHS,
+    )
+    .await;
+}

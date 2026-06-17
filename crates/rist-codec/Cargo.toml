@@ -32,11 +32,15 @@ getrandom.workspace = true
 # SRP-6a big-integer math + constant-time proof comparison (Main-profile EAP).
 num-bigint.workspace = true
 subtle.workspace = true
-# DTLS 1.2 (optional, `--features dtls`): HMAC for the TLS 1.2 PRF, AES-128-GCM
-# AEAD record protection, and P-256 ECDHE/ECDSA for the ECDHE_ECDSA suite. Pure
-# RustCrypto, no FFI; deferred + feature-gated (libRIST has no DTLS).
-hmac = { workspace = true, optional = true }
-aes-gcm = { workspace = true, optional = true }
+# Authenticated Advanced-profile PSK modes (TR-06-3 §8): HMAC-SHA256 (AES-CTR-HMAC,
+# mode 3), AES-GCM (mode 4), and ChaCha20-Poly1305 (mode 5). Default deps — the
+# Advanced profile can negotiate these in the stock build. (`hmac`/`aes-gcm` are also
+# used by the optional DTLS record layer.) Pure RustCrypto, no FFI.
+hmac.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+# DTLS 1.2 (optional, `--features dtls`): P-256 ECDHE/ECDSA for the ECDHE_ECDSA
+# suite and X.509 cert gen/parse. Pure RustCrypto, no FFI; libRIST has no DTLS.
 p256 = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 x509-cert = { workspace = true, optional = true }
@@ -46,5 +50,5 @@ rsa = { workspace = true, optional = true }
 # Pure-Rust DTLS 1.2: the full TR-06-2 §6.2 mandatory suite set (ECDHE-ECDSA and
 # ECDHE-RSA AES-128/256-GCM, RSA_WITH_NULL_SHA256) plus the PSK suite RIST uses.
 # Off by default; not an interop gate (the bar is OpenSSL `s_server`/`s_client
-# -dtls1_2`).
-dtls = ["dep:hmac", "dep:aes-gcm", "dep:p256", "dep:rand_core", "dep:x509-cert", "dep:rsa"]
+# -dtls1_2`). `hmac`/`aes-gcm` are now default deps (the Advanced AEAD modes use them).
+dtls = ["dep:p256", "dep:rand_core", "dep:x509-cert", "dep:rsa"]

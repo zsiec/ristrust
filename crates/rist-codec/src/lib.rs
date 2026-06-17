@@ -3,6 +3,7 @@
 
 pub mod adapt;
 pub mod adv;
+pub mod aead;
 pub mod crypto;
 #[cfg(feature = "dtls")]
 pub mod dtls;

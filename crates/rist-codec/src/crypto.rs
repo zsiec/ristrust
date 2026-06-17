@@ -56,6 +56,22 @@ pub enum CryptoError {
     /// The OS CSPRNG was unavailable during nonce generation (fail closed).
     #[error("rist: crypto: CSPRNG unavailable")]
     Csprng,
+    /// An Advanced AEAD open failed authentication (a forged or corrupted tag/HMAC).
+    /// The recovered bytes are never returned (authenticate before use).
+    #[error("rist: crypto: AEAD authentication failed")]
+    AuthFailed,
+    /// An Advanced PSK mode that is not one of the authenticated modes (3 AES-CTR-HMAC,
+    /// 4 AES-GCM, 5 ChaCha20-Poly1305) was passed to the AEAD seal/open.
+    #[error("rist: crypto: unsupported Advanced PSK mode")]
+    UnknownPskMode,
+    /// ChaCha20-Poly1305 (Advanced PSK mode 5) was requested with a key size other than
+    /// 256 bits.
+    #[error("rist: crypto: ChaCha20-Poly1305 requires a 256-bit key")]
+    ChaChaKeySize,
+    /// The Advanced PSK IV field would wrap within the current nonce epoch; the host
+    /// must rotate the PSK nonce (re-derive the key) rather than reuse a (key, nonce).
+    #[error("rist: crypto: Advanced PSK IV field exhausted; rotate the PSK nonce")]
+    IvExhausted,
 }
 
 /// libRIST's PBKDF2 iteration count for PSK key derivation
@@ -209,8 +225,9 @@ pub fn build_iv(seq: u32) -> [u8; IV_SIZE] {
 }
 
 /// Applies AES-CTR (symmetric: encrypt == decrypt) over `buf` in place, with the
-/// `derive_key`-produced `key` (16 or 32 bytes) and the 16-byte `iv`.
-fn aes_ctr_apply(key: &[u8], iv: &[u8; IV_SIZE], buf: &mut [u8]) {
+/// `derive_key`-produced `key` (16 or 32 bytes) and the 16-byte `iv`. `pub(crate)` so
+/// the Advanced AEAD module reuses the identical keystream for AES-CTR-HMAC (mode 3).
+pub(crate) fn aes_ctr_apply(key: &[u8], iv: &[u8; IV_SIZE], buf: &mut [u8]) {
     if key.len() == 32 {
         Aes256Ctr::new(key.into(), iv.into()).apply_keystream(buf);
     } else {

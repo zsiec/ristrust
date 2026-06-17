@@ -35,6 +35,7 @@ use crate::driver::{
 };
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
+use crate::split::{self, MergeMode, Merger, SplitMode};
 use crate::stats::StatsCell;
 
 /// The largest datagram a path reader will receive.
@@ -98,6 +99,9 @@ pub(crate) struct BondedSimpleDriver {
     ssrc: u32,
     cname: String,
     bitmask: bool,
+    /// The sender's packet-split bonding mode (libRIST `split=`); [`SplitMode::Off`]
+    /// on a receiver. Each split half fans out across the paths like any media packet.
+    split_mode: SplitMode,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
@@ -105,6 +109,11 @@ pub(crate) struct BondedSimpleDriver {
     learned_ssrc: Option<u32>,
     lqm: Option<LqmEmitter>,
     rate: Option<RateControl>,
+    /// The packet-merge state machine (libRIST `merge=`) folding split pairs after the
+    /// shared flow's 2022-7 merge; [`MergeMode::Off`] on a sender. The Simple profile
+    /// has no GRE keepalive, so `merge=auto` has no L-bit signal and stays dormant —
+    /// use `merge=pairs` on Simple bonding.
+    merger: Merger,
 
     /// Pre-routed inbound feed for a multi-flow demultiplexed receiver: when `Some`,
     /// the [`MultiReceiver`](crate::MultiReceiver) demultiplexer owns the path readers
@@ -128,6 +137,7 @@ impl BondedSimpleDriver {
         keepalive: Duration,
         weight_rx: mpsc::Receiver<(u8, u32)>,
         rate: Option<RateControl>,
+        split_mode: SplitMode,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -153,11 +163,13 @@ impl BondedSimpleDriver {
             ssrc,
             cname,
             bitmask,
+            split_mode,
             data_out: None,
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             lqm: None,
             rate,
+            merger: Merger::new(MergeMode::Off),
             injected: None,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
@@ -175,6 +187,7 @@ impl BondedSimpleDriver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -200,11 +213,13 @@ impl BondedSimpleDriver {
             ssrc,
             cname,
             bitmask,
+            split_mode: SplitMode::Off,
             data_out: Some(tx),
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             lqm,
             rate: None,
+            merger: Merger::new(merge_mode),
             injected: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
@@ -226,6 +241,7 @@ impl BondedSimpleDriver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Sender<SimpleBondInbound>,
         mpsc::Receiver<Bytes>,
@@ -253,11 +269,13 @@ impl BondedSimpleDriver {
             ssrc,
             cname,
             bitmask,
+            split_mode: SplitMode::Off,
             data_out: Some(data_tx),
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             lqm,
             rate: None,
+            merger: Merger::new(merge_mode),
             injected: Some(in_rx),
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
@@ -331,7 +349,7 @@ impl BondedSimpleDriver {
                 payload = recv_app_gated(&mut self.app_in, any_peer) => match payload {
                     Some(p) => {
                         let now = self.now();
-                        self.flow.push_app(now, p);
+                        self.push_split(now, p);
                         self.drain(now).await;
                     }
                     None => break,
@@ -473,14 +491,39 @@ impl BondedSimpleDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
-            if let Some(out) = &self.data_out
-                && out.send(payload).await.is_err()
+        let out = self.data_out.clone();
+        while let Some(Event::Deliver {
+            seq,
+            source_time,
+            payload,
+            discontinuity,
+            ..
+        }) = self.flow.poll_event()
+        {
+            for p in self
+                .merger
+                .deliver(seq, source_time, payload, discontinuity)
+                .payloads()
             {
-                return;
+                if let Some(o) = &out
+                    && o.send(p).await.is_err()
+                {
+                    return;
+                }
             }
         }
         self.stats.publish(self.flow.stats(), 0);
+    }
+
+    /// Splits one outbound application payload across a consecutive even/odd sequence
+    /// pair (libRIST `split=`) when split mode is active, else pushes it whole. Each
+    /// half then fans out across the bonded paths like any media packet.
+    fn push_split(&mut self, now: Timestamp, payload: Bytes) {
+        let (first, last) = split::split_payload(self.split_mode, payload);
+        self.flow.push_app(now, first);
+        if let Some(last) = last {
+            self.flow.push_app(now, last);
+        }
     }
 
     /// Sends one pre-encoded RTP media datagram to path `i`'s media address.

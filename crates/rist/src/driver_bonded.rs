@@ -43,6 +43,7 @@ use crate::driver_main::EapRole;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
+use crate::split::{self, MergeMode, Merger, SplitMode};
 use crate::stats::StatsCell;
 
 /// The largest datagram a path reader will receive.
@@ -176,6 +177,13 @@ pub(crate) struct BondedDriver {
     /// callback configured. It folds each inbound LQM into a target bitrate and invokes
     /// the application's `on_rate_adapt` callback.
     rate: Option<RateControl>,
+    /// The sender's packet-split bonding mode (libRIST `split=`); [`SplitMode::Off`]
+    /// on a receiver. Each split half fans out across the paths like any media packet.
+    split_mode: SplitMode,
+    /// The packet-merge state machine (libRIST `merge=`) folding split pairs after the
+    /// shared flow's 2022-7 merge; [`MergeMode::Off`] on a sender. In `merge=auto` mode
+    /// it is enabled by any path's inbound keepalive L bit.
+    merger: Merger,
 }
 
 impl BondedDriver {
@@ -197,6 +205,7 @@ impl BondedDriver {
         rate: Option<RateControl>,
         adv: Option<AdvCodec>,
         fec: Option<FecState>,
+        split_mode: SplitMode,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -230,6 +239,8 @@ impl BondedDriver {
             lqm: None, // a sender does not emit LQM
             adv,
             rate,
+            split_mode,
+            merger: Merger::new(MergeMode::Off),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -249,6 +260,7 @@ impl BondedDriver {
         lqm: Option<LqmEmitter>,
         adv: Option<AdvCodec>,
         fec: Option<FecState>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -282,6 +294,8 @@ impl BondedDriver {
             lqm,
             adv,
             rate: None, // a receiver does not consume LQM
+            split_mode: SplitMode::Off,
+            merger: Merger::new(merge_mode),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -303,6 +317,7 @@ impl BondedDriver {
         bitmask: bool,
         keepalive: Duration,
         adv: Option<AdvCodec>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Sender<Inbound>,
         mpsc::Receiver<Bytes>,
@@ -338,6 +353,8 @@ impl BondedDriver {
             lqm: None, // multi-flow bonded LQM emission is deferred
             adv,
             rate: None,
+            split_mode: SplitMode::Off,
+            merger: Merger::new(merge_mode),
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -411,7 +428,7 @@ impl BondedDriver {
                 payload = recv_app_gated(&mut self.app_in, authed) => match payload {
                     Some(p) => {
                         let now = self.now();
-                        self.flow.push_app(now, p);
+                        self.push_split(now, p);
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down
@@ -502,6 +519,9 @@ impl BondedDriver {
     /// the path (its bound socket); the sender shares one source socket across all
     /// paths, so it resolves the path from the source address (each path's peer is a
     /// distinct remote).
+    // A flat inbound dispatcher (path resolution + EAP/keepalive/media/feedback/FEC
+    // demux); splitting it would only scatter the one linear decision tree.
+    #[allow(clippy::too_many_lines)]
     async fn on_recv(&mut self, inb: Inbound) {
         let now = self.now();
         let i = if self.sender {
@@ -565,9 +585,14 @@ impl BondedDriver {
             return;
         }
 
-        // A GRE keepalive is a liveness signal only — nothing for the flow.
-        let (kind, _ka, _ver) = self.paths[i].codec.peek_control(&inb.data);
-        if kind != ControlKind::Keepalive {
+        // A GRE keepalive is a liveness signal only — nothing for the flow, except its
+        // L bit drives merge=auto (the peer advertises pair-split on this path).
+        let (kind, ka, _ver) = self.paths[i].codec.peek_control(&inb.data);
+        if kind == ControlKind::Keepalive {
+            if let Some(ka) = &ka {
+                self.merger.set_auto_enabled(ka.caps.l);
+            }
+        } else {
             match self.paths[i].codec.decode(&inb.data, self.highest_sent) {
                 Ok(Decoded::Media(pkt)) => {
                     if self.learned_ssrc.is_none() {
@@ -693,14 +718,42 @@ impl BondedDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
-            if let Some(out) = &self.data_out
-                && out.send(payload).await.is_err()
+        // Clone the data channel so the merge loop does not borrow `&self` across the
+        // `await` (the per-path EAP roles make `BondedDriver` non-`Sync`).
+        let out = self.data_out.clone();
+        while let Some(Event::Deliver {
+            seq,
+            source_time,
+            payload,
+            discontinuity,
+            ..
+        }) = self.flow.poll_event()
+        {
+            for p in self
+                .merger
+                .deliver(seq, source_time, payload, discontinuity)
+                .payloads()
             {
-                return; // the application Receiver was dropped
+                if let Some(o) = &out
+                    && o.send(p).await.is_err()
+                {
+                    return; // the application Receiver was dropped
+                }
             }
         }
         self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// Splits one outbound application payload across a consecutive even/odd sequence
+    /// pair (libRIST `split=`) when split mode is active, else pushes it whole. Each
+    /// half then fans out across the bonded paths like any media packet (full
+    /// redundancy or weighted load-share, per the bonding policy).
+    fn push_split(&mut self, now: Timestamp, payload: Bytes) {
+        let (first, last) = split::split_payload(self.split_mode, payload);
+        self.flow.push_app(now, first);
+        if let Some(last) = last {
+            self.flow.push_app(now, last);
+        }
     }
 
     /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
@@ -959,9 +1012,13 @@ impl BondedDriver {
         let bytes = if let Some(adv) = self.adv.as_mut() {
             adv.keepalive_datagram(adv_ctrl_ts(now))
         } else {
+            // Advertise the pair-split capability (the L bit) when split mode is active
+            // so a peer running `merge=auto` enables merging (Main bonded substrate).
+            let mut caps = gre::Capabilities::standard();
+            caps.l = self.split_mode != SplitMode::Off;
             let ka = gre::Keepalive {
                 mac: self.mac,
-                caps: gre::Capabilities::standard(),
+                caps,
                 ..gre::Keepalive::default()
             };
             self.paths[i].codec.encode_keepalive(&ka, gre::VERSION_MIN)

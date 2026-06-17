@@ -31,7 +31,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use rist::{AesKeyBits, Config, Profile, dial, dial_bonded, listen, listen_bonded};
+use rist::{
+    AesKeyBits, Config, MergeMode, Profile, SplitMode, dial, dial_bonded, listen, listen_bonded,
+};
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
 
@@ -1604,4 +1606,176 @@ async fn interop_bonded_librist_rx_from_ristrust_tx() {
     }
     sender_task.abort();
     assert_contiguous_chunks(&got, RUN, "ristrust bonded -> libRIST 2022-7 merge");
+}
+
+// ---- packet split/merge bonding (libRIST split=/merge=) ----
+//
+// Cleartext Main profile (`-p 1`). One side splits each payload across an even/odd
+// sequence pair (same source time); the other recombines it. Proves ristrust's split
+// is what libRIST's merge expects, and ristrust's merge recombines libRIST's split —
+// byte-exact, and provably merged (not delivered as orphan halves).
+
+/// A cleartext Main config with the given buffer.
+fn main_clear_cfg(buffer_ms: u64) -> Config {
+    Config::default()
+        .with_profile(Profile::Main)
+        .with_buffer(Duration::from_millis(buffer_ms))
+}
+
+/// libRIST `ristsender` (`-p 1`, `split=auto`) → ristrust Main Receiver (`merge=pairs`).
+/// Proves ristrust's `Merger` recombines libRIST's real split output byte-exactly: with
+/// merge active, N sends yield exactly N full-CHUNK deliveries equal to the input (a
+/// failed merge would surface 2N half-CHUNK orphans and the byte stream would not line
+/// up across N reads).
+#[tokio::test]
+async fn interop_split_ristrust_merge_from_librist_split() {
+    let Some(sender_bin) = librist_tool("ristsender") else {
+        eprintln!("interop: ristsender not found; skipping");
+        return;
+    };
+    let rx_port = free_udp_port(&[]);
+    let feed_port = free_udp_port(&[rx_port]);
+
+    let cfg = main_clear_cfg(200).with_merge_mode(MergeMode::Pairs);
+    let mut receiver = listen(&format!("127.0.0.1:{rx_port}"), cfg)
+        .await
+        .expect("listen for libRIST split sender");
+
+    let _tool = spawn_tool(
+        &sender_bin,
+        &[
+            "-p".into(),
+            "1".into(),
+            "-b".into(),
+            "200".into(),
+            "-i".into(),
+            format!("udp://@127.0.0.1:{feed_port}"),
+            "-o".into(),
+            // libRIST spells the split mode as a word (off|auto|half), not a number.
+            format!("rist://127.0.0.1:{rx_port}?split=auto"),
+        ],
+    );
+    wait_tool_ready(feed_port, Duration::from_secs(5)).await;
+
+    let data = gen_data(N);
+    let feed_data = data.clone();
+    tokio::spawn(async move {
+        let feed = UdpSocket::bind("127.0.0.1:0").await.expect("bind feed");
+        feed.connect(("127.0.0.1", feed_port))
+            .await
+            .expect("connect feed");
+        for i in 0..N {
+            let _ = feed.send(&feed_data[i * CHUNK..(i + 1) * CHUNK]).await;
+            if i % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
+
+    // N reads must reconstruct the whole stream: each read is a merged full CHUNK.
+    let mut got = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        let payload = timeout(Duration::from_secs(20), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on merged payload {i}"))
+            .expect("session open");
+        assert_eq!(
+            payload.len(),
+            CHUNK,
+            "payload {i} was not a recombined full chunk (merge failed)"
+        );
+        got.extend_from_slice(&payload);
+    }
+
+    receiver.close().await.expect("close");
+    assert_eq!(got, data, "byte mismatch merging libRIST's split output");
+}
+
+/// ristrust Main Sender (`split=auto`) → libRIST `ristreceiver` (`-p 1`, `merge=pairs`).
+/// Proves libRIST recombines ristrust's split pairs: the captured UDP output is the
+/// original byte stream AND arrives as N full-CHUNK datagrams (a failed merge would
+/// surface ~2N half-CHUNK datagrams).
+#[tokio::test]
+async fn interop_split_librist_merge_from_ristrust_split() {
+    let Some(receiver_bin) = librist_tool("ristreceiver") else {
+        eprintln!("interop: ristreceiver not found; skipping");
+        return;
+    };
+    let rx_port = free_udp_port(&[]);
+    let cap_port = free_udp_port(&[rx_port]);
+
+    let cap = UdpSocket::bind(("127.0.0.1", cap_port))
+        .await
+        .expect("bind capture");
+    let _tool = spawn_tool(
+        &receiver_bin,
+        &[
+            "-p".into(),
+            "1".into(),
+            "-b".into(),
+            "200".into(),
+            "-i".into(),
+            // libRIST spells the merge mode as a word (off|pairs|auto), not a number.
+            format!("rist://@127.0.0.1:{rx_port}?merge=pairs"),
+            "-o".into(),
+            format!("udp://127.0.0.1:{cap_port}"),
+        ],
+    );
+    wait_tool_ready(rx_port, Duration::from_secs(5)).await;
+
+    let sender = dial(
+        &format!("127.0.0.1:{rx_port}"),
+        main_clear_cfg(200).with_split_mode(SplitMode::Auto),
+    )
+    .await
+    .expect("dial libRIST merge receiver");
+
+    let data = std::sync::Arc::new(gen_data(N));
+    let send_data = data.clone();
+    let send = tokio::spawn(async move {
+        for i in 0..N {
+            sender
+                .send(&send_data[i * CHUNK..(i + 1) * CHUNK])
+                .await
+                .expect("send");
+            if i % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        sender
+    });
+
+    // Count merged output datagrams: each full CHUNK is one recombined pair.
+    let want = N * CHUNK;
+    let mut got = Vec::with_capacity(want);
+    let mut datagrams = 0usize;
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, cap.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                datagrams += 1;
+                got.extend_from_slice(&buf[..n]);
+            }
+            _ => break,
+        }
+    }
+
+    let sender = send.await.expect("send task");
+    sender.close().await.expect("close");
+
+    assert_eq!(
+        got.len(),
+        want,
+        "libRIST merged {} of {want} bytes",
+        got.len()
+    );
+    assert_eq!(got, *data, "byte mismatch at the libRIST merge receiver");
+    // Merge recombines each split pair, so the original chunk count comes back; an
+    // unmerged stream would deliver about twice as many (half-size) datagrams.
+    assert!(
+        datagrams <= N + N / 8,
+        "libRIST delivered {datagrams} datagrams for {N} payloads — split pairs were not merged"
+    );
 }

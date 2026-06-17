@@ -75,6 +75,13 @@ pub enum Event {
     Deliver {
         /// The 32-bit (widened) sequence number of the delivered packet.
         seq: u32,
+        /// The packet's source timestamp (the sender's NTP-64 media clock, as carried
+        /// on the wire). Two packets that the sender emitted from one application
+        /// payload — e.g. a split/merge bonding pair — share a source time, so the host
+        /// merge layer keys the recombination on it (a mis-paired neighbour with a
+        /// different source time stays a harmless orphan rather than corrupting the
+        /// stream).
+        source_time: u64,
         /// The delivered media payload.
         payload: bytes::Bytes,
         /// Whether one or more sequence numbers immediately before this packet

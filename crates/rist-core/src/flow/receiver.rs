@@ -912,15 +912,16 @@ impl Flow {
     /// Hands the slot's payload to the application and advances the cursor. The
     /// payload reference moves into the event; the slot is cleared.
     fn emit_deliver(&mut self, idx: usize) {
-        let (seqn, payload, frag) = {
+        let (seqn, source_time, payload, frag) = {
             let s = &mut self.receiver.ring[idx];
             s.state = SlotState::Empty;
-            (s.seq, std::mem::take(&mut s.payload), s.frag)
+            (s.seq, s.source_time, std::mem::take(&mut s.payload), s.frag)
         };
         let discontinuity = self.receiver.pending_discontinuity;
         self.receiver.pending_discontinuity = false;
         self.events.push_back(Event::Deliver {
             seq: seqn,
+            source_time,
             payload,
             discontinuity,
             frag,

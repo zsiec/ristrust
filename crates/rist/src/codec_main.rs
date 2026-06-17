@@ -141,6 +141,11 @@ pub(crate) struct MainCodec {
     /// for NAT-rebind re-association. Learned only behind a keyed session (a forger or
     /// cleartext sender cannot supply it); the host reads it via [`MainCodec::peer_cname`].
     last_rx_cname: Option<Bytes>,
+    /// The peer's capability bits from its most recently decoded GRE keepalive, for
+    /// the host to drive `merge=auto` (the L bit advertises pair-splitting). A v1
+    /// keepalive surfaces its caps through [`MainCodec::peek_control`]; a v2 (VSF)
+    /// keepalive stashes them here, read via [`MainCodec::peer_caps`].
+    last_peer_caps: Option<gre::Capabilities>,
 }
 
 impl MainCodec {
@@ -172,6 +177,7 @@ impl MainCodec {
             ssrc,
             cname,
             last_rx_cname: None,
+            last_peer_caps: None,
         }
     }
 
@@ -180,6 +186,14 @@ impl MainCodec {
     /// source-port rebind re-association: a migrated tuple must present the same CNAME.
     pub(crate) fn peer_cname(&self) -> Option<&[u8]> {
         self.last_rx_cname.as_deref()
+    }
+
+    /// The peer's capability bits from its most recently decoded GRE keepalive, if any.
+    /// The host reads the L bit to drive `merge=auto`. Surfaces a v2 (VSF) keepalive's
+    /// caps, which [`MainCodec::decode`] stashes; a v1 keepalive's caps come back
+    /// directly from [`MainCodec::peek_control`].
+    pub(crate) fn peer_caps(&self) -> Option<gre::Capabilities> {
+        self.last_peer_caps
     }
 
     /// Probes a candidate datagram for the SDES CNAME of an ENCRYPTED RTCP feedback
@@ -739,6 +753,14 @@ impl MainCodec {
                 )));
             }
             if vsf.subtype != gre::VSF_SUBTYPE_REDUCED {
+                // A v2 (VSF) keepalive carries no flow input, but its capability bits
+                // drive `merge=auto` (the L bit advertises pair-splitting). Stash them
+                // for the host to read via `peer_caps`; the v1 path uses `peek_control`.
+                if vsf.subtype == gre::VSF_SUBTYPE_KEEPALIVE
+                    && let Ok(ka) = gre::Keepalive::parse(&region[vn..])
+                {
+                    self.last_peer_caps = Some(ka.caps);
+                }
                 return Ok(Region::Control(Decoded::Ignored));
             }
             region = region.slice(vn..);

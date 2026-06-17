@@ -36,6 +36,7 @@ use crate::fec::{FEC_MAX_CTRL_BODY, FecState};
 use crate::peer::Peer;
 use crate::reassembler::FragReassembler;
 use crate::socket::MainSocket;
+use crate::split::{self, MergeMode, Merger, SplitMode};
 use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
@@ -96,6 +97,10 @@ pub(crate) struct AdvDriver {
     /// When > 0, split an application payload larger than this many bytes across
     /// consecutive fragment sequences (TR-06-3 §5); 0 disables fragmentation.
     frag_size: usize,
+    /// The sender's packet-split bonding mode (libRIST `split=`); [`SplitMode::Off`]
+    /// on a receiver. An alternative to F/L fragmentation: a split payload is sent as
+    /// two `Standalone` packets (the two mechanisms are not combined).
+    split_mode: SplitMode,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
@@ -104,6 +109,10 @@ pub(crate) struct AdvDriver {
     /// Reassembles a delivered fragment run into a complete payload before it is
     /// handed to the application (a no-op for unfragmented `Standalone` media).
     reasm: FragReassembler,
+    /// The packet-merge state machine (libRIST `merge=`) folding split pairs after
+    /// reassembly; [`MergeMode::Off`] on a sender. In `merge=auto` mode it is enabled
+    /// by an inbound GRE-substrate keepalive's L bit.
+    merger: Merger,
 
     // --- EAP-SRP authentication ---
     eap: Option<EapRole>,
@@ -173,6 +182,7 @@ impl AdvDriver {
         oob_out: mpsc::Sender<(u16, Bytes)>,
         frag_size: usize,
         fec: Option<FecState>,
+        split_mode: SplitMode,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -202,10 +212,12 @@ impl AdvDriver {
             highest_sent: start_seq,
             ssrc,
             frag_size,
+            split_mode,
             data_out: None,
             learned_ssrc: None,
             greeted: false,
             reasm: FragReassembler::default(),
+            merger: Merger::new(MergeMode::Off),
             eap,
             authed,
             ever_authed: false,
@@ -239,6 +251,7 @@ impl AdvDriver {
         oob_out: mpsc::Sender<(u16, Bytes)>,
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         fec: Option<FecState>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -268,10 +281,12 @@ impl AdvDriver {
             highest_sent: 0,
             ssrc,
             frag_size: 0,
+            split_mode: SplitMode::Off,
             data_out: Some(tx),
             learned_ssrc: None,
             greeted: false,
             reasm: FragReassembler::default(),
+            merger: Merger::new(merge_mode),
             eap,
             authed,
             ever_authed: false,
@@ -307,6 +322,7 @@ impl AdvDriver {
         lqm: Option<LqmEmitter>,
         on_flow_attr: Option<FlowAttrCallback>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Sender<AdvInbound>,
         mpsc::Receiver<Bytes>,
@@ -336,10 +352,12 @@ impl AdvDriver {
             highest_sent: 0,
             ssrc,
             frag_size: 0,
+            split_mode: SplitMode::Off,
             data_out: Some(tx),
             learned_ssrc: None,
             greeted: false,
             reasm: FragReassembler::default(),
+            merger: Merger::new(merge_mode),
             eap,
             authed,
             ever_authed: false,
@@ -501,9 +519,14 @@ impl AdvDriver {
                     tracing::debug!(target: crate::logging::SESSION, "rist: adv oob decode failed: {e}");
                 }
                 Ok(None) => {
-                    // Keepalive is liveness only; SR/RR/SDES carry no flow input.
-                    let (kind, _ka, _ver) = self.main.peek_control(data);
-                    if kind != ControlKind::Keepalive {
+                    // Keepalive is liveness only; SR/RR/SDES carry no flow input —
+                    // except its L bit drives merge=auto (the peer advertises pair-split).
+                    let (kind, ka, _ver) = self.main.peek_control(data);
+                    if kind == ControlKind::Keepalive {
+                        if let Some(ka) = &ka {
+                            self.merger.set_auto_enabled(ka.caps.l);
+                        }
+                    } else {
                         let _ = self.main.decode(data, self.highest_sent);
                     }
                 }
@@ -520,8 +543,13 @@ impl AdvDriver {
         if parsed.enc_type == adv::TYPE_GRE_MAIN {
             // The inner payload is a Main-profile GRE packet (handshake/keepalive).
             let inner = parsed.payload.clone();
-            let (kind, _ka, _ver) = self.main.peek_control(&inner);
-            if kind != ControlKind::Keepalive {
+            let (kind, ka, _ver) = self.main.peek_control(&inner);
+            if kind == ControlKind::Keepalive {
+                // The keepalive's L bit drives merge=auto (peer advertises pair-split).
+                if let Some(ka) = &ka {
+                    self.merger.set_auto_enabled(ka.caps.l);
+                }
+            } else {
                 let _ = self.main.decode(&inner, self.highest_sent);
             }
             return;
@@ -701,6 +729,18 @@ impl AdvDriver {
     /// them back together. Without fragmentation, or for a payload that already fits,
     /// it is a single unfragmented [`FragRole::Standalone`] push.
     fn push_app(&mut self, now: Timestamp, p: &Bytes) {
+        // Packet-split bonding (libRIST `split=`): send the payload as a consecutive
+        // even/odd `Standalone` pair sharing one source time. Split is an alternative
+        // to F/L fragmentation — when active it bypasses fragmentation, so the peer's
+        // merge (not its reassembler) recombines the halves.
+        if self.split_mode != SplitMode::Off {
+            let (first, last) = split::split_payload(self.split_mode, p.clone());
+            self.flow.push_app(now, first);
+            if let Some(last) = last {
+                self.flow.push_app(now, last);
+            }
+            return;
+        }
         if self.frag_size == 0 || p.len() <= self.frag_size {
             self.flow.push_app(now, p.clone());
             return;
@@ -761,11 +801,15 @@ impl AdvDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
+        // Clone the data channel so the merge loop does not borrow `&self` across the
+        // `await` (the EAP role makes `AdvDriver` non-`Sync`).
+        let out = self.data_out.clone();
         while let Some(Event::Deliver {
+            seq,
+            source_time,
             payload,
             discontinuity,
             frag,
-            ..
         }) = self.flow.poll_event()
         {
             // Reassemble a fragment run before delivery; an unfragmented payload
@@ -774,10 +818,19 @@ impl AdvDriver {
             let Some(out_payload) = self.reasm.push(frag, payload, discontinuity) else {
                 continue;
             };
-            if let Some(out) = &self.data_out
-                && out.send(out_payload).await.is_err()
+            // Then fold a split pair (libRIST `merge=`) back together. With split
+            // active every delivery is `Standalone`, so the reassembler is a passthrough
+            // and `seq`/`source_time` identify the pair.
+            for p in self
+                .merger
+                .deliver(seq, source_time, out_payload, discontinuity)
+                .payloads()
             {
-                return;
+                if let Some(o) = &out
+                    && o.send(p).await.is_err()
+                {
+                    return;
+                }
             }
         }
         self.stats.publish(self.flow.stats(), self.fec_recovered());

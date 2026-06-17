@@ -19,6 +19,7 @@ use rist_codec::crypto::AesKeyBits;
 
 use crate::config::{Config, Profile};
 use crate::error::Error;
+use crate::split::{MergeMode, SplitMode};
 use crate::{CongestionMode, TimingMode};
 
 /// A millisecond-valued query parameter ceiling: one week, far above any sane
@@ -292,9 +293,11 @@ fn apply_string_and_feature_params(
     Ok(())
 }
 
-/// Folds the enum-valued query parameters (`aes-type`, `profile`,
-/// `congestion-control`) into `cfg`, each on libRIST's numbering. Split out of
-/// [`apply_query`] to keep that function under the line cap.
+/// Folds the enum-valued query parameters into `cfg`: `aes-type`, `profile`,
+/// `congestion-control`, `timing-mode`, and `return-bandwidth` on libRIST's numbering,
+/// plus the string-valued `split` (off|auto|half) and `merge` (off|pairs|auto) bonding
+/// modes (libRIST spells these as words, not numbers). Split out of [`apply_query`] to
+/// keep that function under the line cap.
 fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Error> {
     let int = |key: &str| -> Result<Option<i64>, Error> {
         match q.get(key) {
@@ -356,6 +359,32 @@ fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<()
             }
         };
     }
+    // `split` (sender) — libRIST's string values: off | auto (alias `ts`) | half.
+    if let Some(v) = q.get("split") {
+        cfg.split_mode = match v.as_str() {
+            "off" => SplitMode::Off,
+            "auto" | "ts" => SplitMode::Auto,
+            "half" => SplitMode::Half,
+            other => {
+                return Err(Error::Url(format!(
+                    "split={other:?} must be off, auto, or half"
+                )));
+            }
+        };
+    }
+    // `merge` (receiver) — libRIST's string values: off | pairs | auto.
+    if let Some(v) = q.get("merge") {
+        cfg.merge_mode = match v.as_str() {
+            "off" => MergeMode::Off,
+            "pairs" => MergeMode::Pairs,
+            "auto" => MergeMode::Auto,
+            other => {
+                return Err(Error::Url(format!(
+                    "merge={other:?} must be off, pairs, or auto"
+                )));
+            }
+        };
+    }
     Ok(())
 }
 
@@ -397,6 +426,8 @@ const RECOGNIZED_URL_PARAMS: &[&str] = &[
     "source",
     "congestion-control",
     "timing-mode",
+    "split",
+    "merge",
     // Accepted-and-ignored for libRIST URL portability (not implemented as a
     // single-session URL value): `srp-compat` legacy SRP mode, `recovery-priority`
     // per-peer NACK priority (a bonded-peer concept), `reflector` one-to-many
@@ -504,6 +535,32 @@ mod tests {
 
         let (_, cfg) = parse_url("rist://h:5000?return-bandwidth=2000", Config::default()).unwrap();
         assert_eq!(cfg.return_bandwidth, 2000);
+    }
+
+    #[test]
+    fn split_and_merge_use_librist_string_values() {
+        for (s, want) in [
+            ("off", SplitMode::Off),
+            ("auto", SplitMode::Auto),
+            ("ts", SplitMode::Auto), // libRIST alias for auto
+            ("half", SplitMode::Half),
+        ] {
+            let raw = format!("rist://h:5000?split={s}");
+            let (_, cfg) = parse_url(&raw, Config::default()).unwrap();
+            assert_eq!(cfg.split_mode, want, "split={s}");
+        }
+        for (s, want) in [
+            ("off", MergeMode::Off),
+            ("pairs", MergeMode::Pairs),
+            ("auto", MergeMode::Auto),
+        ] {
+            let raw = format!("rist://h:5000?merge={s}");
+            let (_, cfg) = parse_url(&raw, Config::default()).unwrap();
+            assert_eq!(cfg.merge_mode, want, "merge={s}");
+        }
+        // Unknown mode strings are rejected, not silently ignored.
+        assert!(parse_url("rist://h:5000?split=sometimes", Config::default()).is_err());
+        assert!(parse_url("rist://h:5000?merge=both", Config::default()).is_err());
     }
 
     #[test]

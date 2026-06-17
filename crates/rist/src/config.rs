@@ -12,6 +12,7 @@ use rist_core::flow::{CongestionMode, TimingMode};
 
 use crate::error::ConfigError;
 use crate::fec::FecConfig;
+use crate::split::{MergeMode, SplitMode};
 
 /// A source-adaptation rate callback (TR-06-4 Part 1): invoked with the new
 /// encoder bit-rate target, in kbit/s, each time an inbound Link Quality Message
@@ -182,6 +183,24 @@ pub struct Config {
     /// paths in proportion to the weight. Per-path weights use `dial_bonded_weighted`
     /// instead. Ignored by non-bonded senders and by all receivers.
     pub weight: u32,
+    /// The sender's packet-split bonding mode (libRIST `split=`). When active, each
+    /// outbound application payload is split across two consecutive RIST sequences (an
+    /// even one and its `seq + 1`) carrying the same source time, so a bonded pair of
+    /// links can each carry half the byte rate. [`SplitMode::Off`] (the default) sends
+    /// every payload whole. Pair the sender with a receiver running [`merge_mode`] set
+    /// to recombine. Works on all profiles. Ignored by a receiver.
+    ///
+    /// [`merge_mode`]: Self::merge_mode
+    pub split_mode: SplitMode,
+    /// The receiver's packet-merge bonding mode (libRIST `merge=`), the counterpart to
+    /// [`split_mode`] on the sender. When active, the receiver recombines a split pair
+    /// — an even sequence and its same-source-time `seq + 1` partner — back into the
+    /// original payload; [`MergeMode::Auto`] only does so once the peer advertises
+    /// pair-splitting (the GRE keepalive L bit). [`MergeMode::Off`] (the default)
+    /// delivers every packet as received. Works on all profiles. Ignored by a sender.
+    ///
+    /// [`split_mode`]: Self::split_mode
+    pub merge_mode: MergeMode,
     /// Make a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
     /// or an Advanced control message (index `0x0002`). Default: off.
@@ -268,6 +287,8 @@ impl Default for Config {
             null_packet_deletion: false,
             one_way: false,
             weight: 0,
+            split_mode: SplitMode::Off,
+            merge_mode: MergeMode::Off,
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
@@ -432,6 +453,24 @@ impl Config {
     #[must_use]
     pub fn with_weight(mut self, weight: u32) -> Config {
         self.weight = weight;
+        self
+    }
+
+    /// Sets the sender's packet-split bonding mode (libRIST `split=`): each outbound
+    /// payload is split across two consecutive same-source-time sequences. Pair it
+    /// with [`Config::with_merge_mode`] on the receiver. Works on all profiles.
+    #[must_use]
+    pub fn with_split_mode(mut self, mode: SplitMode) -> Config {
+        self.split_mode = mode;
+        self
+    }
+
+    /// Sets the receiver's packet-merge bonding mode (libRIST `merge=`): recombine a
+    /// split pair back into the original payload. The counterpart to
+    /// [`Config::with_split_mode`]. Works on all profiles.
+    #[must_use]
+    pub fn with_merge_mode(mut self, mode: MergeMode) -> Config {
+        self.merge_mode = mode;
         self
     }
 
@@ -932,6 +971,24 @@ mod tests {
         assert_eq!(c.key_rotation, 2048);
         assert_eq!(c.session_timeout, Duration::from_millis(3000));
         assert_eq!(c.nack_type, NackType::Bitmask);
+    }
+
+    #[test]
+    fn split_merge_modes_default_off_and_set_on_every_profile() {
+        assert_eq!(Config::default().split_mode, SplitMode::Off);
+        assert_eq!(Config::default().merge_mode, MergeMode::Off);
+        // Settable and valid on every profile (no profile gate — libRIST allows
+        // split/merge on Simple, Main, and Advanced alike).
+        for profile in [Profile::Simple, Profile::Main, Profile::Advanced] {
+            let c = Config::default()
+                .with_profile(profile)
+                .with_split_mode(SplitMode::Auto)
+                .with_merge_mode(MergeMode::Pairs);
+            assert_eq!(c.split_mode, SplitMode::Auto);
+            assert_eq!(c.merge_mode, MergeMode::Pairs);
+            c.validate()
+                .expect("split/merge validates on every profile");
+        }
     }
 
     #[cfg(feature = "dtls")]

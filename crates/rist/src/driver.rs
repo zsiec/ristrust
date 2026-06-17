@@ -32,6 +32,7 @@ use crate::error::Error;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
+use crate::split::{self, MergeMode, MergeOut, Merger, SplitMode};
 use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
@@ -137,6 +138,9 @@ pub(crate) struct Driver {
     ssrc: u32,
     cname: String,
     bitmask: bool,
+    /// The sender's packet-split bonding mode (libRIST `split=`); [`SplitMode::Off`]
+    /// on a receiver.
+    split_mode: SplitMode,
 
     // --- receiver half ---
     /// Delivered in-order payloads handed to the application (`None` on a sender).
@@ -145,6 +149,9 @@ pub(crate) struct Driver {
     /// The media SSRC learned from the first inbound packet (the receiver's
     /// reporter SSRC until then).
     learned_ssrc: Option<u32>,
+    /// The packet-merge state machine (libRIST `merge=`) folding split pairs back
+    /// together at delivery; [`MergeMode::Off`] on a sender.
+    merger: Merger,
 
     // --- source adaptation (TR-06-4 Part 1) ---
     /// The receiver's Link Quality Message emitter, when source adaptation is on.
@@ -184,6 +191,7 @@ impl Driver {
         start_seq: u32,
         rate: Option<RateControl>,
         fec: Option<FecState>,
+        split_mode: SplitMode,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -210,9 +218,11 @@ impl Driver {
             ssrc,
             cname,
             bitmask,
+            split_mode,
             data_out: None,
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
+            merger: Merger::new(MergeMode::Off),
             lqm: None,
             rate,
             fec,
@@ -236,6 +246,7 @@ impl Driver {
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
         fec: Option<FecState>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -262,9 +273,11 @@ impl Driver {
             ssrc,
             cname,
             bitmask,
+            split_mode: SplitMode::Off,
             data_out: Some(tx),
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
+            merger: Merger::new(merge_mode),
             lqm,
             rate: None,
             fec,
@@ -290,6 +303,7 @@ impl Driver {
         bitmask: bool,
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Sender<SimpleInbound>,
         mpsc::Receiver<Bytes>,
@@ -316,9 +330,11 @@ impl Driver {
             ssrc,
             cname,
             bitmask,
+            split_mode: SplitMode::Off,
             data_out: Some(tx),
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
+            merger: Merger::new(merge_mode),
             lqm,
             rate: None,
             fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
@@ -375,7 +391,7 @@ impl Driver {
                 payload = recv_app_gated(&mut self.app_in, self.peer.media().is_some()) => match payload {
                     Some(p) => {
                         let now = self.now();
-                        self.flow.push_app(now, p);
+                        self.push_split(now, p);
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down.
@@ -561,14 +577,53 @@ impl Driver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
-            if let Some(out) = &self.data_out
-                && out.send(payload).await.is_err()
+        while let Some(Event::Deliver {
+            seq,
+            source_time,
+            payload,
+            discontinuity,
+            ..
+        }) = self.flow.poll_event()
+        {
+            match self
+                .merger
+                .deliver(seq, source_time, payload, discontinuity)
             {
-                return; // the application Receiver was dropped.
+                MergeOut::Hold => {}
+                MergeOut::One(p) => {
+                    if !self.deliver_out(p).await {
+                        return; // the application Receiver was dropped.
+                    }
+                }
+                MergeOut::Two(a, b) => {
+                    if !self.deliver_out(a).await || !self.deliver_out(b).await {
+                        return;
+                    }
+                }
             }
         }
         self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// Hands one application payload to the data channel, returning `false` if the
+    /// application `Receiver` has been dropped (the caller stops the loop).
+    async fn deliver_out(&self, payload: Bytes) -> bool {
+        match &self.data_out {
+            Some(out) => out.send(payload).await.is_ok(),
+            None => true,
+        }
+    }
+
+    /// Splits one outbound application payload across a consecutive even/odd sequence
+    /// pair (libRIST `split=`) when split mode is active, else pushes it whole. Both
+    /// halves carry the same `now`, so they share a source time — the pairing the peer
+    /// merges on.
+    fn push_split(&mut self, now: Timestamp, payload: Bytes) {
+        let (first, last) = split::split_payload(self.split_mode, payload);
+        self.flow.push_app(now, first);
+        if let Some(last) = last {
+            self.flow.push_app(now, last);
+        }
     }
 
     /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.

@@ -34,6 +34,7 @@ use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
+use crate::split::{self, MergeMode, Merger, SplitMode};
 use crate::stats::StatsCell;
 
 /// The largest datagram the driver will receive.
@@ -170,6 +171,14 @@ pub(crate) struct MainDriver {
     /// The 48-bit MAC advertised in outbound GRE keepalives (informational).
     mac: [u8; 6],
     bitmask: bool,
+    /// The sender's packet-split bonding mode (libRIST `split=`); [`SplitMode::Off`]
+    /// on a receiver. When active, the outbound keepalive advertises the L bit so a
+    /// peer running `merge=auto` enables merging.
+    split_mode: SplitMode,
+    /// The packet-merge state machine (libRIST `merge=`) folding split pairs back
+    /// together at delivery; [`MergeMode::Off`] on a sender. In `merge=auto` mode it
+    /// is enabled by the peer's keepalive L bit.
+    merger: Merger,
     /// Records why the task exited, read by the handle once its channel closes.
     close: CloseFlag,
     /// The latest stats snapshot published to the handle's `stats()`.
@@ -289,6 +298,7 @@ impl MainDriver {
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
         fec: Option<FecState>,
+        split_mode: SplitMode,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -312,6 +322,8 @@ impl MainDriver {
             codec,
             mac,
             bitmask,
+            split_mode,
+            merger: Merger::new(MergeMode::Off),
             close: close.clone(),
             stats: stats.clone(),
             app_in: Some(rx),
@@ -363,6 +375,7 @@ impl MainDriver {
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         caller_rebind: bool,
         fec: Option<FecState>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -386,6 +399,8 @@ impl MainDriver {
             codec,
             mac,
             bitmask,
+            split_mode: SplitMode::Off,
+            merger: Merger::new(merge_mode),
             close: close.clone(),
             stats: stats.clone(),
             app_in: None,
@@ -437,6 +452,7 @@ impl MainDriver {
         eap: Option<EapRole>,
         lqm: Option<LqmEmitter>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
+        merge_mode: MergeMode,
     ) -> (
         mpsc::Sender<MainInbound>,
         mpsc::Receiver<Bytes>,
@@ -460,6 +476,8 @@ impl MainDriver {
             codec,
             mac,
             bitmask,
+            split_mode: SplitMode::Off,
+            merger: Merger::new(merge_mode),
             close: close.clone(),
             stats: stats.clone(),
             app_in: None,
@@ -547,7 +565,7 @@ impl MainDriver {
                 payload = recv_app_gated(&mut self.app_in, self.authed && self.peer.media().is_some()) => match payload {
                     Some(p) => {
                         let now = self.now();
-                        self.flow.push_app(now, p);
+                        self.push_split(now, p);
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down.
@@ -727,9 +745,15 @@ impl MainDriver {
             }
         }
 
-        // A GRE keepalive is a liveness signal only — nothing for the flow.
-        let (kind, _ka, _ver) = self.codec.peek_control(data);
-        if kind != ControlKind::Keepalive {
+        // A GRE keepalive is a liveness signal only — nothing for the flow, except
+        // that its capability bits drive `merge=auto`: the peer advertises pair-split
+        // with the L bit, enabling the receiver's merge.
+        let (kind, ka, _ver) = self.codec.peek_control(data);
+        if kind == ControlKind::Keepalive {
+            if let Some(ka) = &ka {
+                self.merger.set_auto_enabled(ka.caps.l);
+            }
+        } else {
             match self.codec.decode(data, self.highest_sent) {
                 Ok(Decoded::Media(pkt)) => {
                     if self.learned_ssrc.is_none() {
@@ -774,7 +798,14 @@ impl MainDriver {
                     }
                 }
                 Ok(Decoded::BufferNeg(bn)) => self.on_buffer_neg(bn),
-                Ok(Decoded::Ignored) => {}
+                Ok(Decoded::Ignored) => {
+                    // A v2 (VSF) keepalive lands here; its L bit drives merge=auto (the
+                    // peer advertises pair-split). The v1 keepalive path above reads it
+                    // straight from `peek_control`.
+                    if let Some(caps) = self.codec.peer_caps() {
+                        self.merger.set_auto_enabled(caps.l);
+                    }
+                }
                 Err(e) => crate::driver::decode_warn(self.codec.has_psk(), "main", &e),
             }
         }
@@ -838,14 +869,42 @@ impl MainDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        while let Some(Event::Deliver { payload, .. }) = self.flow.poll_event() {
-            if let Some(out) = &self.data_out
-                && out.send(payload).await.is_err()
+        // Clone the data channel so the merge loop does not borrow `&self` across the
+        // `await` (the EAP role makes `MainDriver` non-`Sync`).
+        let out = self.data_out.clone();
+        while let Some(Event::Deliver {
+            seq,
+            source_time,
+            payload,
+            discontinuity,
+            ..
+        }) = self.flow.poll_event()
+        {
+            for p in self
+                .merger
+                .deliver(seq, source_time, payload, discontinuity)
+                .payloads()
             {
-                return; // the application Receiver was dropped.
+                if let Some(o) = &out
+                    && o.send(p).await.is_err()
+                {
+                    return; // the application Receiver was dropped.
+                }
             }
         }
         self.stats.publish(self.flow.stats(), self.fec_recovered());
+    }
+
+    /// Splits one outbound application payload across a consecutive even/odd sequence
+    /// pair (libRIST `split=`) when split mode is active, else pushes it whole. Both
+    /// halves carry the same `now`, so they share a source time — the pairing the peer
+    /// merges on.
+    fn push_split(&mut self, now: Timestamp, payload: Bytes) {
+        let (first, last) = split::split_payload(self.split_mode, payload);
+        self.flow.push_app(now, first);
+        if let Some(last) = last {
+            self.flow.push_app(now, last);
+        }
     }
 
     /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.
@@ -994,9 +1053,12 @@ impl MainDriver {
         }
         let Some(dst) = self.peer.media() else { return };
         // Advertise the FEC capability (the P flag) in the keepalive when FEC is
-        // configured (TR-06-2 §8; ristgo `localCaps().P`).
+        // configured (TR-06-2 §8; ristgo `localCaps().P`), and the pair-split
+        // capability (the L bit) when split mode is active, so a peer running
+        // `merge=auto` enables merging.
         let mut caps = gre::Capabilities::standard();
         caps.p = self.fec.is_some();
+        caps.l = self.split_mode != SplitMode::Off;
         let ka = gre::Keepalive {
             mac: self.mac,
             caps,

@@ -31,6 +31,7 @@ use crate::fec::FecState;
 use crate::peer::Peer;
 use crate::runtime::Runtime;
 use crate::socket::{MainSocket, SimpleSocket};
+use crate::split::SplitMode;
 
 /// The default base flow SSRC a sender stamps when the public config does not
 /// specify one. Even (the LSB is the retransmit marker); the receiver learns it
@@ -199,12 +200,19 @@ fn random_even_ssrc() -> u32 {
 /// A random 16-bit initial RTP sequence number. The wire sequence is 16-bit on the
 /// Simple/Main profiles (widened to 32-bit in the core); a random start (vs. 0)
 /// resists off-path injection. Falls back to 0 if the CSPRNG is unavailable.
-fn random_start_seq() -> u32 {
+///
+/// When `even` is set (packet-split bonding is active), the low bit is cleared so the
+/// initial sequence is even: split emits every payload as an even/`+1` pair, and an
+/// even start keeps each pair's first half on an even sequence — the parity the
+/// receiver's merge keys on. A slip would strand a later pair across an (odd, even)
+/// boundary and corrupt the merge.
+fn random_start_seq(even: bool) -> u32 {
     let mut b = [0u8; 2];
     if getrandom::fill(&mut b).is_err() {
         return 0;
     }
-    u32::from(u16::from_be_bytes(b))
+    let seq = u32::from(u16::from_be_bytes(b));
+    if even { seq & !1 } else { seq }
 }
 
 /// Builds the EAP-SRP role for a Main-profile flow when credentials are
@@ -348,7 +356,7 @@ pub(crate) fn build_sender(
     remote: SocketAddr,
 ) -> io::Result<SenderSpawned> {
     let ssrc = random_even_ssrc();
-    let start_seq = random_start_seq();
+    let start_seq = random_start_seq(cfg.split_mode != SplitMode::Off);
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     // Multicast egress options when `remote` is a group; `None` for unicast.
     let egress = crate::multicast::sender_egress(cfg, remote)?;
@@ -376,6 +384,7 @@ pub(crate) fn build_sender(
             oob_rx,
             rev_oob_tx,
             build_fec(cfg),
+            cfg.split_mode,
         );
         return Ok(SenderSpawned {
             local,
@@ -419,6 +428,7 @@ pub(crate) fn build_sender(
             rev_oob_tx,
             cfg.fragment_size,
             build_fec(cfg),
+            cfg.split_mode,
         );
         return Ok(SenderSpawned {
             local,
@@ -449,6 +459,7 @@ pub(crate) fn build_sender(
         start_seq,
         RateControl::from_config(cfg),
         build_fec(cfg),
+        cfg.split_mode,
     );
     Ok(SenderSpawned {
         local,
@@ -518,6 +529,7 @@ pub(crate) fn build_receiver(
             rev_oob_rx,
             false, // a listening receiver is not a caller; no caller-rebind
             build_fec(cfg),
+            cfg.merge_mode,
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -553,6 +565,7 @@ pub(crate) fn build_receiver(
             oob_tx,
             rev_oob_rx,
             build_fec(cfg),
+            cfg.merge_mode,
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -584,6 +597,7 @@ pub(crate) fn build_receiver(
         cfg.keepalive_interval,
         build_lqm_emitter(cfg),
         build_fec(cfg),
+        cfg.merge_mode,
     );
     Ok(ReceiverSpawned {
         local: bound,
@@ -619,6 +633,7 @@ pub(crate) fn build_injected_simple(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         build_lqm_emitter(cfg),
+        cfg.merge_mode,
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -665,6 +680,7 @@ pub(crate) fn build_injected_main(
         eap,
         build_lqm_emitter(cfg),
         oob_tx,
+        cfg.merge_mode,
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -712,6 +728,7 @@ pub(crate) fn build_injected_adv(
         build_lqm_emitter(cfg),
         cfg.on_flow_attr.clone(),
         oob_tx,
+        cfg.merge_mode,
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -782,6 +799,7 @@ pub(crate) fn build_injected_bonded(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         adv,
+        cfg.merge_mode,
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -839,6 +857,7 @@ pub(crate) fn build_injected_bonded_simple(
         bitmask_of(cfg),
         cfg.keepalive_interval,
         build_lqm_emitter(cfg),
+        cfg.merge_mode,
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -895,7 +914,7 @@ pub(crate) fn build_listener_sender(
 ) -> io::Result<SenderSpawned> {
     require_reversible(cfg)?;
     let ssrc = random_even_ssrc();
-    let start_seq = random_start_seq();
+    let start_seq = random_start_seq(cfg.split_mode != SplitMode::Off);
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     let membership = crate::multicast::receiver_membership(cfg, local)?;
     // Empty peer: the caller-receiver's announcement teaches us where to send.
@@ -918,6 +937,7 @@ pub(crate) fn build_listener_sender(
             start_seq,
             RateControl::from_config(cfg),
             None, // FEC + reversed-role deferred
+            cfg.split_mode,
         );
         return Ok(SenderSpawned {
             local: bound,
@@ -963,6 +983,7 @@ pub(crate) fn build_listener_sender(
             rev_oob_tx,
             cfg.fragment_size,
             None, // FEC + reversed-role deferred
+            cfg.split_mode,
         );
         return Ok(SenderSpawned {
             local: bound,
@@ -996,6 +1017,7 @@ pub(crate) fn build_listener_sender(
         oob_rx,
         rev_oob_tx,
         None, // FEC + reversed-role deferred
+        cfg.split_mode,
     );
     Ok(SenderSpawned {
         local: bound,
@@ -1048,6 +1070,7 @@ pub(crate) fn build_caller_receiver(
             cfg.keepalive_interval,
             build_lqm_emitter(cfg),
             None, // FEC + reversed-role deferred
+            cfg.merge_mode,
         );
         return Ok(ReceiverSpawned {
             local,
@@ -1089,6 +1112,7 @@ pub(crate) fn build_caller_receiver(
             oob_tx,
             rev_oob_rx,
             None, // FEC + reversed-role deferred
+            cfg.merge_mode,
         );
         return Ok(ReceiverSpawned {
             local,
@@ -1124,6 +1148,7 @@ pub(crate) fn build_caller_receiver(
         rev_oob_rx,
         caller_rebind,
         None, // FEC + reversed-role deferred
+        cfg.merge_mode,
     );
     Ok(ReceiverSpawned {
         local,
@@ -1201,7 +1226,7 @@ pub(crate) fn build_bonded_sender(
         )
     })?;
     let ssrc = random_even_ssrc();
-    let start_seq = random_start_seq();
+    let start_seq = random_start_seq(cfg.split_mode != SplitMode::Off);
 
     // Simple bonds through the even/odd BondedSimpleDriver (one shared socket pair fans
     // RTP media to each path's media port; NACKs return on the shared RTCP socket).
@@ -1233,6 +1258,7 @@ pub(crate) fn build_bonded_sender(
             cfg.keepalive_interval,
             weight_rx,
             RateControl::from_config(cfg),
+            cfg.split_mode,
         );
         return Ok(SenderSpawned {
             local,
@@ -1288,6 +1314,7 @@ pub(crate) fn build_bonded_sender(
         RateControl::from_config(cfg),
         adv,
         build_fec(cfg),
+        cfg.split_mode,
     );
     Ok(SenderSpawned {
         local,
@@ -1359,6 +1386,7 @@ pub(crate) fn build_bonded_receiver(
             bitmask_of(cfg),
             cfg.keepalive_interval,
             build_lqm_emitter(cfg),
+            cfg.merge_mode,
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -1424,6 +1452,7 @@ pub(crate) fn build_bonded_receiver(
         build_lqm_emitter(cfg),
         adv,
         build_fec(cfg),
+        cfg.merge_mode,
     );
     Ok(ReceiverSpawned {
         local: bound,

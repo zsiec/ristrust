@@ -172,30 +172,33 @@ impl Drop for TempFiles {
     }
 }
 
-/// Generates a self-signed ECDSA P-256 cert + key with `openssl`, returning their
-/// paths (kept alive by the guard), or `None` on failure.
-fn gen_ecdsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
+/// Generates a self-signed cert + key with `openssl req -x509`, returning their
+/// paths (kept alive by the guard), or `None` on failure. `key_args` selects the key
+/// type; `tag` keeps the temp-file paths distinct.
+fn gen_cert(
+    openssl: &str,
+    tag: &str,
+    key_args: &[&str],
+    subject: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
     let dir = std::env::temp_dir();
-    let cert = dir.join(format!("ristrust-dtls-{}-cert.pem", unique_token()));
-    let key = dir.join(format!("ristrust-dtls-{}-key.pem", unique_token()));
+    let cert = dir.join(format!("ristrust-dtls-{tag}-{}-cert.pem", unique_token()));
+    let key = dir.join(format!("ristrust-dtls-{tag}-{}-key.pem", unique_token()));
+    let mut args = vec!["req", "-x509"];
+    args.extend_from_slice(key_args);
+    args.extend_from_slice(&[
+        "-keyout",
+        key.to_str()?,
+        "-out",
+        cert.to_str()?,
+        "-days",
+        "1",
+        "-nodes",
+        "-subj",
+        subject,
+    ]);
     let ok = Command::new(openssl)
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-keyout",
-            key.to_str()?,
-            "-out",
-            cert.to_str()?,
-            "-days",
-            "1",
-            "-nodes",
-            "-subj",
-            "/CN=ristrust-interop",
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -205,6 +208,16 @@ fn gen_ecdsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathB
     }
     let guard = TempFiles(vec![cert.clone(), key.clone()]);
     Some((cert, key, guard))
+}
+
+/// A self-signed ECDSA P-256 cert + key.
+fn gen_ecdsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
+    gen_cert(
+        openssl,
+        "ec",
+        &["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"],
+        "/CN=ristrust-interop",
+    )
 }
 
 /// ristrust DTLS client → OpenSSL `s_server -dtls1_2` (ECDHE-ECDSA). OpenSSL
@@ -247,36 +260,14 @@ fn interop_ecdhe_client_to_openssl_server() {
     );
 }
 
-/// Generates a self-signed RSA-2048 cert + key with `openssl`, returning their paths.
+/// A self-signed RSA-2048 cert + key.
 fn gen_rsa_cert(openssl: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, TempFiles)> {
-    let dir = std::env::temp_dir();
-    let cert = dir.join(format!("ristrust-dtls-rsa-{}-cert.pem", unique_token()));
-    let key = dir.join(format!("ristrust-dtls-rsa-{}-key.pem", unique_token()));
-    let ok = Command::new(openssl)
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            key.to_str()?,
-            "-out",
-            cert.to_str()?,
-            "-days",
-            "1",
-            "-nodes",
-            "-subj",
-            "/CN=ristrust-interop-rsa",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !ok {
-        return None;
-    }
-    let guard = TempFiles(vec![cert.clone(), key.clone()]);
-    Some((cert, key, guard))
+    gen_cert(
+        openssl,
+        "rsa",
+        &["-newkey", "rsa:2048"],
+        "/CN=ristrust-interop-rsa",
+    )
 }
 
 /// Spawns `openssl s_server -dtls1_2` constrained to one `cipher`, presenting

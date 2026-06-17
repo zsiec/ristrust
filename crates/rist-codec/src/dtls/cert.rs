@@ -170,6 +170,7 @@ fn build_self_signed_rsa(
 
 /// A peer's leaf public key: ECDSA P-256 or RSA.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum PeerKey {
     /// An ECDSA P-256 verifying key.
     Ecdsa(VerifyingKey),

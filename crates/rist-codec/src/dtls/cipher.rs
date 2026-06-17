@@ -54,51 +54,77 @@ fn aead_aad(
     aad
 }
 
-/// Encrypts `plaintext` under an AES-GCM `key` (16 or 32 bytes) with `nonce` and
-/// `aad`, returning `ciphertext || tag`.
-fn gcm_encrypt(key: &[u8], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-    let payload = Payload {
-        msg: plaintext,
-        aad,
-    };
-    let nonce = Nonce::from_slice(nonce);
-    if key.len() == 32 {
-        Aes256Gcm::new_from_slice(key)
-            .expect("32-byte AES-256 key")
-            .encrypt(nonce, payload)
-            .expect("AES-GCM seal never fails for record-sized plaintext")
-    } else {
-        Aes128Gcm::new_from_slice(key)
-            .expect("16-byte AES-128 key")
-            .encrypt(nonce, payload)
-            .expect("AES-GCM seal never fails for record-sized plaintext")
+/// An AES-GCM cipher with its key schedule already expanded, built once at key
+/// derivation so each record seal/open reuses it (the expansion is the costly part
+/// of GCM, and a DTLS data stream seals/opens one record per datagram). AES-128 with
+/// a 16-byte key, AES-256 with a 32-byte key.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum GcmCipher {
+    /// AES-128-GCM.
+    Aes128(Box<Aes128Gcm>),
+    /// AES-256-GCM.
+    Aes256(Box<Aes256Gcm>),
+}
+
+impl std::fmt::Debug for GcmCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GcmCipher::Aes128(_) => "GcmCipher::Aes128",
+            GcmCipher::Aes256(_) => "GcmCipher::Aes256",
+        })
     }
 }
 
-/// Decrypts an AES-GCM `ciphertext` (`ct || tag`) under `key` with `nonce`/`aad`.
-fn gcm_decrypt(key: &[u8], nonce: &[u8; 12], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, DtlsError> {
-    let payload = Payload { msg: ct, aad };
-    let nonce = Nonce::from_slice(nonce);
-    let r = if key.len() == 32 {
-        Aes256Gcm::new_from_slice(key)
-            .expect("32-byte AES-256 key")
-            .decrypt(nonce, payload)
-    } else {
-        Aes128Gcm::new_from_slice(key)
-            .expect("16-byte AES-128 key")
-            .decrypt(nonce, payload)
-    };
-    r.map_err(|_| DtlsError::DecryptFailed)
+impl GcmCipher {
+    /// Expands the key schedule for a 16-byte (AES-128) or 32-byte (AES-256) key.
+    fn new(key: &[u8]) -> GcmCipher {
+        if key.len() == 32 {
+            GcmCipher::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(key).expect("32-byte AES-256 key"),
+            ))
+        } else {
+            GcmCipher::Aes128(Box::new(
+                Aes128Gcm::new_from_slice(key).expect("16-byte AES-128 key"),
+            ))
+        }
+    }
+
+    /// Encrypts `plaintext` with `nonce`/`aad`, returning `ciphertext || tag`.
+    fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        let payload = Payload {
+            msg: plaintext,
+            aad,
+        };
+        let nonce = Nonce::from_slice(nonce);
+        match self {
+            GcmCipher::Aes128(c) => c.encrypt(nonce, payload),
+            GcmCipher::Aes256(c) => c.encrypt(nonce, payload),
+        }
+        .expect("AES-GCM seal never fails for record-sized plaintext")
+    }
+
+    /// Decrypts `ciphertext` (`ct || tag`) with `nonce`/`aad`.
+    fn decrypt(&self, nonce: &[u8; 12], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, DtlsError> {
+        let payload = Payload { msg: ct, aad };
+        let nonce = Nonce::from_slice(nonce);
+        match self {
+            GcmCipher::Aes128(c) => c.decrypt(nonce, payload),
+            GcmCipher::Aes256(c) => c.decrypt(nonce, payload),
+        }
+        .map_err(|_| DtlsError::DecryptFailed)
+    }
 }
 
-/// One direction's record protection: AES-GCM (with the bulk key + 4-byte salt) or
-/// the NULL cipher with an HMAC (with the MAC key + suite hash).
-#[derive(Debug, Clone)]
+/// One direction's record protection: AES-GCM (with the bulk cipher + 4-byte salt)
+/// or the NULL cipher with an HMAC (with the MAC key + suite hash).
+#[derive(Clone)]
+#[non_exhaustive]
 pub enum HalfConn {
-    /// AES-GCM AEAD (AES-128 with a 16-byte key, AES-256 with a 32-byte key).
+    /// AES-GCM AEAD (AES-128 or AES-256, by key length at construction).
     Gcm {
-        /// The 16- or 32-byte AES key.
-        key: Vec<u8>,
+        /// The AES-GCM cipher, key schedule already expanded.
+        cipher: GcmCipher,
         /// The 4-byte fixed IV (salt), the implicit part of the GCM nonce.
         salt: [u8; GCM_FIXED_IV_LEN],
     },
@@ -113,12 +139,28 @@ pub enum HalfConn {
     },
 }
 
+// Debug is hand-written (not derived) so it never prints key material — `GcmCipher`
+// wraps the expanded key schedule, which has no `Debug` of its own anyway.
+impl std::fmt::Debug for HalfConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HalfConn::Gcm { .. } => f.write_str("HalfConn::Gcm(..)"),
+            HalfConn::NullMac { hash, mac_len, .. } => f
+                .debug_struct("HalfConn::NullMac")
+                .field("hash", hash)
+                .field("mac_len", mac_len)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 impl HalfConn {
-    /// Builds an AES-GCM half from a 16- or 32-byte key and 4-byte salt.
+    /// Builds an AES-GCM half from a 16- or 32-byte key and 4-byte salt, expanding
+    /// the key schedule once up front.
     #[must_use]
     pub fn gcm(key: &[u8], salt: [u8; GCM_FIXED_IV_LEN]) -> HalfConn {
         HalfConn::Gcm {
-            key: key.to_vec(),
+            cipher: GcmCipher::new(key),
             salt,
         }
     }
@@ -136,13 +178,13 @@ impl HalfConn {
         plaintext: &[u8],
     ) -> Vec<u8> {
         match self {
-            HalfConn::Gcm { key, salt } => {
+            HalfConn::Gcm { cipher, salt } => {
                 let se = seq_and_epoch(epoch, seq);
                 let mut nonce = [0u8; 12];
                 nonce[..4].copy_from_slice(salt);
                 nonce[4..].copy_from_slice(&se.to_be_bytes());
                 let aad = aead_aad(epoch, seq, typ, version, plaintext.len());
-                let ct = gcm_encrypt(key, &nonce, plaintext, &aad);
+                let ct = cipher.encrypt(&nonce, plaintext, &aad);
                 let mut out = Vec::with_capacity(GCM_EXPLICIT_NONCE_LEN + ct.len());
                 out.extend_from_slice(&se.to_be_bytes());
                 out.extend_from_slice(&ct);
@@ -176,7 +218,7 @@ impl HalfConn {
         fragment: &[u8],
     ) -> Result<Vec<u8>, DtlsError> {
         match self {
-            HalfConn::Gcm { key, salt } => {
+            HalfConn::Gcm { cipher, salt } => {
                 if fragment.len() < GCM_OVERHEAD {
                     return Err(DtlsError::Malformed("gcm record"));
                 }
@@ -186,7 +228,7 @@ impl HalfConn {
                 let ct = &fragment[GCM_EXPLICIT_NONCE_LEN..];
                 let plaintext_len = ct.len() - GCM_TAG_LEN;
                 let aad = aead_aad(epoch, seq, typ, version, plaintext_len);
-                gcm_decrypt(key, &nonce, ct, &aad)
+                cipher.decrypt(&nonce, ct, &aad)
             }
             HalfConn::NullMac {
                 mac_key,
@@ -410,12 +452,17 @@ mod tests {
         let frag =
             a.client_write
                 .seal(1, 5, ContentType::ApplicationData, VERSION_DTLS_1_2, b"abc");
-        // The AES-256 key must be 32 bytes (SHA-384 suite).
-        if let HalfConn::Gcm { key, .. } = &a.client_write {
-            assert_eq!(key.len(), 32);
-        } else {
-            panic!("AES-256 suite must derive a GCM half");
-        }
+        // The AES-256 suite must derive an AES-256 GCM half (SHA-384 suite).
+        assert!(
+            matches!(
+                &a.client_write,
+                HalfConn::Gcm {
+                    cipher: GcmCipher::Aes256(_),
+                    ..
+                }
+            ),
+            "AES-256 suite must derive an AES-256 GCM half"
+        );
         let back = b
             .client_write // a second endpoint with the same inputs opens the same direction
             .open(1, 5, ContentType::ApplicationData, VERSION_DTLS_1_2, &frag);

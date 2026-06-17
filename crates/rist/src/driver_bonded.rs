@@ -515,11 +515,8 @@ impl BondedDriver {
                 // from a bonded sender — the per-path max is ill-defined across paths
                 // — but a bonded receiver still consumes an inbound advert.
                 Ok(Decoded::BufferNeg(bn)) => {
-                    if bn.sender_max_ms != 0 {
-                        self.flow
-                            .set_sender_max_buffer(rist_core::clock::Micros::from_millis(
-                                i64::from(bn.sender_max_ms),
-                            ));
+                    if let Some(max) = bn.sender_max() {
+                        self.flow.set_sender_max_buffer(max);
                     }
                 }
                 Ok(Decoded::Ignored) => {}

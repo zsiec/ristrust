@@ -23,6 +23,7 @@ use super::suites::{
 
 /// A key-exchange method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyExchange {
     /// Ephemeral ECDH on P-256 (forward secret).
     Ecdhe,
@@ -34,6 +35,7 @@ pub enum KeyExchange {
 
 /// How the server (and optionally the client) authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthMethod {
     /// PSK: the shared key is the authenticator (no certificate).
     None,

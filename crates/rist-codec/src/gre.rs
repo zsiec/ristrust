@@ -675,6 +675,33 @@ pub struct BufferNegotiation {
 }
 
 impl BufferNegotiation {
+    /// The advertised sender-max as a duration, or `None` when the peer is not a
+    /// sender (`sender_max_ms == 0`). A receiver feeds this to its recovery-buffer
+    /// auto-scaler so it never sizes past what the sender retains for retransmission.
+    #[must_use]
+    pub fn sender_max(&self) -> Option<rist_core::clock::Micros> {
+        (self.sender_max_ms != 0)
+            .then(|| rist_core::clock::Micros::from_millis(i64::from(self.sender_max_ms)))
+    }
+
+    /// Builds a sender's advertisement from its recovery-buffer ceiling and minimum
+    /// RTT: the advertised max is `recovery_buffer_max + 2·rtt_min` (libRIST's
+    /// `sender_recover_min_time`), clamped to the 16-bit milliseconds the wire holds.
+    #[must_use]
+    pub fn for_sender_buffer(
+        recovery_buffer_max: rist_core::clock::Micros,
+        rtt_min: rist_core::clock::Micros,
+    ) -> BufferNegotiation {
+        let micros = recovery_buffer_max
+            .as_micros()
+            .saturating_add(rtt_min.as_micros().saturating_mul(2));
+        let max_ms = u16::try_from(micros / 1000).unwrap_or(u16::MAX);
+        BufferNegotiation {
+            sender_max_ms: max_ms,
+            ..BufferNegotiation::default()
+        }
+    }
+
     /// Appends the 6-byte big-endian buffer-negotiation body to `dst`.
     pub fn append_to(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.sender_max_ms.to_be_bytes());

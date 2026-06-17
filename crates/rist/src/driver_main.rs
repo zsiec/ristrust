@@ -680,13 +680,13 @@ impl MainDriver {
         // (so a keyless forger or a cleartext sender cannot supply one); this gate
         // additionally requires an established per-peer SRP identity so a shared-PSK
         // or plaintext CNAME is never trusted as identity.
-        if self.srp_authed() {
-            let cname = self.codec.peer_cname().map(str::to_owned);
-            if let Some(c) = cname
-                && self.peer_cname.as_deref() != Some(c.as_str())
-            {
-                self.peer_cname = Some(c);
-            }
+        if self.srp_authed()
+            && let Some(c) = self.codec.peer_cname()
+            && self.peer_cname.as_deref() != Some(c)
+        {
+            // Borrow-compare first: the CNAME is fixed for the session, so this only
+            // allocates on the (rare) first/changed value, not every authed datagram.
+            self.peer_cname = Some(c.to_owned());
         }
         self.drain(now).await;
     }
@@ -915,15 +915,8 @@ impl MainDriver {
             return;
         }
         let Some(dst) = self.peer.media() else { return };
-        let max_ms = {
-            let cfg = self.flow.config();
-            let micros = cfg.recovery_buffer_max.as_micros() + 2 * cfg.rtt_min.as_micros();
-            u16::try_from(micros / 1000).unwrap_or(u16::MAX)
-        };
-        let bn = gre::BufferNegotiation {
-            sender_max_ms: max_ms,
-            ..gre::BufferNegotiation::default()
-        };
+        let cfg = self.flow.config();
+        let bn = gre::BufferNegotiation::for_sender_buffer(cfg.recovery_buffer_max, cfg.rtt_min);
         if let Ok(bytes) = self.codec.encode_buffer_neg(bn) {
             let sock = self.socket.clone();
             let _ = sock.send(&bytes, dst).await;
@@ -934,11 +927,8 @@ impl MainDriver {
     /// enables (and bounds) the receiver's recovery-buffer auto-scaling. A no-op on a
     /// sender-role flow (the core guards by role).
     fn on_buffer_neg(&mut self, bn: gre::BufferNegotiation) {
-        if bn.sender_max_ms != 0 {
-            self.flow
-                .set_sender_max_buffer(rist_core::clock::Micros::from_millis(i64::from(
-                    bn.sender_max_ms,
-                )));
+        if let Some(max) = bn.sender_max() {
+            self.flow.set_sender_max_buffer(max);
         }
     }
 

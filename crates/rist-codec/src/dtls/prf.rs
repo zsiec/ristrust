@@ -20,6 +20,7 @@ pub const LABEL_SERVER_FINISHED: &str = "server finished";
 /// transcript hash, Finished `verify_data`, and extended master secret: SHA-256 for
 /// the `*_SHA256` suites, SHA-384 for the `*_SHA384` suites (RFC 5246 §5, RFC 5289).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PrfHash {
     /// SHA-256 (32-byte output), used by the `*_SHA256` suites.
     Sha256,

@@ -859,15 +859,8 @@ impl AdvDriver {
             return;
         }
         let Some(dst) = self.peer.media() else { return };
-        let max_ms = {
-            let cfg = self.flow.config();
-            let micros = cfg.recovery_buffer_max.as_micros() + 2 * cfg.rtt_min.as_micros();
-            u16::try_from(micros / 1000).unwrap_or(u16::MAX)
-        };
-        let bn = gre::BufferNegotiation {
-            sender_max_ms: max_ms,
-            ..gre::BufferNegotiation::default()
-        };
+        let cfg = self.flow.config();
+        let bn = gre::BufferNegotiation::for_sender_buffer(cfg.recovery_buffer_max, cfg.rtt_min);
         if let Ok(bytes) = self.main.encode_buffer_neg(bn) {
             let sock = self.socket.clone();
             let _ = sock.send(&bytes, dst).await;
@@ -878,11 +871,8 @@ impl AdvDriver {
     /// enables (and bounds) the receiver's recovery-buffer auto-scaling. A no-op on a
     /// sender-role flow (the core guards by role).
     fn on_buffer_neg(&mut self, bn: gre::BufferNegotiation) {
-        if bn.sender_max_ms != 0 {
-            self.flow
-                .set_sender_max_buffer(rist_core::clock::Micros::from_millis(i64::from(
-                    bn.sender_max_ms,
-                )));
+        if let Some(max) = bn.sender_max() {
+            self.flow.set_sender_max_buffer(max);
         }
     }
 

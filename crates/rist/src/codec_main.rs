@@ -869,9 +869,13 @@ impl MainCodec {
                 RtcpPacket::LinkQualityReport(pk) => {
                     out.push(Feedback::LinkQuality { lqm: pk.lqm });
                 }
-                RtcpPacket::Sdes(s) if encrypted => {
-                    // Record the peer's CNAME only from an ENCRYPTED RTCP envelope, so a
-                    // forger or cleartext sender cannot supply the NAT-rebind identity key.
+                // Record the peer's CNAME only from an ENCRYPTED RTCP envelope, so a
+                // forger or cleartext sender cannot supply the NAT-rebind identity key.
+                // The CNAME is fixed for the session, so the guard only enters (and
+                // clones) on an actual change, not every encrypted SDES datagram.
+                RtcpPacket::Sdes(s)
+                    if encrypted && self.last_rx_cname.as_deref() != Some(s.cname.as_str()) =>
+                {
                     self.last_rx_cname = Some(s.cname.clone());
                 }
                 _ => {}

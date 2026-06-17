@@ -27,7 +27,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rist::{AesKeyBits, Config, Profile, dial, dial_bonded, listen, listen_bonded};
+use rist::{
+    AesKeyBits, Config, MergeMode, Profile, SplitMode, dial, dial_bonded, listen, listen_bonded,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::process::{Child, Command};
@@ -133,6 +135,11 @@ struct Scenario {
     srp: Option<(&'static str, &'static str)>,
     /// Negotiate the legacy unpadded EAPOL v2 SRP variant (libRIST `srp-compat`).
     srp_compat: bool,
+    /// Packet-split bonding modes (libRIST `split=`/`merge=`). Applied to both ends:
+    /// `split` is inert on whichever end is the receiver and `merge` is inert on the
+    /// sender, so a single scenario exercises split→merge in both directions.
+    split_mode: SplitMode,
+    merge_mode: MergeMode,
 }
 
 impl Scenario {
@@ -156,7 +163,8 @@ impl Scenario {
         if self.srp_compat {
             c = c.with_srp_compat(true);
         }
-        c
+        c.with_split_mode(self.split_mode)
+            .with_merge_mode(self.merge_mode)
     }
 
     /// The ristgo `rist://` query string. `sender` adds `compression=1`, which is a
@@ -170,6 +178,7 @@ impl Scenario {
         if let Some(bits) = self.aes {
             let n = match bits {
                 AesKeyBits::Aes128 => 128,
+                AesKeyBits::Aes192 => 192,
                 AesKeyBits::Aes256 => 256,
             };
             write!(q, "&aes-type={n}").unwrap();
@@ -182,6 +191,17 @@ impl Scenario {
         }
         if self.compression && sender {
             q.push_str("&compression=1");
+        }
+        // libRIST/ristgo spell split/merge as words (off|auto|half, off|pairs|auto).
+        match self.split_mode {
+            SplitMode::Auto => q.push_str("&split=auto"),
+            SplitMode::Half => q.push_str("&split=half"),
+            SplitMode::Off => {}
+        }
+        match self.merge_mode {
+            MergeMode::Pairs => q.push_str("&merge=pairs"),
+            MergeMode::Auto => q.push_str("&merge=auto"),
+            MergeMode::Off => {}
         }
         q
     }
@@ -421,10 +441,22 @@ fn base(profile: Profile, profile_n: u8) -> Scenario {
         buffer_ms: 300,
         srp: None,
         srp_compat: false,
+        split_mode: SplitMode::Off,
+        merge_mode: MergeMode::Off,
     }
 }
 fn simple() -> Scenario {
     base(Profile::Simple, 0)
+}
+/// Split/merge bonding on a profile: `split=auto` + `merge=pairs` on both ends (each
+/// inert in the wrong role), so a single scenario cross-validates ristrust-split →
+/// ristgo-merge and ristgo-split → ristrust-merge byte-exact.
+fn split_merge(profile: Profile, profile_n: u8) -> Scenario {
+    Scenario {
+        split_mode: SplitMode::Auto,
+        merge_mode: MergeMode::Pairs,
+        ..base(profile, profile_n)
+    }
 }
 fn main_clear() -> Scenario {
     base(Profile::Main, 1)
@@ -624,6 +656,68 @@ async fn diff_main_srp_lossy_ristgo_rx() {
 #[tokio::test]
 async fn diff_main_srp_lossy_ristrust_rx() {
     ristrust_rx_from_tx("main/srp lossy ristrust-rx", main_srp(), 0.12).await;
+}
+
+// ---------------------------------------------------------------------------
+// Packet split/merge bonding (libRIST split=/merge=) — both directions, all three
+// single-path profiles. split=auto on the sender spreads each payload across a
+// consecutive sequence pair; merge=pairs on the receiver recombines it. Byte-exact
+// delivery proves the two stacks agree on the split wire and recombine it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn diff_simple_split_merge_ristgo_rx() {
+    rx_from_ristrust_tx(
+        "simple/split-merge ristgo-rx",
+        split_merge(Profile::Simple, 0),
+        0.0,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_simple_split_merge_ristrust_rx() {
+    ristrust_rx_from_tx(
+        "simple/split-merge ristrust-rx",
+        split_merge(Profile::Simple, 0),
+        0.0,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_main_split_merge_ristgo_rx() {
+    rx_from_ristrust_tx(
+        "main/split-merge ristgo-rx",
+        split_merge(Profile::Main, 1),
+        0.0,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_main_split_merge_ristrust_rx() {
+    ristrust_rx_from_tx(
+        "main/split-merge ristrust-rx",
+        split_merge(Profile::Main, 1),
+        0.0,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_adv_split_merge_ristgo_rx() {
+    rx_from_ristrust_tx(
+        "adv/split-merge ristgo-rx",
+        split_merge(Profile::Advanced, 2),
+        0.0,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_adv_split_merge_ristrust_rx() {
+    ristrust_rx_from_tx(
+        "adv/split-merge ristrust-rx",
+        split_merge(Profile::Advanced, 2),
+        0.0,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

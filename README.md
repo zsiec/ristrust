@@ -7,8 +7,8 @@ low-latency video over lossy IP.
 > **Status: feature-complete, pre-1.0.** All three RIST profiles (Simple / Main /
 > Advanced), SMPTE 2022-7 bonding, FEC, source adaptation, reversed-role and
 > multi-flow transport are implemented and interoperate with libRIST byte-for-byte
-> — 20 sender/receiver combinations across the profiles, clean and lossy — and
-> with the `ristgo` reference across a 32-case differential matrix. DTLS 1.2 is
+> — 22 sender/receiver combinations across the profiles, clean and lossy — and
+> with the `ristgo` reference across a 38-case differential matrix. DTLS 1.2 is
 > optional and feature-gated. See the feature matrix below.
 
 ## Why
@@ -99,6 +99,7 @@ and tested; — = not applicable to that profile.
 | LZ4 payload compression (LPC) | — | — | ✅ | TR-06-3 §5.3.6 |
 | Authenticated AEAD PSK modes 3/4/5 † | — | — | ✅ | TR-06-3 §8 |
 | SMPTE 2022-7 bonding (full redundancy + weighted load-share) | ✅ | ✅ | ✅ | TR-06-2 §7 |
+| Packet split/merge bonding (`split=`/`merge=`) | ✅ | ✅ | ✅ | libRIST parity |
 | FEC — SMPTE ST 2022-1 / ST 2022-5 (1-D + 2-D XOR) | ✅ | ✅ | ✅ | TR-06-2 §8.4 |
 | Source adaptation — Link Quality Messages + AIMD rate control | ✅ | ✅ | ✅ | TR-06-4 Part 1 |
 | Congestion control — `recovery_maxbitrate` retransmit pacing | ✅ | ✅ | ✅ | libRIST parity |
@@ -190,7 +191,8 @@ let cfg = Config::default().with_profile(Profile::Main).with_fec(FecConfig::defa
 `rtt` (`rtt-min`/`rtt-max`/`rtt-multiplier`), `reorder-buffer`, `session-timeout`,
 `keepalive` (`keepalive-interval`), `bandwidth`, `return-bandwidth`, `weight`,
 `min-retries`/`max-retries`, `virt-src-port`/`virt-dst-port`, `recovery-priority`,
-`congestion-control`, `timing-mode`, `miface`, `ttl`, `source`, `reflector`,
+`congestion-control`, `timing-mode`, `split` (`off`/`auto`/`half`),
+`merge` (`off`/`pairs`/`auto`), `miface`, `ttl`, `source`, `reflector`,
 `local-port`.
 
 ## Limitations
@@ -207,13 +209,13 @@ let cfg = Config::default().with_profile(Profile::Main).with_fec(FecConfig::defa
 
 ## Interoperability
 
-- **libRIST** v0.2.18-rc1 — 20 sender/receiver combinations across Simple / Main /
-  Advanced, clean and lossy, byte-exact recovery (behind `--features interop`,
-  graceful-skip when the tools are absent).
-- **ristgo** — a 32-case differential matrix (profiles × clear/AES-128/AES-256/LZ4
-  × both directions × clean+lossy, plus all-profile bonding and EAP-SRP), driven
-  by the ristgo example binaries (behind `--features differential`, needs
-  `$RISTGO_DIR`).
+- **libRIST** v0.2.18-rc1 — 22 sender/receiver combinations across Simple / Main /
+  Advanced, clean and lossy, byte-exact recovery, including packet split/merge both
+  directions (behind `--features interop`, graceful-skip when the tools are absent).
+- **ristgo** — a 38-case differential matrix (profiles × clear/AES-128/AES-256/LZ4
+  × both directions × clean+lossy, plus all-profile bonding, EAP-SRP, and packet
+  split/merge), driven by the ristgo example binaries (behind `--features
+  differential`, needs `$RISTGO_DIR`).
 
 ## Design principles
 

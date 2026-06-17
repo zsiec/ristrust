@@ -458,6 +458,9 @@ impl AdvDriver {
                     if self.peer.media().is_some() {
                         self.send_handshake(now).await;
                         self.send_keepalive(now).await;
+                        // Advertise pair-split on the substrate (merge=auto) when split
+                        // is active; a no-op (no datagram) otherwise.
+                        self.send_split_advert().await;
                         // Advertise this sender's max recovery buffer (GRE-v2 buffer
                         // negotiation on the substrate codec; sender-only).
                         self.send_buffer_neg(now).await;
@@ -917,6 +920,31 @@ impl AdvDriver {
         }
     }
 
+    /// When packet-split bonding is active, advertise it on the GRE substrate with a
+    /// keepalive carrying the pair-split (L) bit, so a peer running `merge=auto`
+    /// enables merging. The Advanced keepalive datagram has no GRE capability octet,
+    /// hence this separate substrate beacon. Strictly gated on split being active, so
+    /// the default Advanced wire is byte-identical (the `-p 2` interop is unaffected).
+    /// A v1 keepalive so the peer reads the caps straight from `peek_control`.
+    async fn send_split_advert(&mut self) {
+        if self.split_mode == SplitMode::Off || self.flow.config().no_recovery {
+            return;
+        }
+        let Some(dst) = self.peer.media() else { return };
+        let s = self.ssrc.to_be_bytes();
+        let mut caps = gre::Capabilities::standard();
+        caps.l = true;
+        let ka = gre::Keepalive {
+            mac: [0x02, 0x00, s[0], s[1], s[2], s[3]],
+            caps,
+            ..gre::Keepalive::default()
+        };
+        let sock = self.socket.clone();
+        if let Ok(bytes) = self.main.encode_keepalive(&ka, gre::VERSION_MIN) {
+            let _ = sock.send(&bytes, dst).await;
+        }
+    }
+
     /// Advertises this sender's maximum recovery buffer as a GRE-v2 buffer-negotiation
     /// message on the substrate codec, so the receiver auto-scales its playout buffer
     /// without sizing past what the sender retains. Sender-role, two-way only.
@@ -976,6 +1004,7 @@ impl AdvDriver {
     async fn greet(&mut self, now: Timestamp) {
         self.send_handshake(now).await;
         self.send_keepalive(now).await;
+        self.send_split_advert().await;
         self.greeted = true;
     }
 

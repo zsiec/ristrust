@@ -118,21 +118,15 @@ async fn advanced_split_merge_round_trips() {
     run_pairs(cfg, 50).await;
 }
 
-#[tokio::test]
-async fn main_merge_auto_enables_off_the_keepalive_l_bit() {
-    // merge=auto stays dormant until the sender's GRE keepalive advertises pair-split
-    // (the L bit). Before it enables, a pair may be delivered as two orphan halves;
-    // after, pairs merge. Either way the concatenated output byte stream equals the
-    // concatenated input — the robust steady-state invariant. We additionally require
-    // that *some* payload merged exactly (proving auto did engage), tolerating startup
-    // orphans.
+/// Drives `n` split payloads over a `merge=auto` receiver built from `cfg`, asserting
+/// the steady-state invariant: merge=auto stays dormant until the sender's keepalive
+/// advertises pair-split (the L bit), so before it engages a pair may arrive as two
+/// orphan halves and after it engages the pair merges — but either way the
+/// concatenated output byte stream equals the concatenated input. It additionally
+/// requires that *some* payload merged whole (proving auto engaged off the L bit),
+/// tolerating startup orphans.
+async fn run_merge_auto(cfg: Config) {
     const N: usize = 60;
-    let cfg = Config::default()
-        .with_profile(Profile::Main)
-        .with_buffer(Duration::from_millis(150))
-        .with_split_mode(SplitMode::Half)
-        .with_merge_mode(MergeMode::Auto);
-
     let (mut receiver, port) = listen_free(&cfg).await;
     let sender = dial(&format!("127.0.0.1:{port}"), cfg.clone())
         .await
@@ -146,7 +140,6 @@ async fn main_merge_auto_enables_off_the_keepalive_l_bit() {
         sender
     });
 
-    // The expected concatenated byte stream.
     let mut want = Vec::new();
     for i in 0..N {
         want.extend_from_slice(&payload(i));
@@ -154,8 +147,7 @@ async fn main_merge_auto_enables_off_the_keepalive_l_bit() {
 
     let mut got = Vec::new();
     let mut merged_any = false;
-    // Drain until the concatenated output covers the whole input (orphans make the
-    // delivery count vary, so we drain by byte length, not message count).
+    // Drain by byte length, not message count: orphans make the count vary.
     while got.len() < want.len() {
         let m = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
             .await
@@ -175,6 +167,32 @@ async fn main_merge_auto_enables_off_the_keepalive_l_bit() {
     let sender = send.await.expect("send task");
     sender.close().await.expect("close sender");
     receiver.close().await.expect("close receiver");
+}
+
+#[tokio::test]
+async fn main_merge_auto_enables_off_the_keepalive_l_bit() {
+    run_merge_auto(
+        Config::default()
+            .with_profile(Profile::Main)
+            .with_buffer(Duration::from_millis(150))
+            .with_split_mode(SplitMode::Half)
+            .with_merge_mode(MergeMode::Auto),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn advanced_merge_auto_enables_off_the_substrate_l_bit() {
+    // The Advanced driver advertises pair-split via a GRE-substrate keepalive (gated on
+    // split being active); the receiver reads its L bit and enables merge=auto.
+    run_merge_auto(
+        Config::default()
+            .with_profile(Profile::Advanced)
+            .with_buffer(Duration::from_millis(150))
+            .with_split_mode(SplitMode::Half)
+            .with_merge_mode(MergeMode::Auto),
+    )
+    .await;
 }
 
 /// Binds `n` even ports for a bonded receiver, retrying past the probe/bind race.

@@ -15,6 +15,7 @@ mod codec_main;
 mod driver;
 mod driver_adv;
 mod driver_bonded;
+mod driver_bonded_simple;
 mod driver_main;
 #[cfg(feature = "dtls")]
 mod dtls_transport;

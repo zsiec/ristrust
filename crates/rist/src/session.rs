@@ -25,6 +25,7 @@ use crate::config::{Config, NackType, Profile};
 use crate::driver::{Driver, SimpleInbound};
 use crate::driver_adv::AdvDriver;
 use crate::driver_bonded::{BondedDriver, PathParts};
+use crate::driver_bonded_simple::{BondedSimpleDriver, SimplePathParts};
 use crate::driver_main::{EapRole, MainDriver, MainInbound};
 use crate::fec::FecState;
 use crate::peer::Peer;
@@ -1105,18 +1106,14 @@ fn require_main(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-/// The gate for the single-socket (Main/Advanced) bonded driver: admits Main and
-/// Advanced (the Simple even/odd pair bonds through its own driver), rejects DTLS, and
+/// The gate for SMPTE 2022-7 bonding, now on all three profiles (Simple bonds through
+/// the even/odd [`BondedSimpleDriver`](crate::driver_bonded_simple); Main/Advanced
+/// through the single-socket [`BondedDriver`](crate::driver_bonded)). Rejects DTLS, and
 /// rejects EAP-SRP on Advanced — Advanced bonding keys media through ONE shared adv
 /// codec, which cannot hold the per-path SRP session keys, so it requires a shared PSK
 /// (or cleartext).
+#[cfg_attr(not(feature = "dtls"), allow(clippy::unnecessary_wraps))]
 fn require_bondable(cfg: &Config) -> io::Result<()> {
-    if cfg.profile == Profile::Simple {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "rist: this bonded transport requires the Main or Advanced profile",
-        ));
-    }
     #[cfg(feature = "dtls")]
     if cfg.dtls.is_some() {
         return Err(io::Error::new(
@@ -1157,6 +1154,50 @@ pub(crate) fn build_bonded_sender(
     })?;
     let ssrc = random_even_ssrc();
     let start_seq = random_start_seq();
+
+    // Simple bonds through the even/odd BondedSimpleDriver (one shared socket pair fans
+    // RTP media to each path's media port; NACKs return on the shared RTCP socket).
+    if cfg.profile == Profile::Simple {
+        let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
+        let mut group = bonding_group(cfg);
+        let egress = crate::multicast::sender_egress(cfg, first_remote)?;
+        let socket = SimpleSocket::dial_ephemeral(rt, first_remote.is_ipv6(), egress.as_ref())?;
+        let local = socket.media_local()?;
+        let mut paths = Vec::with_capacity(peers.len());
+        for (i, &(remote, weight)) in peers.iter().enumerate() {
+            let mut rtcp = remote;
+            rtcp.set_port(remote.port().wrapping_add(1));
+            let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, rtcp);
+            group.add_path(u8::try_from(i).unwrap_or(u8::MAX), weight, 0);
+            paths.push(SimplePathParts {
+                socket: socket.clone(),
+                peer,
+            });
+        }
+        let (weight_tx, weight_rx) = mpsc::channel(16);
+        let (app_in, close, stats, task) = BondedSimpleDriver::spawn_sender(
+            flow,
+            group,
+            paths,
+            ssrc,
+            cname_of(cfg),
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            weight_rx,
+            RateControl::from_config(cfg),
+        );
+        return Ok(SenderSpawned {
+            local,
+            app_in,
+            weight_cmd: Some(weight_tx),
+            flow_attr_cmd: None,
+            oob_in: None,
+            oob_out: None,
+            close,
+            stats,
+            task,
+        });
+    }
     let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
     let mut group = bonding_group(cfg);
     // One shared source socket for every path (the family/egress of the first remote):
@@ -1219,15 +1260,69 @@ pub(crate) fn build_bonded_sender(
 /// reported as `local_addr`.
 ///
 /// # Errors
-/// Returns an I/O error if the profile is not Main, `locals` is empty, a port is
-/// invalid, a transport socket cannot be bound, or an invalid secret prevents PSK
-/// key derivation.
+/// Returns an I/O error if `locals` is empty, a port is invalid, a transport socket
+/// cannot be bound, or an invalid secret prevents PSK key derivation.
+// A per-profile dispatch builder (Simple even/odd vs Main/Advanced single-socket);
+// splitting it would only scatter the per-profile wiring.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_bonded_receiver(
     rt: &dyn Runtime,
     cfg: &Config,
     locals: &[SocketAddr],
 ) -> io::Result<ReceiverSpawned> {
     require_bondable(cfg)?;
+
+    // Simple bonds through the even/odd BondedSimpleDriver: one media+RTCP socket pair
+    // per path, all merged into the one flow.
+    if cfg.profile == Profile::Simple {
+        let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
+        let mut group = bonding_group(cfg);
+        let mut paths = Vec::with_capacity(locals.len());
+        let mut bound = None;
+        for (i, &local) in locals.iter().enumerate() {
+            let membership = crate::multicast::receiver_membership(cfg, local)?;
+            let socket = SimpleSocket::listen(rt, local, membership.as_ref())?;
+            let path_local = socket.media_local()?;
+            if bound.is_none() {
+                bound = Some(path_local);
+            }
+            group.add_path(
+                u8::try_from(i).unwrap_or(u8::MAX),
+                bonding::WEIGHT_DUPLICATE,
+                0,
+            );
+            paths.push(SimplePathParts {
+                socket,
+                peer: Peer::new(dur_to_micros(cfg.session_timeout)),
+            });
+        }
+        let bound = bound.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rist: bonded receiver needs at least one local address",
+            )
+        })?;
+        let (data_out, close, stats, task) = BondedSimpleDriver::spawn_receiver(
+            flow,
+            group,
+            paths,
+            DEFAULT_FLOW_SSRC,
+            cname_of(cfg),
+            bitmask_of(cfg),
+            cfg.keepalive_interval,
+            build_lqm_emitter(cfg),
+        );
+        return Ok(ReceiverSpawned {
+            local: bound,
+            data_out,
+            oob_out: None,
+            oob_in: None,
+            close,
+            stats,
+            task,
+        });
+    }
+
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let mut group = bonding_group(cfg);
     let mut paths = Vec::with_capacity(locals.len());

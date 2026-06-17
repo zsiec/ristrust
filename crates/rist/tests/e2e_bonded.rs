@@ -42,9 +42,11 @@ async fn listen_free_bonded(cfg: &Config, n: usize) -> (Receiver, Vec<String>) {
         let mut ports = Vec::with_capacity(n);
         for _ in 0..n {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-            let p = probe.local_addr().expect("probe addr").port();
+            // Even ports so the same helper serves the Simple profile (which binds an
+            // even media + odd RTCP pair); Main/Advanced accept any port.
+            let p = probe.local_addr().expect("probe addr").port() & !1;
             drop(probe);
-            if p == 0 || ports.contains(&p) {
+            if p == 0 || ports.contains(&p) || ports.contains(&(p + 1)) {
                 continue 'attempt;
             }
             ports.push(p);
@@ -166,6 +168,42 @@ async fn bonded_advanced_survives_one_path_blackhole() {
     // whole stream seamlessly.
     let body = "x".repeat(200);
     run_bonded(bonded_adv_cfg(), 2, 60, &body, |dests| {
+        Arc::new(PathTapRuntime::blackholing(dests, 0))
+    })
+    .await;
+}
+
+/// A bonded Simple-profile base config (even/odd per-path sockets).
+fn bonded_simple_cfg() -> Config {
+    Config::default()
+        .with_profile(Profile::Simple)
+        .with_buffer(Duration::from_millis(200))
+}
+
+#[tokio::test]
+async fn bonded_simple_two_paths_clean() {
+    // Simple media over two 2022-7 paths: the even/odd BondedSimpleDriver fans RTP
+    // to each path and merges the duplicate copies into one in-order stream.
+    run_bonded(bonded_simple_cfg(), 2, 60, "simple-payload", |_| {
+        Arc::new(TokioRuntime)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn bonded_simple_three_paths_clean() {
+    run_bonded(bonded_simple_cfg(), 3, 60, "simple-triple", |_| {
+        Arc::new(TokioRuntime)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn bonded_simple_survives_one_path_blackhole() {
+    // Simple 2022-7 redundancy: path 0's forward media is dropped; path 1 carries the
+    // whole stream seamlessly.
+    let body = "x".repeat(200);
+    run_bonded(bonded_simple_cfg(), 2, 60, &body, |dests| {
         Arc::new(PathTapRuntime::blackholing(dests, 0))
     })
     .await;

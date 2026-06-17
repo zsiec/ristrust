@@ -811,7 +811,10 @@ fn spawn_reader(
 /// future never resolves, so a reversed-role listener-sender holds its application
 /// media until it has learned the caller's address. A normal sender knows its peer at
 /// construction, so `ready` is always true and this is a plain receive.
-async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, ready: bool) -> Option<Bytes> {
+pub(crate) async fn recv_app_gated(
+    app_in: &mut Option<mpsc::Receiver<Bytes>>,
+    ready: bool,
+) -> Option<Bytes> {
     if !ready {
         return std::future::pending().await;
     }
@@ -822,7 +825,7 @@ async fn recv_app_gated(app_in: &mut Option<mpsc::Receiver<Bytes>>, ready: bool)
 }
 
 /// Sleeps until `at`, or never resolves when there is no pending timer.
-async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+pub(crate) async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
@@ -830,7 +833,7 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 }
 
 /// Whether sequence `a` is circularly after `b` (wrap-aware).
-fn seq_after(a: u32, b: u32) -> bool {
+pub(crate) fn seq_after(a: u32, b: u32) -> bool {
     Seq32::new(b).less(Seq32::new(a))
 }
 

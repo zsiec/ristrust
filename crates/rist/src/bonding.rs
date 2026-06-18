@@ -58,6 +58,44 @@ struct Path {
     /// Edge-detection latch: set the tick a seen path crosses into silence so the
     /// death is reported once. Cleared on the next [`Group::observe`].
     dead: bool,
+    /// Per-path media counters for [`Group::peer_snapshots`] (libRIST per-peer stats):
+    /// a receiver group fills `recv_*` as packets arrive on the path; a sender group
+    /// fills `sent_*` / `retx_*` as it fans media out. Each path uses only its role's
+    /// counters (the other stays 0).
+    recv_pkts: u64,
+    recv_bytes: u64,
+    sent_pkts: u64,
+    sent_bytes: u64,
+    retx_pkts: u64,
+    retx_bytes: u64,
+}
+
+/// A snapshot of one bonded path's per-peer statistics (libRIST `rist_stats_*_peer`),
+/// assembled by [`Group::peer_snapshots`] for the host's public `Stats.peers`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PathStats {
+    /// The stable 0-based path index.
+    pub(crate) index: u8,
+    /// The smoothed, clamped per-path RTT.
+    pub(crate) rtt: Micros,
+    /// Whether the path is currently live (seen and within the session timeout).
+    pub(crate) alive: bool,
+    /// The path's load-share weight (`0` = full 2022-7 duplication).
+    pub(crate) weight: u32,
+    /// The path's NACK-recovery priority.
+    pub(crate) priority: u32,
+    /// Media packets received on this path (receiver group; `0` on a sender).
+    pub(crate) recv_pkts: u64,
+    /// Payload bytes received on this path (receiver group).
+    pub(crate) recv_bytes: u64,
+    /// First-transmission media packets sent on this path (sender group; `0` on a receiver).
+    pub(crate) sent_pkts: u64,
+    /// First-transmission payload bytes sent on this path (sender group).
+    pub(crate) sent_bytes: u64,
+    /// Retransmitted media packets sent on this path (sender group).
+    pub(crate) retx_pkts: u64,
+    /// Retransmitted payload bytes sent on this path (sender group).
+    pub(crate) retx_bytes: u64,
 }
 
 /// A group of bonded paths feeding one flow.
@@ -124,6 +162,12 @@ impl Group {
             last_seen: Timestamp::ZERO,
             seen: false,
             dead: false,
+            recv_pkts: 0,
+            recv_bytes: 0,
+            sent_pkts: 0,
+            sent_bytes: 0,
+            retx_pkts: 0,
+            retx_bytes: 0,
         });
     }
 
@@ -148,6 +192,52 @@ impl Group {
         if let Some(p) = self.path_mut(index) {
             p.rtt = p.rtt.observe(sample);
         }
+    }
+
+    /// Counts one media packet of `bytes` payload received on `index` (a receiver
+    /// group), for the per-peer stats. Unknown indices are ignored.
+    pub(crate) fn count_recv(&mut self, index: u8, bytes: usize) {
+        if let Some(p) = self.path_mut(index) {
+            p.recv_pkts += 1;
+            p.recv_bytes += bytes as u64;
+        }
+    }
+
+    /// Counts one media packet of `bytes` payload sent on `index` (a sender group),
+    /// split into the first-transmission or retransmission tallies by `retransmit`.
+    /// Unknown indices are ignored.
+    pub(crate) fn count_sent(&mut self, index: u8, bytes: usize, retransmit: bool) {
+        if let Some(p) = self.path_mut(index) {
+            if retransmit {
+                p.retx_pkts += 1;
+                p.retx_bytes += bytes as u64;
+            } else {
+                p.sent_pkts += 1;
+                p.sent_bytes += bytes as u64;
+            }
+        }
+    }
+
+    /// A snapshot of every registered path's per-peer statistics (RTT, liveness,
+    /// weight/priority, and the media counters), in registration order — the host
+    /// assembles the public `Stats.peers` from these. `now` resolves liveness.
+    pub(crate) fn peer_snapshots(&self, now: Timestamp) -> Vec<PathStats> {
+        self.paths
+            .iter()
+            .map(|p| PathStats {
+                index: p.index,
+                rtt: p.rtt.clamped(self.rtt_min, self.rtt_max),
+                alive: p.seen && (now - p.last_seen) <= self.timeout,
+                weight: p.weight,
+                priority: p.priority,
+                recv_pkts: p.recv_pkts,
+                recv_bytes: p.recv_bytes,
+                sent_pkts: p.sent_pkts,
+                sent_bytes: p.sent_bytes,
+                retx_pkts: p.retx_pkts,
+                retx_bytes: p.retx_bytes,
+            })
+            .collect()
     }
 
     /// Whether `index` is currently live: seen at least once and not silent past

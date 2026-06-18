@@ -50,7 +50,7 @@ pub use sender::{
     dial_bonded_weighted_with, dial_bonded_with, dial_with, listen_sender, listen_sender_with,
 };
 pub use split::{MergeMode, SplitMode};
-pub use stats::Stats;
+pub use stats::{PeerStats, Stats};
 pub use url::parse_url;
 
 /// The AES key size for PSK encryption, re-exported for use with

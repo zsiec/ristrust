@@ -26,7 +26,7 @@ use rist_codec::rtcp::{
     EmptyReceiverReport, LinkQualityReport, Packet as RtcpPacket, SenderReport,
 };
 use rist_codec::{eap, fec_header, gre, rtp};
-use rist_core::clock::Timestamp;
+use rist_core::clock::{Micros, Ntp64, Timestamp};
 use rist_core::fec::{Direction, Recovered};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::seq::Seq32;
@@ -44,6 +44,7 @@ use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
 use crate::split::{self, MergeMode, Merger, SplitMode};
+use crate::stats::PeerStats;
 use crate::stats::StatsCell;
 
 /// The largest datagram a path reader will receive.
@@ -519,6 +520,7 @@ impl BondedDriver {
                 if let Some(e) = self.lqm.as_mut() {
                     e.meter(pkt.payload.len(), pkt.retransmit);
                 }
+                self.group.count_recv(path_id, pkt.payload.len());
                 self.flow.feed(now, path_id, pkt);
             }
             Ok(Decoded::Feedback(fbs)) => {
@@ -528,6 +530,7 @@ impl BondedDriver {
                             r.handle(&lqm);
                         }
                     } else {
+                        self.observe_path_rtt(path_id, now, &fb);
                         self.flow.feed_feedback(now, fb);
                     }
                 }
@@ -643,6 +646,7 @@ impl BondedDriver {
                     }
                     // Feed on this path's index: the one ring dedups copies from the
                     // other paths by `(seq, source_time)`.
+                    self.group.count_recv(path_id, pkt.payload.len());
                     self.flow.feed(now, path_id, pkt);
                     if let Some((seq, wts, ssrc, payload)) = fec_input {
                         let recovered = self
@@ -662,6 +666,7 @@ impl BondedDriver {
                                 r.handle(&lqm);
                             }
                         } else {
+                            self.observe_path_rtt(path_id, now, &fb);
                             self.flow.feed_feedback(now, fb);
                         }
                     }
@@ -768,7 +773,31 @@ impl BondedDriver {
                 }
             }
         }
-        self.stats.publish(self.flow.stats(), self.fec_recovered());
+        let peers = self
+            .group
+            .peer_snapshots(now)
+            .into_iter()
+            .map(PeerStats::from)
+            .collect();
+        self.stats
+            .publish_peers(self.flow.stats(), self.fec_recovered(), peers);
+    }
+
+    /// Folds a per-path RTT sample into the bonding group when `fb` is an RTT-echo
+    /// response (the same `now - echoed - processing_delay` measure the flow core uses
+    /// for its aggregate estimator), so the per-peer stats and NACK-peer tie-break see
+    /// a real per-path RTT. A no-op for any other feedback.
+    fn observe_path_rtt(&mut self, path_id: u8, now: Timestamp, fb: &Feedback) {
+        if let Feedback::RttEchoResponse {
+            timestamp,
+            processing_delay,
+            ..
+        } = fb
+        {
+            let sent = Ntp64::from_bits(*timestamp).to_timestamp();
+            let sample = (now - sent) - Micros::from_micros(i64::from(*processing_delay));
+            self.group.observe_rtt(path_id, sample);
+        }
     }
 
     /// Splits one outbound application payload across a consecutive even/odd sequence
@@ -927,6 +956,14 @@ impl BondedDriver {
         };
         match self.paths[i].codec.encode_media(pkt) {
             Ok(bytes) => {
+                // Per-path sent stat (libRIST per-peer): count the media handed to this
+                // path's socket, split first-tx vs retransmit. (The shared-adv-codec fan
+                // and FEC fan are not metered per path.)
+                self.group.count_sent(
+                    u8::try_from(i).unwrap_or(u8::MAX),
+                    pkt.payload.len(),
+                    pkt.retransmit,
+                );
                 let sock = self.paths[i].socket.clone();
                 if let Err(e) = sock.send(&bytes, dst).await {
                     tracing::debug!(

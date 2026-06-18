@@ -9,10 +9,40 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Per-peer (per-path) statistics for one bonded path, or the single peer of a
+/// non-bonded session — the libRIST `rist_stats_*_peer` analog, surfaced in
+/// [`Stats::peers`]. A receiver session fills the `received_*` counters; a sender
+/// session fills `sent_*` / `retransmitted_*`; `rtt` is per-path.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct PeerStats {
+    /// The smoothed per-path round-trip time (the flow RTT on a non-bonded session).
+    pub rtt: Duration,
+    /// Media packets received from this peer (receiver session).
+    pub received: u64,
+    /// Payload bytes received from this peer (receiver session).
+    pub received_bytes: u64,
+    /// First-transmission media packets sent to this peer (sender session).
+    pub sent: u64,
+    /// First-transmission payload bytes sent to this peer (sender session).
+    pub sent_bytes: u64,
+    /// Retransmitted media packets sent to this peer (sender session).
+    pub retransmitted: u64,
+    /// Retransmitted payload bytes sent to this peer (sender session).
+    pub retransmitted_bytes: u64,
+    /// The path's SMPTE 2022-7 load-share weight (`0` = full duplication, or the
+    /// single non-bonded peer).
+    pub weight: u32,
+    /// The path's NACK-recovery priority (`0` on the single non-bonded peer).
+    pub priority: u32,
+    /// Whether the path is currently live. Always `true` for the single non-bonded peer.
+    pub alive: bool,
+}
+
 /// A snapshot of a [`Sender`](crate::Sender)'s or [`Receiver`](crate::Receiver)'s
 /// counters and gauges, read via their `stats()` method. Sender-only and
 /// receiver-only fields are zero on the other role.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Stats {
     // --- Receiver ---
@@ -110,6 +140,10 @@ pub struct Stats {
     /// running mean of the dynamic buffer, equal to the static buffer when not
     /// windowed, and zero on a sender.
     pub avg_buffer_time: Duration,
+    /// Per-peer (per-path) statistics (libRIST `rist_stats_*_peer`). A non-bonded
+    /// session reports exactly one peer mirroring the flow; a bonded session reports
+    /// one per path with its own RTT, counters, weight, and liveness.
+    pub peers: Vec<PeerStats>,
 }
 
 impl From<rist_core::flow::Stats> for Stats {
@@ -166,17 +200,45 @@ impl From<rist_core::flow::Stats> for Stats {
             avg_buffer_time: Duration::from_micros(
                 u64::try_from(f.avg_buffer_time_us).unwrap_or(0),
             ),
+            // Left empty here so the per-input publish stays allocation-free; the
+            // single-peer default is materialized lazily at read time (see
+            // `StatsCell::snapshot`), and a bonded driver supplies its per-path list.
+            peers: Vec::new(),
         }
     }
 }
 
 impl Stats {
+    /// Builds the single-peer view of a non-bonded session from the flow aggregate —
+    /// the libRIST single-peer case. Materialized at read time so the hot publish path
+    /// never allocates a peer vector.
+    fn single_peer(&self) -> PeerStats {
+        PeerStats {
+            rtt: self.rtt,
+            received: self.received,
+            received_bytes: self.received_bytes,
+            sent: self.sent,
+            sent_bytes: self.sent_bytes,
+            retransmitted: self.retransmitted,
+            retransmitted_bytes: self.retransmitted_bytes,
+            weight: 0,
+            priority: 0,
+            alive: true,
+        }
+    }
+
     /// Serializes the snapshot to a flat JSON object (libRIST's `stats_json` analog),
     /// every counter and gauge as a field. Hand-rolled to avoid a serialization
     /// dependency; the byte counts and gauges round-trip as integers, `quality` and
     /// `rtt_us` as numbers.
     #[must_use]
     pub fn to_json(&self) -> String {
+        let peers_json = self
+            .peers
+            .iter()
+            .map(PeerStats::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
             concat!(
                 "{{",
@@ -189,7 +251,8 @@ impl Stats {
                 "\"retransmit_skipped\":{},\"retransmit_suppressed\":{},",
                 "\"retransmit_exhausted\":{},\"bandwidth_skipped\":{},",
                 "\"rtt_us\":{},\"bandwidth_bps\":{},\"retry_bandwidth_bps\":{},\"quality\":{:.3},",
-                "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{},\"avg_buffer_time_us\":{}",
+                "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{},\"avg_buffer_time_us\":{},",
+                "\"peers\":[{}]",
                 "}}"
             ),
             self.received,
@@ -227,6 +290,50 @@ impl Stats {
             self.inter_packet_cur.as_micros(),
             self.inter_packet_max.as_micros(),
             self.avg_buffer_time.as_micros(),
+            peers_json,
+        )
+    }
+}
+
+impl From<crate::bonding::PathStats> for PeerStats {
+    /// Maps one bonded path's [`PathStats`](crate::bonding::PathStats) snapshot to the
+    /// public per-peer form.
+    fn from(p: crate::bonding::PathStats) -> PeerStats {
+        PeerStats {
+            rtt: Duration::from_micros(u64::try_from(p.rtt.as_micros()).unwrap_or(0)),
+            received: p.recv_pkts,
+            received_bytes: p.recv_bytes,
+            sent: p.sent_pkts,
+            sent_bytes: p.sent_bytes,
+            retransmitted: p.retx_pkts,
+            retransmitted_bytes: p.retx_bytes,
+            weight: p.weight,
+            priority: p.priority,
+            alive: p.alive,
+        }
+    }
+}
+
+impl PeerStats {
+    /// Serializes one peer to a flat JSON object for [`Stats::to_json`]'s `peers` array.
+    #[must_use]
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"rtt_us\":{},\"received\":{},\"received_bytes\":{},",
+                "\"sent\":{},\"sent_bytes\":{},\"retransmitted\":{},\"retransmitted_bytes\":{},",
+                "\"weight\":{},\"priority\":{},\"alive\":{}}}"
+            ),
+            self.rtt.as_micros(),
+            self.received,
+            self.received_bytes,
+            self.sent,
+            self.sent_bytes,
+            self.retransmitted,
+            self.retransmitted_bytes,
+            self.weight,
+            self.priority,
+            self.alive,
         )
     }
 }
@@ -259,14 +366,37 @@ impl StatsCell {
     // the ~272-byte snapshot by value (to feed the by-value `From`) is not worth a ref.
     #[allow(clippy::large_types_passed_by_value)]
     pub(crate) fn publish(&self, core: rist_core::flow::Stats, fec_recovered: u64) {
+        self.publish_peers(core, fec_recovered, Vec::new());
+    }
+
+    /// Like [`publish`](Self::publish), but replaces the single-peer default with an
+    /// explicit per-path peer list (a bonded driver passes one entry per path). An
+    /// empty `peers` keeps the flow-derived single peer.
+    #[allow(clippy::large_types_passed_by_value)]
+    pub(crate) fn publish_peers(
+        &self,
+        core: rist_core::flow::Stats,
+        fec_recovered: u64,
+        peers: Vec<PeerStats>,
+    ) {
         let mut snapshot: Stats = core.into();
         snapshot.fec_recovered = fec_recovered;
+        if !peers.is_empty() {
+            snapshot.peers = peers;
+        }
         *self.0.stats.lock().expect("stats mutex poisoned") = snapshot;
     }
 
-    /// Reads the latest published snapshot (all-zero until the first publish).
+    /// Reads the latest published snapshot (all-zero until the first publish). A
+    /// non-bonded session's `peers` is empty in the stored snapshot (kept so the hot
+    /// publish never allocates) and is materialized here, on this rare read path, as
+    /// the single peer mirroring the flow.
     pub(crate) fn snapshot(&self) -> Stats {
-        *self.0.stats.lock().expect("stats mutex poisoned")
+        let mut s = self.0.stats.lock().expect("stats mutex poisoned").clone();
+        if s.peers.is_empty() {
+            s.peers.push(s.single_peer());
+        }
+        s
     }
 
     /// Records whether the session is currently authenticated (driver-side).

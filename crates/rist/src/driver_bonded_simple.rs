@@ -22,7 +22,7 @@ use tokio::time::MissedTickBehavior;
 use rist_codec::rtcp::{
     EmptyReceiverReport, LinkQualityReport, Packet as RtcpPacket, SenderReport,
 };
-use rist_core::clock::Timestamp;
+use rist_core::clock::{Micros, Ntp64, Timestamp};
 use rist_core::flow::{Event, Flow, Output, TimerId};
 use rist_core::wire::Feedback;
 
@@ -36,7 +36,7 @@ use crate::driver::{
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
 use crate::split::{self, MergeMode, Merger, SplitMode};
-use crate::stats::StatsCell;
+use crate::stats::{PeerStats, StatsCell};
 
 /// The largest datagram a path reader will receive.
 const RECV_BUF: usize = 65_536;
@@ -441,6 +441,7 @@ impl BondedSimpleDriver {
                     if let Some(e) = self.lqm.as_mut() {
                         e.meter(pkt.payload.len(), pkt.retransmit);
                     }
+                    self.group.count_recv(path_id, pkt.payload.len());
                     self.flow.feed(now, path_id, pkt);
                 }
             }
@@ -457,6 +458,7 @@ impl BondedSimpleDriver {
                                 r.handle(&lqm);
                             }
                         } else {
+                            self.observe_path_rtt(path_id, now, &fb);
                             self.flow.feed_feedback(now, fb);
                         }
                     }
@@ -481,9 +483,13 @@ impl BondedSimpleDriver {
                     match codec::encode_media(&pkt) {
                         Ok(bytes) => {
                             for idx in targets {
+                                self.group
+                                    .count_sent(idx, pkt.payload.len(), pkt.retransmit);
                                 self.send_media_on(idx as usize, &bytes).await;
                             }
                             if let Some(idx) = weighted {
+                                self.group
+                                    .count_sent(idx, pkt.payload.len(), pkt.retransmit);
                                 self.send_media_on(idx as usize, &bytes).await;
                             }
                         }
@@ -525,7 +531,30 @@ impl BondedSimpleDriver {
                 }
             }
         }
-        self.stats.publish(self.flow.stats(), 0);
+        let peers = self
+            .group
+            .peer_snapshots(now)
+            .into_iter()
+            .map(PeerStats::from)
+            .collect();
+        self.stats.publish_peers(self.flow.stats(), 0, peers);
+    }
+
+    /// Folds a per-path RTT sample into the bonding group when `fb` is an RTT-echo
+    /// response (the `now - echoed - processing_delay` measure the flow core uses), so
+    /// the per-peer stats and NACK-peer tie-break see a real per-path RTT. A no-op for
+    /// any other feedback.
+    fn observe_path_rtt(&mut self, path_id: u8, now: Timestamp, fb: &Feedback) {
+        if let Feedback::RttEchoResponse {
+            timestamp,
+            processing_delay,
+            ..
+        } = fb
+        {
+            let sent = Ntp64::from_bits(*timestamp).to_timestamp();
+            let sample = (now - sent) - Micros::from_micros(i64::from(*processing_delay));
+            self.group.observe_rtt(path_id, sample);
+        }
     }
 
     /// Splits one outbound application payload across a consecutive even/odd sequence

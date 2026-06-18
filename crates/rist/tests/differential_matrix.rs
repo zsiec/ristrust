@@ -489,13 +489,17 @@ fn adv_lz4() -> Scenario {
 const SRP_USER: &str = "diff-srp-user";
 const SRP_PASS: &str = "diff-srp-password";
 
-// Only the *combined* EAP-SRP-plus-PSK-secret mode is cross-stack interoperable, so
-// every SRP scenario here sets a `secret`. The pure-SRP (no-secret,
-// use_key_as_passphrase) mode keys the media from the SRP session key K; a libRIST /
-// ristgo listener rejects it ("configured without keysize") because its keysize gate
-// inspects the PSK passphrase, not the SRP-derived key — so it is a ristrust↔ristrust
-// (and ristgo↔ristgo) mode, covered by the in-crate e2e tests, not here. EAP-SRP is
-// also Main-only on both stacks, so there is no Advanced SRP case.
+// EAP-SRP cross-stack status (both single-flow and bonded):
+//   - Combined PSK+SRP (a `secret` is set): fully cross-stack interoperable — the media
+//     rides one shared PSK key, so SRP only gates. Covered here (single-flow main_srp and
+//     bonded bonded_main_srp_psk).
+//   - Pure-SRP (no secret, use_key_as_passphrase): the media is keyed from the SRP session
+//     key K. Single-flow pure-SRP IS interoperable (verified against libRIST in the interop
+//     suite). Bonded pure-SRP re-keys EACH path to its OWN K on a per-path codec, and
+//     ristrust's and ristgo's per-path keying do not yet agree on the wire — so bonded
+//     pure-SRP is implemented within each stack (ristrust↔ristrust and ristgo↔ristgo
+//     in-crate e2e) but not yet cross-stack (the #[ignore]d diff_bonded_main_srp_pure_*).
+// EAP-SRP is Main-only on both stacks, so there is no Advanced SRP case.
 
 /// Main profile, EAP-SRP authentication with an AES-256 PSK secret (the libRIST-
 /// interoperable combined mode): SRP gates the session, the secret keys the media.
@@ -909,6 +913,26 @@ fn bonded_main_aes() -> Scenario {
         ..base(Profile::Main, 1)
     }
 }
+/// Main profile, bonded, combined PSK+SRP (a secret keys the media, SRP gates each path).
+/// Cross-stack interoperable: both stacks carry every path on one shared PSK codec.
+fn bonded_main_srp_psk() -> Scenario {
+    Scenario {
+        secret: Some(SECRET),
+        aes: Some(AesKeyBits::Aes256),
+        srp: Some((SRP_USER, SRP_PASS)),
+        ..base(Profile::Main, 1)
+    }
+}
+/// Main profile, bonded, pure-SRP (use_key_as_passphrase: SRP credentials, NO secret).
+/// Each path derives its own session key K and keys its media with it on a per-path codec.
+/// Implemented within each stack (ristrust↔ristrust and ristgo↔ristgo, covered by the
+/// in-crate e2e tests) but NOT yet cross-stack interoperable — see the #[ignore]d tests.
+fn bonded_main_srp_pure() -> Scenario {
+    Scenario {
+        srp: Some((SRP_USER, SRP_PASS)),
+        ..base(Profile::Main, 1)
+    }
+}
 
 #[tokio::test]
 async fn diff_bonded_main_ristgo_rx() {
@@ -951,6 +975,50 @@ async fn diff_bonded_main_aes_ristrust_rx() {
     bonded_ristrust_rx_from_tx(
         "bonded main/aes ristrust-rx",
         bonded_main_aes(),
+        BONDED_PATHS,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_bonded_main_srp_psk_ristgo_rx() {
+    bonded_rx_from_ristrust_tx(
+        "bonded main PSK+SRP ristgo-rx",
+        bonded_main_srp_psk(),
+        BONDED_PATHS,
+    )
+    .await;
+}
+#[tokio::test]
+async fn diff_bonded_main_srp_psk_ristrust_rx() {
+    bonded_ristrust_rx_from_tx(
+        "bonded main PSK+SRP ristrust-rx",
+        bonded_main_srp_psk(),
+        BONDED_PATHS,
+    )
+    .await;
+}
+// Pure-SRP (no-secret) bonding is implemented within each stack but is NOT yet cross-stack
+// interoperable: each path re-keys its media to its own SRP session key K on a per-path
+// codec, and ristrust's and ristgo's per-path keying do not yet agree on the wire (the
+// PSK+SRP bonded case above, on one shared key, does interoperate). Kept as runnable repros
+// of the gap; ristgo↔ristgo and ristrust↔ristrust pure-SRP bonded are covered by in-crate
+// e2e tests.
+#[tokio::test]
+#[ignore = "cross-stack pure-SRP bonded per-path keying not yet interoperable (within-stack only)"]
+async fn diff_bonded_main_srp_pure_ristgo_rx() {
+    bonded_rx_from_ristrust_tx(
+        "bonded main pure-SRP ristgo-rx",
+        bonded_main_srp_pure(),
+        BONDED_PATHS,
+    )
+    .await;
+}
+#[tokio::test]
+#[ignore = "cross-stack pure-SRP bonded per-path keying not yet interoperable (within-stack only)"]
+async fn diff_bonded_main_srp_pure_ristrust_rx() {
+    bonded_ristrust_rx_from_tx(
+        "bonded main pure-SRP ristrust-rx",
+        bonded_main_srp_pure(),
         BONDED_PATHS,
     )
     .await;

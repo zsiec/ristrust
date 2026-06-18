@@ -28,6 +28,9 @@ pub struct Stats {
     pub lost: u64,
     /// Packets recovered by retransmission after a NACK.
     pub recovered: u64,
+    /// The subset of [`recovered`](Stats::recovered) that cleared on the first NACK
+    /// (libRIST `recovered_one_retry`) — a high ratio indicates a healthy link.
+    pub recovered_one_retry: u64,
     /// Packets reconstructed by SMPTE ST 2022-1 / 2022-5 FEC (no NACK round trip),
     /// distinct from [`recovered`](Stats::recovered) (ARQ).
     pub fec_recovered: u64,
@@ -103,13 +106,21 @@ pub struct Stats {
     pub inter_packet_cur: Duration,
     /// Largest inter-packet arrival gap seen so far (libRIST `max_ips`).
     pub inter_packet_max: Duration,
+    /// The average recovery-buffer (playout) level (libRIST `avg_buffer_time`): the
+    /// running mean of the dynamic buffer, equal to the static buffer when not
+    /// windowed, and zero on a sender.
+    pub avg_buffer_time: Duration,
 }
 
 impl From<rist_core::flow::Stats> for Stats {
     /// Maps the flow core's counters and gauges to the curated public snapshot. The
     /// host-tracked `fec_recovered` count is layered on at publish time (the flow core
     /// has no FEC counter — FEC recovery is a host concern), and `quality` is derived.
-    #[allow(clippy::cast_precision_loss)] // counts well within f64's exact range here
+    #[allow(clippy::cast_precision_loss)]
+    // counts well within f64's exact range here
+    // The `From` trait fixes the by-value signature; core `Stats` is `Copy` and this
+    // runs only at snapshot time, so the ~272-byte copy is irrelevant.
+    #[allow(clippy::large_types_passed_by_value)]
     fn from(f: rist_core::flow::Stats) -> Stats {
         let expected = f.received + f.lost;
         let quality = if expected == 0 {
@@ -123,6 +134,7 @@ impl From<rist_core::flow::Stats> for Stats {
             delivered: f.delivered,
             lost: f.lost,
             recovered: f.recovered,
+            recovered_one_retry: f.recovered_one_retry,
             fec_recovered: 0,
             duplicates: f.duplicates,
             reordered: f.reordered,
@@ -151,6 +163,9 @@ impl From<rist_core::flow::Stats> for Stats {
             inter_packet_min: Duration::from_micros(u64::try_from(f.ips_min_us).unwrap_or(0)),
             inter_packet_cur: Duration::from_micros(u64::try_from(f.ips_cur_us).unwrap_or(0)),
             inter_packet_max: Duration::from_micros(u64::try_from(f.ips_max_us).unwrap_or(0)),
+            avg_buffer_time: Duration::from_micros(
+                u64::try_from(f.avg_buffer_time_us).unwrap_or(0),
+            ),
         }
     }
 }
@@ -166,7 +181,7 @@ impl Stats {
             concat!(
                 "{{",
                 "\"received\":{},\"received_bytes\":{},\"delivered\":{},\"lost\":{},",
-                "\"recovered\":{},\"fec_recovered\":{},\"duplicates\":{},\"reordered\":{},",
+                "\"recovered\":{},\"recovered_one_retry\":{},\"fec_recovered\":{},\"duplicates\":{},\"reordered\":{},",
                 "\"too_late\":{},\"too_late_retransmit\":{},\"retransmitted_received\":{},",
                 "\"clock_resync\":{},\"missing\":{},\"nacks_sent\":{},\"abandoned\":{},",
                 "\"overwritten\":{},\"flow_resets\":{},\"discontinuities\":{},",
@@ -174,7 +189,7 @@ impl Stats {
                 "\"retransmit_skipped\":{},\"retransmit_suppressed\":{},",
                 "\"retransmit_exhausted\":{},\"bandwidth_skipped\":{},",
                 "\"rtt_us\":{},\"bandwidth_bps\":{},\"retry_bandwidth_bps\":{},\"quality\":{:.3},",
-                "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{}",
+                "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{},\"avg_buffer_time_us\":{}",
                 "}}"
             ),
             self.received,
@@ -182,6 +197,7 @@ impl Stats {
             self.delivered,
             self.lost,
             self.recovered,
+            self.recovered_one_retry,
             self.fec_recovered,
             self.duplicates,
             self.reordered,
@@ -210,6 +226,7 @@ impl Stats {
             self.inter_packet_min.as_micros(),
             self.inter_packet_cur.as_micros(),
             self.inter_packet_max.as_micros(),
+            self.avg_buffer_time.as_micros(),
         )
     }
 }
@@ -238,6 +255,9 @@ pub(crate) struct StatsCell(Arc<CellInner>);
 impl StatsCell {
     /// Publishes the flow core's current counters as the latest snapshot, layering on
     /// the host-tracked SMPTE ST 2022-1 FEC-recovered count (0 when FEC is off).
+    // Core `Stats` is `Copy` and `publish` is called ~once per status tick, so taking
+    // the ~272-byte snapshot by value (to feed the by-value `From`) is not worth a ref.
+    #[allow(clippy::large_types_passed_by_value)]
     pub(crate) fn publish(&self, core: rist_core::flow::Stats, fec_recovered: u64) {
         let mut snapshot: Stats = core.into();
         snapshot.fec_recovered = fec_recovered;
@@ -282,6 +302,8 @@ mod tests {
         core.received_bytes = 90 * 1316;
         core.lost = 10;
         core.recovered = 5;
+        core.recovered_one_retry = 4;
+        core.avg_buffer_time_us = 600_000;
         core.sent = 100;
         core.sent_bytes = 100 * 1316;
         core.retransmitted = 7;
@@ -306,6 +328,8 @@ mod tests {
         assert_eq!(s.inter_packet_min, Duration::from_micros(3_000));
         assert_eq!(s.inter_packet_cur, Duration::from_micros(4_000));
         assert_eq!(s.inter_packet_max, Duration::from_micros(9_000));
+        assert_eq!(s.recovered_one_retry, 4);
+        assert_eq!(s.avg_buffer_time, Duration::from_micros(600_000));
         // quality = 100 * received / (received + lost) = 100 * 90 / 100 = 90.0.
         assert!((s.quality - 90.0).abs() < 1e-9, "quality = {}", s.quality);
     }
@@ -322,6 +346,8 @@ mod tests {
         core.received = 3;
         core.sent_bytes = 4096;
         core.smoothed_rtt_us = 5_000;
+        core.recovered_one_retry = 2;
+        core.avg_buffer_time_us = 700_000;
         let s: Stats = core.into();
         let j = s.to_json();
         assert!(j.starts_with('{') && j.ends_with('}'));
@@ -332,6 +358,8 @@ mod tests {
             "\"bandwidth_bps\":0",
             "\"quality\":100.000",
             "\"ips_max_us\":0",
+            "\"recovered_one_retry\":2",
+            "\"avg_buffer_time_us\":700000",
         ] {
             assert!(j.contains(key), "JSON missing {key:?}: {j}");
         }

@@ -120,6 +120,11 @@ pub struct Stats {
     pub ips_cur_us: i64,
     /// Largest inter-packet arrival gap seen so far, microseconds (libRIST `max_ips`).
     pub ips_max_us: i64,
+    /// The average receiver recovery-buffer (playout) level in microseconds — libRIST's
+    /// `avg_buffer_time`. The running mean of the dynamic recovery buffer, sampled on
+    /// each ~100 ms receiver recalc tick; equals the static buffer when the buffer is
+    /// not windowed, and 0 on a sender flow.
+    pub avg_buffer_time_us: i64,
 
     // --- Receiver half ---
     /// Media packets accepted into the receiver ring (first copies and accepted
@@ -162,6 +167,10 @@ pub struct Stats {
     pub nacks_sent: u64,
     /// Missing entries removed because the packet arrived after at least one NACK.
     pub recovered: u64,
+    /// The subset of [`recovered`](Self::recovered) filled after exactly one NACK —
+    /// libRIST's `recovered_one_retry`. A high ratio of this to `recovered` means
+    /// losses are clearing on the first retransmission request (a healthy link).
+    pub recovered_one_retry: u64,
     /// Missing entries given up on (after max retries or ageing past the window).
     pub abandoned: u64,
     /// Packets handed to the application via [`Event::Deliver`].

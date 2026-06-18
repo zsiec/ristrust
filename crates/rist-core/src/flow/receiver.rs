@@ -174,6 +174,13 @@ pub(super) struct ReceiverState {
     ips_min_us: i64,
     ips_cur_us: i64,
     ips_max_us: i64,
+
+    /// Running mean of the recovery-buffer level (libRIST `avg_buffer_time`), sampled
+    /// once per recalc tick (~100 ms) in [`auto_scale_buffer`](Self::auto_scale_buffer).
+    /// The gauge is `buffer_time_sum / buffer_time_samples`; before the first sample the
+    /// flow reports the current static buffer instead.
+    buffer_time_sum: i64,
+    buffer_time_samples: u64,
 }
 
 impl ReceiverState {
@@ -208,6 +215,8 @@ impl ReceiverState {
             ips_min_us: i64::MAX,
             ips_cur_us: 0,
             ips_max_us: 0,
+            buffer_time_sum: 0,
+            buffer_time_samples: 0,
         }
     }
 
@@ -358,6 +367,20 @@ impl Flow {
             self.receiver.ips_min_us
         };
         (min, self.receiver.ips_cur_us, self.receiver.ips_max_us)
+    }
+
+    /// The average recovery-buffer (playout) level in microseconds — the libRIST
+    /// `avg_buffer_time` gauge. The running mean of the dynamic buffer sampled per
+    /// recalc tick; before the first sample (or on a sender) it reports the current
+    /// static buffer so the gauge is never a misleading `0`.
+    pub(crate) fn avg_buffer_time_us(&self) -> i64 {
+        if self.role != Role::Receiver {
+            return 0;
+        }
+        if self.receiver.buffer_time_samples == 0 {
+            return self.recovery_buffer.as_micros();
+        }
+        self.receiver.buffer_time_sum / self.receiver.buffer_time_samples as i64
     }
 
     /// Samples the inter-packet arrival gap from the previous arrival, updating the
@@ -588,7 +611,17 @@ impl Flow {
     /// rate-limited.
     #[allow(clippy::cast_precision_loss)]
     pub(super) fn auto_scale_buffer(&mut self) {
-        if self.role != Role::Receiver || self.cfg.rtt_multiplier == 0 {
+        if self.role != Role::Receiver {
+            return;
+        }
+        // Sample the live recovery-buffer level for the avg_buffer_time gauge on every
+        // recalc tick (~100 ms), whether or not the dynamic scaling below proceeds — a
+        // static or scaling-disabled buffer still contributes its constant level to the
+        // running mean.
+        self.receiver.buffer_time_sum += self.recovery_buffer.as_micros();
+        self.receiver.buffer_time_samples += 1;
+
+        if self.cfg.rtt_multiplier == 0 {
             return;
         }
         if self.cfg.recovery_buffer_min.as_micros() == self.cfg.recovery_buffer_max.as_micros() {
@@ -836,6 +869,9 @@ impl Flow {
             if filled && slot_seq == e.seq {
                 if e.nack_count > 0 {
                     self.stats.recovered += 1;
+                    if e.nack_count == 1 {
+                        self.stats.recovered_one_retry += 1;
+                    }
                 }
                 continue; // recovered: remove
             }
@@ -1183,6 +1219,43 @@ mod tests {
             ms(500).as_micros(),
             "non-windowed never scales"
         );
+    }
+
+    #[test]
+    fn avg_buffer_time_tracks_the_recovery_buffer() {
+        // A static (non-windowed) receiver: the gauge reports the constant buffer even
+        // before any sample, and stays there as recalc ticks accumulate.
+        let mut cfg = Config::librist_defaults();
+        cfg.recovery_buffer_min = ms(500);
+        cfg.recovery_buffer_max = ms(500);
+        let mut f = Flow::new(Role::Receiver, cfg);
+        assert_eq!(
+            f.avg_buffer_time_us(),
+            ms(500).as_micros(),
+            "pre-sample static"
+        );
+        for _ in 0..4 {
+            f.auto_scale_buffer(); // samples 500ms each tick, never scales
+        }
+        assert_eq!(f.avg_buffer_time_us(), ms(500).as_micros(), "static mean");
+
+        // A windowed receiver that scales 600 -> 715ms: the running mean lies between
+        // the two sampled levels (600 sampled first, then 715).
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer(); // samples 600 (pre-scale), then grows to 715
+        f.auto_scale_buffer(); // samples 715
+        let avg = f.avg_buffer_time_us();
+        assert_eq!(
+            avg,
+            i64::midpoint(ms(600).as_micros(), ms(715).as_micros()),
+            "windowed mean"
+        );
+
+        // A sender flow always reports 0.
+        let s = Flow::new(Role::Sender, Config::librist_defaults());
+        assert_eq!(s.avg_buffer_time_us(), 0, "sender reports 0");
     }
 
     #[test]

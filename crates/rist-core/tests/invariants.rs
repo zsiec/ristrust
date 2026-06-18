@@ -283,6 +283,9 @@ fn single_loss_recovered_with_one_retransmit() {
         "want exactly one retransmit"
     );
     assert_eq!(fab.receiver_stats().recovered, 1);
+    // The hole cleared on the first (and only) NACK, so it counts as a
+    // recovered-on-first-retry (libRIST `recovered_one_retry`).
+    assert_eq!(fab.receiver_stats().recovered_one_retry, 1);
 }
 
 /// Documents the structural limit of pure ARQ: a lost final packet has no

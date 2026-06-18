@@ -308,6 +308,7 @@ impl Flow {
         s.ips_min_us = ips_min;
         s.ips_cur_us = ips_cur;
         s.ips_max_us = ips_max;
+        s.avg_buffer_time_us = self.avg_buffer_time_us();
         s
     }
 

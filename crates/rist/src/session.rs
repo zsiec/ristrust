@@ -602,7 +602,7 @@ pub(crate) fn build_receiver(
             build_fec(cfg),
             cfg.merge_mode,
             rxctrl_rx,
-            crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
+            crate::driver_main::AuthGate::new(cfg.on_connect.clone(), cfg.on_disconnect.clone()),
             block_tx,
         );
         return Ok(ReceiverSpawned {
@@ -1333,7 +1333,7 @@ pub(crate) fn build_caller_receiver(
         None, // FEC + reversed-role deferred
         cfg.merge_mode,
         rxctrl_rx,
-        crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
+        crate::driver_main::AuthGate::new(cfg.on_connect.clone(), cfg.on_disconnect.clone()),
         None, // caller-receiver: no per-packet block delivery
     );
     Ok(ReceiverSpawned {
@@ -1718,6 +1718,7 @@ pub(crate) fn build_bonded_receiver(
         rxctrl_rx,
         peer_rx,
         path_factory,
+        crate::driver_main::AuthGate::new(cfg.on_connect.clone(), cfg.on_disconnect.clone()),
     );
     Ok(ReceiverSpawned {
         local: bound,

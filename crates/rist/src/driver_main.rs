@@ -30,7 +30,7 @@ use rist_core::wire::{Feedback, FragRole, MediaPacket};
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::config::{ConnectCallback, ConnectInfo};
+use crate::config::{ConnectCallback, ConnectInfo, DisconnectCallback};
 use crate::driver::{
     AppBlock, COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, MediaBlock, RxControl,
     recv_opt,
@@ -165,31 +165,52 @@ impl EapRole {
 /// the driver loop turns into an auth teardown. Absent a callback, every peer is admitted.
 pub(crate) struct AuthGate {
     connect: Option<ConnectCallback>,
+    disconnect: Option<DisconnectCallback>,
     rejected: bool,
+    /// The admitted peer's connect-time info, retained to pass to the disconnect callback
+    /// at session end. `Some` only after a successful, accepted connect.
+    connected: Option<ConnectInfo>,
 }
 
 impl AuthGate {
-    /// Builds a gate from the optional connect callback (`None` admits every peer).
-    pub(crate) fn new(connect: Option<ConnectCallback>) -> AuthGate {
+    /// Builds a gate from the optional connect/disconnect callbacks (`None` connect admits
+    /// every peer; `None` disconnect ignores disconnections).
+    pub(crate) fn new(
+        connect: Option<ConnectCallback>,
+        disconnect: Option<DisconnectCallback>,
+    ) -> AuthGate {
         AuthGate {
             connect,
+            disconnect,
             rejected: false,
+            connected: None,
         }
     }
 
-    /// Offers a freshly-authenticated peer to the callback; returns `true` to admit. A
-    /// `false` return is latched in `rejected` for the loop to tear the session down.
-    fn admit(&mut self, info: &ConnectInfo) -> bool {
-        let ok = self.connect.as_ref().is_none_or(|cb| cb.accept(info));
-        if !ok {
+    /// Offers a freshly-authenticated peer to the connect callback; returns `true` to
+    /// admit. A `false` return is latched in `rejected` for the loop to tear the session
+    /// down; an accepted peer's `info` is retained for the disconnect callback.
+    pub(crate) fn admit(&mut self, info: ConnectInfo) -> bool {
+        let ok = self.connect.as_ref().is_none_or(|cb| cb.accept(&info));
+        if ok {
+            self.connected = Some(info);
+        } else {
             self.rejected = true;
         }
         ok
     }
 
     /// Whether the connect callback rejected the peer.
-    fn rejected(&self) -> bool {
+    pub(crate) fn rejected(&self) -> bool {
         self.rejected
+    }
+
+    /// Fires the disconnect callback for a peer that had connected (no-op otherwise).
+    /// Called once when the session ends.
+    pub(crate) fn disconnected(&self) {
+        if let (Some(cb), Some(info)) = (&self.disconnect, &self.connected) {
+            cb.call(info);
+        }
     }
 }
 
@@ -449,7 +470,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
-            auth: AuthGate::new(None),
+            auth: AuthGate::new(None, None),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -619,7 +640,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
-            auth: AuthGate::new(None),
+            auth: AuthGate::new(None, None),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -703,7 +724,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
-            auth: AuthGate::new(None),
+            auth: AuthGate::new(None, None),
         };
         (in_tx, rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -900,6 +921,9 @@ impl MainDriver {
         if let Some(reader) = self.reader.take() {
             reader.abort();
         }
+        // Notify the host that a connected peer's session ended (libRIST disconn_cb);
+        // a no-op when the peer never connected or there is no disconnect callback.
+        self.auth.disconnected();
     }
 
     /// Dispatches one inbound datagram by the socket it arrived on.
@@ -1549,7 +1573,7 @@ impl MainDriver {
                 .and_then(EapRole::peer_username)
                 .map(str::to_owned),
         };
-        self.auth.admit(&info)
+        self.auth.admit(info)
     }
 
     async fn handle_eap(&mut self, now: Timestamp, payload: &[u8]) {

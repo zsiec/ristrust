@@ -37,6 +37,7 @@ use crate::bonding::Group;
 use crate::codec::{self};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
+use crate::config::ConnectInfo;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, RxControl, recv_opt};
 use crate::driver_adv::{adv_ctrl_ts, is_adv_framed};
 use crate::driver_main::EapRole;
@@ -184,6 +185,12 @@ pub(crate) struct BondedDriver {
     /// [`PeerCmd::Add`] can spawn a reader feeding the same channel. `None` on a sender
     /// or a non-add-capable / injected receiver.
     inbound_tx: Option<mpsc::Sender<Inbound>>,
+    /// The host connection accept/reject + disconnect gate (libRIST `rist_auth_handler_set`),
+    /// fired once when the bonded session first authenticates. A no-op without callbacks.
+    auth: crate::driver_main::AuthGate,
+    /// Whether the connect callback has already fired (the session's first path to
+    /// authenticate); the bonded session connects once even though paths auth per-path.
+    ever_connected: bool,
     /// The highest first-transmission sequence sent (shared across paths — the RTP
     /// sequence space is one stream), the NACK-widening reference.
     highest_sent: u32,
@@ -282,6 +289,8 @@ impl BondedDriver {
             peer_cmd: Some(peer_cmd),
             path_factory: Some(path_factory),
             inbound_tx: None, // sender shares one socket; runtime add needs no reader
+            auth: crate::driver_main::AuthGate::new(None, None), // a sender does not gate connects
+            ever_connected: false,
             highest_sent: start_seq,
             ssrc,
             data_out: None,
@@ -317,6 +326,7 @@ impl BondedDriver {
         rx_ctrl: mpsc::Receiver<RxControl>,
         peer_cmd: Option<mpsc::Receiver<PeerCmd>>,
         path_factory: Option<PathFactory>,
+        auth: crate::driver_main::AuthGate,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -345,6 +355,8 @@ impl BondedDriver {
             peer_cmd,
             path_factory,
             inbound_tx: None, // run() retains the inbound sender when add-capable
+            auth,
+            ever_connected: false,
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
@@ -409,6 +421,8 @@ impl BondedDriver {
             peer_cmd: None,
             path_factory: None,
             inbound_tx: None,
+            auth: crate::driver_main::AuthGate::new(None, None),
+            ever_connected: false,
             highest_sent: 0,
             ssrc,
             data_out: Some(data_tx),
@@ -505,7 +519,15 @@ impl BondedDriver {
             let authed = self.all_authed();
             tokio::select! {
                 msg = in_rx.recv() => match msg {
-                    Some(inb) => self.on_recv(inb).await,
+                    Some(inb) => {
+                        self.on_recv(inb).await;
+                        // The host connect callback rejected the session's first
+                        // authenticated peer: tear the bonded session down.
+                        if self.auth.rejected() {
+                            self.close.set_auth();
+                            break;
+                        }
+                    }
                     None => break, // every path reader has exited
                 },
                 // Hold outbound media until every path's data channel is open (a
@@ -580,6 +602,8 @@ impl BondedDriver {
                 r.abort();
             }
         }
+        // Notify the host that a connected bonded session ended (libRIST disconn_cb).
+        self.auth.disconnected();
     }
 
     /// Decodes one adv-framed (Advanced media / keepalive / NACK) datagram through the
@@ -1298,9 +1322,40 @@ impl BondedDriver {
         if let Some(wire) = reply {
             self.send_eapol(i, &wire).await;
         }
-        if self.paths[i].authed && !was_authed && !self.paths[i].codec.has_psk() {
-            self.on_authenticated(i).await;
+        if self.paths[i].authed && !was_authed {
+            // The bonded session connects once: the host connect gate fires on the first
+            // path to authenticate (all paths share the session's credentials). On reject
+            // re-gate this path (its media is dropped) and let the loop tear the session
+            // down on `auth.rejected()`.
+            if !self.ever_connected {
+                self.ever_connected = true;
+                if !self.bonded_admit(i) {
+                    self.paths[i].authed = false;
+                    return;
+                }
+            }
+            if !self.paths[i].codec.has_psk() {
+                self.on_authenticated(i).await;
+            }
         }
+    }
+
+    /// Offers path `i`'s just-authenticated peer to the host connect gate (libRIST
+    /// `rist_auth_handler_set`): builds the [`ConnectInfo`] (the path's remote + SRP
+    /// username) and returns whether it is admitted. Admits when the remote is unknown.
+    fn bonded_admit(&mut self, i: usize) -> bool {
+        let Some(remote) = self.paths[i].peer.media() else {
+            return true;
+        };
+        let info = ConnectInfo {
+            remote,
+            username: self.paths[i]
+                .eap
+                .as_ref()
+                .and_then(EapRole::peer_username)
+                .map(str::to_owned),
+        };
+        self.auth.admit(info)
     }
 
     /// On path `i` reaching authentication with no configured PSK, re-keys its data

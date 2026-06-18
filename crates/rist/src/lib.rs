@@ -33,7 +33,8 @@ pub mod split;
 mod stats;
 
 pub use config::{
-    Config, ConnectCallback, ConnectInfo, FlowAttrCallback, NackType, Profile, RateCallback,
+    Config, ConnectCallback, ConnectInfo, DisconnectCallback, FlowAttrCallback, NackType, Profile,
+    RateCallback,
 };
 pub use error::{ConfigError, Error};
 pub use fec::{FecCarriage, FecConfig, FecVariant};

@@ -104,6 +104,33 @@ impl std::fmt::Debug for ConnectCallback {
     }
 }
 
+/// A disconnection callback (libRIST `rist_auth_handler_set` disconnect callback):
+/// invoked once when a previously-connected peer's session ends — with the same
+/// [`ConnectInfo`] passed to the [`ConnectCallback`] at connect. A pure notification (no
+/// return). Only fires if the peer first connected (a session that never authenticated,
+/// or was rejected, does not fire it). The callback runs on the session task, so it must
+/// not block.
+#[derive(Clone)]
+pub struct DisconnectCallback(Arc<dyn Fn(&ConnectInfo) + Send + Sync>);
+
+impl DisconnectCallback {
+    /// Wraps `f` as a disconnect callback.
+    pub fn new(f: impl Fn(&ConnectInfo) + Send + Sync + 'static) -> DisconnectCallback {
+        DisconnectCallback(Arc::new(f))
+    }
+
+    /// Invokes the callback with the disconnected peer's connect-time info.
+    pub(crate) fn call(&self, info: &ConnectInfo) {
+        (self.0)(info);
+    }
+}
+
+impl std::fmt::Debug for DisconnectCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DisconnectCallback(..)")
+    }
+}
+
 /// The RIST profile (wire dialect) a session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -285,6 +312,11 @@ pub struct Config {
     /// handshake; returning `false` rejects (tears down) the connection. `None`
     /// (default) accepts every authenticated peer. See [`Config::with_connect_callback`].
     pub on_connect: Option<ConnectCallback>,
+    /// The disconnection notification callback (libRIST `rist_auth_handler_set`). When
+    /// set on a listener, it is invoked once with a connected peer's [`ConnectInfo`] when
+    /// that peer's session ends. `None` (default) ignores disconnections. See
+    /// [`Config::with_disconnect_callback`].
+    pub on_disconnect: Option<DisconnectCallback>,
     /// SMPTE ST 2022-1 / ST 2022-5 forward error correction (TR-06-2 §8.4 /
     /// TR-06-3 §5.3.5). When set, the sender emits row/column FEC and the receiver
     /// recovers loss with no NACK round trip; ARQ remains the backstop. Carried
@@ -366,6 +398,7 @@ impl Default for Config {
             on_rate_adapt: None,
             on_flow_attr: None,
             on_connect: None,
+            on_disconnect: None,
             fec: None,
             #[cfg(feature = "dtls")]
             dtls: None,
@@ -669,6 +702,19 @@ impl Config {
         f: impl Fn(&ConnectInfo) -> bool + Send + Sync + 'static,
     ) -> Config {
         self.on_connect = Some(ConnectCallback::new(f));
+        self
+    }
+
+    /// Sets the disconnection notification callback (libRIST `rist_auth_handler_set`) on
+    /// a listener: `f` is invoked once with a connected peer's [`ConnectInfo`] when that
+    /// peer's session ends (only if it first connected — a rejected or never-authenticated
+    /// peer does not fire it). The mirror of [`with_connect_callback`](Self::with_connect_callback).
+    #[must_use]
+    pub fn with_disconnect_callback(
+        mut self,
+        f: impl Fn(&ConnectInfo) + Send + Sync + 'static,
+    ) -> Config {
+        self.on_disconnect = Some(DisconnectCallback::new(f));
         self
     }
 

@@ -344,6 +344,28 @@ pub(crate) struct MainDriver {
     /// The host connection gate: invoked once on the listener's first authentication to
     /// accept or reject the peer. A no-op (always admit) without a configured callback.
     auth: AuthGate,
+
+    /// RTC timing mode (libRIST `RIST_TIMING_MODE_RTC`): when set on a sender, each
+    /// first-transmit packet's `source_time` is stamped from the NTP wall clock instead
+    /// of the session-relative monotonic clock, so the receiver (also in RTC mode) maps
+    /// it through a fixed offset. Scheduling stays monotonic. Sender-only.
+    rtc_timing: bool,
+}
+
+/// The current NTP-64 timestamp from the system real-time (wall) clock, matching
+/// libRIST's `timestampNTP_RTC_u64`: seconds since the NTP epoch (1900) in the high 32
+/// bits and a 232-picosecond fraction in the low 32. This is the one place the host
+/// reads the wall clock — it stamps `source_time` in RTC timing mode (the deterministic
+/// core never reads any clock; the host owns it).
+fn wall_ntp64() -> u64 {
+    // 70 years incl. 17 leap days from the 1900 NTP epoch to the 1970 Unix epoch.
+    const NTP_UNIX_OFFSET_SECS: u64 = (70 * 365 + 17) * 24 * 60 * 60; // 2_208_988_800
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs().wrapping_add(NTP_UNIX_OFFSET_SECS);
+    let frac = (u64::from(d.subsec_nanos()) << 32) / 1_000_000_000;
+    (secs << 32) | frac
 }
 
 impl MainDriver {
@@ -368,6 +390,7 @@ impl MainDriver {
         split_mode: SplitMode,
         npd_cmd: mpsc::Receiver<bool>,
         block_in: mpsc::Receiver<AppBlock>,
+        rtc: bool,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -386,6 +409,7 @@ impl MainDriver {
             socket,
             peer,
             epoch: Instant::now(),
+            rtc_timing: rtc,
             timers: HashMap::new(),
             keepalive,
             codec,
@@ -470,6 +494,7 @@ impl MainDriver {
             socket,
             peer,
             epoch: Instant::now(),
+            rtc_timing: false,
             timers: HashMap::new(),
             keepalive,
             codec,
@@ -553,6 +578,7 @@ impl MainDriver {
             socket,
             peer,
             epoch: Instant::now(),
+            rtc_timing: false,
             timers: HashMap::new(),
             keepalive,
             codec,
@@ -635,6 +661,7 @@ impl MainDriver {
             socket,
             peer,
             epoch: Instant::now(),
+            rtc_timing: false,
             timers: HashMap::new(),
             keepalive,
             codec,
@@ -1118,10 +1145,16 @@ impl MainDriver {
     /// halves carry the same `now`, so they share a source time — the pairing the peer
     /// merges on.
     fn push_split(&mut self, now: Timestamp, payload: Bytes) {
+        // RTC timing: stamp source_time from the NTP wall clock (the split pieces are the
+        // one media instant, so they share the stamp). Otherwise the core derives it from
+        // the monotonic `now` (source-relative timing). One wall read per media submit.
+        let st = self.rtc_timing.then(wall_ntp64);
         let (first, last) = split::split_payload(self.split_mode, payload);
-        self.flow.push_app(now, first);
+        self.flow
+            .push_app_block(now, first, FragRole::Standalone, None, st);
         if let Some(last) = last {
-            self.flow.push_app(now, last);
+            self.flow
+                .push_app_block(now, last, FragRole::Standalone, None, st);
         }
     }
 

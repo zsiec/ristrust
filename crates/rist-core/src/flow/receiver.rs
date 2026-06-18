@@ -340,7 +340,11 @@ impl Flow {
         }
         let mut pt = self.map_source_time(source_time);
         let dwell = Micros::from_micros(self.recovery_buffer.as_micros().saturating_mul(3));
-        if !retransmit
+        // The 32-bit source-clock wrap re-anchor is for the RTP-derived SOURCE clock;
+        // RTC mode's NTP-64 wall clock does not wrap on that boundary (libRIST gates the
+        // re-anchor on `!rtc_timing_mode`).
+        if self.cfg.timing_mode == TimingMode::Source
+            && !retransmit
             && source_time < self.receiver.max_source_time
             && self.receiver.max_source_time - source_time > SRC_WRAP_HALF_NTP
             && (now - self.receiver.last_resync) >= dwell
@@ -448,10 +452,11 @@ impl Flow {
 
         // Out-of-order / too-late shedding by SOURCE time: only packets older than
         // the newest packet time and not the immediate successor of last_found
-        // qualify. Skipped in ARRIVAL timing, where playout is not source-paced (the
-        // seq-based cursor guard below sheds the unrecoverable ones instead).
+        // qualify. Applies to both source-paced modes (SOURCE and RTC); skipped in
+        // ARRIVAL timing, where playout is not source-paced (the seq-based cursor guard
+        // below sheds the unrecoverable ones instead).
         let mut out_of_order = false;
-        if self.cfg.timing_mode == TimingMode::Source
+        if self.cfg.timing_mode != TimingMode::Arrival
             && packet_time < self.receiver.last_packet_time
             && seqn != self.receiver.last_found.wrapping_add(1)
         {
@@ -2171,6 +2176,32 @@ mod tests {
             f.stats().too_late,
             0,
             "arrival timing must not shed by source time"
+        );
+    }
+
+    #[test]
+    fn rtc_timing_disables_source_clock_wrap_reanchor() {
+        // RTC timing carries a 64-bit NTP wall clock that never wraps on the 32-bit RTP
+        // boundary, so the source-clock wrap re-anchor is disabled. The same backward
+        // source jump that SOURCE timing re-anchors (see source_clock_wrap_reanchors_offset)
+        // produces no resync under RTC; the far-past packet is shed as too-late instead
+        // (RTC keeps the source-time too-late test, unlike ARRIVAL).
+        let mut cfg = Config::librist_defaults();
+        cfg.timing_mode = TimingMode::Rtc;
+        let mut f = Flow::new(Role::Receiver, cfg);
+        let t0: u64 = 47_000_000_000;
+        f.feed(ts(t0), 0, mk_pkt(100, t0, b"x"));
+        drain_outputs(&mut f);
+        f.feed(ts(t0 + 4_000_000), 0, mk_pkt(105, 100_000_000, b"x"));
+        assert_eq!(
+            f.stats().clock_resync,
+            0,
+            "RTC must not re-anchor on a backward source jump"
+        );
+        assert_eq!(
+            f.stats().too_late,
+            1,
+            "the far-past packet is shed (no wrap re-anchor under RTC)"
         );
     }
 

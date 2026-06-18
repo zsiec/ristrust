@@ -71,6 +71,15 @@ pub enum TimingMode {
     /// absent source clock cannot stall playout. Shedding of unrecoverable packets
     /// falls to the seq-based playout-cursor guard.
     Arrival,
+    /// Pace playout by the SOURCE timestamps as [`Source`](Self::Source) does, but
+    /// treating those timestamps as a common NTP wall clock (libRIST
+    /// `RIST_TIMING_MODE_RTC`): the sender stamps `source_time` from the real-time
+    /// clock and the receiver maps it through the offset locked at the first packet.
+    /// The 32-bit source-clock wrap re-anchor is disabled — a 64-bit NTP wall clock
+    /// does not wrap on the RTP boundary — while the source-time too-late/reorder test
+    /// still applies. Scheduling stays on the host's monotonic clock (the offset
+    /// absorbs the wall↔monotonic difference), so an NTP step cannot jolt the timer wheel.
+    Rtc,
 }
 
 /// Which half of a RIST flow this instance is.

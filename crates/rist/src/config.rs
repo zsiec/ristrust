@@ -165,7 +165,9 @@ pub struct Config {
     /// How the receiver schedules playout (libRIST `timing_mode`). Default
     /// [`TimingMode::Source`] (source-paced, the libRIST default);
     /// [`TimingMode::Arrival`] paces by arrival time, robust to a drifting or absent
-    /// source clock. Receiver-side; ignored by a sender.
+    /// source clock; [`TimingMode::Rtc`] is source-paced on a shared NTP wall clock
+    /// (the sender stamps `source_time` from the real-time clock — Main/Advanced).
+    /// Receiver-side, except RTC also drives the sender's wall-clock stamping.
     pub timing_mode: TimingMode,
     /// libRIST's return-bandwidth in kbps: caps the receiver's outbound NACK channel
     /// so its retransmission requests stay within an upstream budget on an asymmetric
@@ -569,7 +571,9 @@ impl Config {
     }
 
     /// Selects how the receiver schedules playout (default [`TimingMode::Source`]).
-    /// [`TimingMode::Arrival`] paces by arrival time rather than the source clock.
+    /// [`TimingMode::Arrival`] paces by arrival time rather than the source clock;
+    /// [`TimingMode::Rtc`] is source-paced on a shared NTP wall clock (the sender then
+    /// stamps `source_time` from the real-time clock, for Main/Advanced).
     #[must_use]
     pub fn with_timing_mode(mut self, mode: TimingMode) -> Config {
         self.timing_mode = mode;

@@ -428,6 +428,7 @@ pub(crate) fn build_sender(
             cfg.split_mode,
             npd_rx,
             block_rx,
+            matches!(cfg.timing_mode, rist_core::flow::TimingMode::Rtc),
         );
         return Ok(SenderSpawned {
             local,
@@ -1166,6 +1167,7 @@ pub(crate) fn build_listener_sender(
         cfg.split_mode,
         npd_rx,
         block_rx,
+        matches!(cfg.timing_mode, rist_core::flow::TimingMode::Rtc),
     );
     Ok(SenderSpawned {
         local: bound,

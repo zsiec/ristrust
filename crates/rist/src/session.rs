@@ -321,7 +321,7 @@ fn main_sender_socket(
     if let Some(dtls) = &cfg.dtls {
         return crate::dtls_transport::dtls_client(remote, dtls.clone());
     }
-    MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress)
+    MainSocket::dial_ephemeral(rt, remote.is_ipv6(), cfg.local_port, egress)
 }
 
 /// The Main-profile receiver transport: a DTLS server (it learns its peer from the
@@ -400,7 +400,8 @@ pub(crate) fn build_sender(
     }
 
     if cfg.profile == Profile::Advanced {
-        let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
+        let socket =
+            MainSocket::dial_ephemeral(rt, remote.is_ipv6(), cfg.local_port, egress.as_ref())?;
         let local = socket.local()?;
         let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
         let main = build_main_codec(cfg, ssrc)?;
@@ -443,7 +444,8 @@ pub(crate) fn build_sender(
         });
     }
 
-    let socket = SimpleSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
+    let socket =
+        SimpleSocket::dial_ephemeral(rt, remote.is_ipv6(), cfg.local_port, egress.as_ref())?;
     let local = socket.media_local()?;
     let mut rtcp = remote;
     rtcp.set_port(remote.port().wrapping_add(1));
@@ -1083,7 +1085,7 @@ pub(crate) fn build_caller_receiver(
         });
     }
 
-    let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), egress.as_ref())?;
+    let socket = MainSocket::dial_ephemeral(rt, remote.is_ipv6(), cfg.local_port, egress.as_ref())?;
     let local = socket.local()?;
     // The sender's address is known up front (we dialled it), so we announce to it.
     let peer = Peer::with_addrs(dur_to_micros(cfg.session_timeout), remote, remote);
@@ -1213,6 +1215,8 @@ fn require_bondable(cfg: &Config) -> io::Result<()> {
 /// # Errors
 /// Returns an I/O error if the profile is not Main, `remotes` is empty, a transport
 /// socket cannot be bound, or an invalid secret prevents PSK key derivation.
+// A flat constructor wiring the session config + per-path peer/codec/EAP setup.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_bonded_sender(
     rt: &dyn Runtime,
     cfg: &Config,
@@ -1234,7 +1238,12 @@ pub(crate) fn build_bonded_sender(
         let flow = Flow::new(Role::Sender, flow_config(cfg, ssrc, start_seq));
         let mut group = bonding_group(cfg);
         let egress = crate::multicast::sender_egress(cfg, first_remote)?;
-        let socket = SimpleSocket::dial_ephemeral(rt, first_remote.is_ipv6(), egress.as_ref())?;
+        let socket = SimpleSocket::dial_ephemeral(
+            rt,
+            first_remote.is_ipv6(),
+            cfg.local_port,
+            egress.as_ref(),
+        )?;
         let local = socket.media_local()?;
         let mut paths = Vec::with_capacity(peers.len());
         for (i, &(remote, weight)) in peers.iter().enumerate() {
@@ -1278,7 +1287,8 @@ pub(crate) fn build_bonded_sender(
     // the sender's datagrams then carry one source address, which a multiplexing
     // receiver keys on to group the paths into a single bonded flow.
     let egress = crate::multicast::sender_egress(cfg, first_remote)?;
-    let socket = MainSocket::dial_ephemeral(rt, first_remote.is_ipv6(), egress.as_ref())?;
+    let socket =
+        MainSocket::dial_ephemeral(rt, first_remote.is_ipv6(), cfg.local_port, egress.as_ref())?;
     let local = socket.local()?;
     let mut paths = Vec::with_capacity(peers.len());
     for (i, &(remote, weight)) in peers.iter().enumerate() {

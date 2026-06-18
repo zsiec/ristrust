@@ -201,6 +201,13 @@ pub struct Config {
     ///
     /// [`split_mode`]: Self::split_mode
     pub merge_mode: MergeMode,
+    /// The fixed local UDP source port a *caller* (a `dial`/`dial_receiver` or a
+    /// bonded sender) binds its transport socket to (libRIST `local-port`). `0` (the
+    /// default) lets the OS choose an ephemeral port. Useful for traversing a NAT or
+    /// firewall pinhole that expects a known source port. On the Simple profile the
+    /// RTCP socket binds the adjacent port (`local_port + 1`). Ignored by a plain
+    /// listener (which binds the address it was given).
+    pub local_port: u16,
     /// Make a receiver emit periodic Link Quality Messages for source adaptation
     /// (TR-06-4 Part 1). Carried as an RR profile-specific extension (Simple/Main)
     /// or an Advanced control message (index `0x0002`). Default: off.
@@ -289,6 +296,7 @@ impl Default for Config {
             weight: 0,
             split_mode: SplitMode::Off,
             merge_mode: MergeMode::Off,
+            local_port: 0,
             source_adaptation: false,
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
@@ -453,6 +461,14 @@ impl Config {
     #[must_use]
     pub fn with_weight(mut self, weight: u32) -> Config {
         self.weight = weight;
+        self
+    }
+
+    /// Sets the fixed local UDP source port a caller binds to (libRIST `local-port`);
+    /// `0` (the default) uses an ephemeral port.
+    #[must_use]
+    pub fn with_local_port(mut self, port: u16) -> Config {
+        self.local_port = port;
         self
     }
 

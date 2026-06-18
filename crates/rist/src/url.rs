@@ -216,6 +216,7 @@ fn apply_query(cfg: &mut Config, q: &HashMap<String, String>) -> Result<(), Erro
     for (key, dst) in [
         ("virt-src-port", &mut cfg.virt_src_port),
         ("virt-dst-port", &mut cfg.virt_dst_port),
+        ("local-port", &mut cfg.local_port),
     ] {
         if let Some(v) = q.get(key) {
             let n: i64 = v
@@ -415,6 +416,7 @@ const RECOGNIZED_URL_PARAMS: &[&str] = &[
     "max-retries",
     "virt-src-port",
     "virt-dst-port",
+    "local-port",
     "profile",
     "cname",
     "secret",
@@ -432,10 +434,10 @@ const RECOGNIZED_URL_PARAMS: &[&str] = &[
     // `apply_string_and_feature_params` and `with_srp_compat`.
     "srp-compat",
     // Accepted-and-ignored for libRIST URL portability (recognized but not yet acted
-    // on): `recovery-priority` per-peer NACK priority (a bonded-peer concept whose
-    // selection algorithm exists but is never set non-zero), `reflector` one-to-many
-    // fan-out, and `local-port` caller fixed source port. Rejecting a valid libRIST
-    // URL over these is the worse failure for portability.
+    // on): `recovery-priority` per-peer NACK priority (per-path, set via the
+    // `listen_bonded_priority` API rather than a per-session URL value) and
+    // `reflector` one-to-many fan-out. Rejecting a valid libRIST URL over these is the
+    // worse failure for portability.
     "recovery-priority",
     "reflector",
     "local-port",
@@ -537,6 +539,16 @@ mod tests {
 
         let (_, cfg) = parse_url("rist://h:5000?return-bandwidth=2000", Config::default()).unwrap();
         assert_eq!(cfg.return_bandwidth, 2000);
+    }
+
+    #[test]
+    fn local_port_folds_in() {
+        let (_, cfg) = parse_url("rist://h:5000?local-port=7000", Config::default()).unwrap();
+        assert_eq!(cfg.local_port, 7000);
+        // Default is ephemeral (0).
+        assert_eq!(Config::default().local_port, 0);
+        // Out-of-range (not a u16) is rejected.
+        assert!(parse_url("rist://h:5000?local-port=99999", Config::default()).is_err());
     }
 
     #[test]

@@ -140,6 +140,7 @@ impl SimpleSocket {
     pub(crate) fn dial_ephemeral(
         rt: &dyn Runtime,
         ipv6: bool,
+        port: u16,
         egress: Option<&Egress>,
     ) -> io::Result<SimpleSocket> {
         let unspecified = if ipv6 {
@@ -147,9 +148,13 @@ impl SimpleSocket {
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
-        let any = SocketAddr::new(unspecified, 0);
-        let media = rt.bind(any)?;
-        let rtcp = rt.bind(any)?;
+        // `port` 0 binds ephemeral media+RTCP sockets; a non-zero value is the libRIST
+        // `local-port` fixed caller source port, with RTCP on the adjacent `port + 1`.
+        let media = rt.bind(SocketAddr::new(unspecified, port))?;
+        let rtcp = rt.bind(SocketAddr::new(
+            unspecified,
+            if port == 0 { 0 } else { port.wrapping_add(1) },
+        ))?;
         if let Some(e) = egress {
             media.set_multicast_egress(e)?;
             rtcp.set_multicast_egress(e)?;
@@ -359,6 +364,7 @@ impl MainSocket {
     pub(crate) fn dial_ephemeral(
         rt: &dyn Runtime,
         ipv6: bool,
+        port: u16,
         egress: Option<&Egress>,
     ) -> io::Result<MainSocket> {
         let unspecified = if ipv6 {
@@ -366,7 +372,9 @@ impl MainSocket {
         } else {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         };
-        let sock = rt.bind(SocketAddr::new(unspecified, 0))?;
+        // `port` 0 binds an ephemeral source port; a non-zero value is the libRIST
+        // `local-port` fixed caller source port.
+        let sock = rt.bind(SocketAddr::new(unspecified, port))?;
         if let Some(e) = egress {
             sock.set_multicast_egress(e)?;
         }
@@ -404,7 +412,7 @@ impl MainSocket {
         // A caller-rebind is a production NAT-recovery path; bind directly via the
         // default tokio runtime (matching ristgo's direct rebind), independent of any
         // injected runtime.
-        MainSocket::dial_ephemeral(&crate::runtime::TokioRuntime, ipv6, None)
+        MainSocket::dial_ephemeral(&crate::runtime::TokioRuntime, ipv6, 0, None)
     }
 
     /// The local address the transport is bound to.
@@ -443,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn dial_ephemeral_binds_two_distinct_sockets() {
         let rt = TokioRuntime;
-        let s = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
+        let s = SimpleSocket::dial_ephemeral(&rt, false, 0, None).unwrap();
         let media = s.media_local().unwrap();
         let rtcp = s.rtcp_local().unwrap();
         assert_ne!(media.port(), 0);
@@ -455,7 +463,7 @@ mod tests {
     async fn main_rebind_binds_a_fresh_distinct_port_same_family() {
         let rt = TokioRuntime;
         for ipv6 in [false, true] {
-            let Ok(s) = MainSocket::dial_ephemeral(&rt, ipv6, None) else {
+            let Ok(s) = MainSocket::dial_ephemeral(&rt, ipv6, 0, None) else {
                 continue; // host may lack IPv6
             };
             let old = s.local().unwrap();
@@ -472,8 +480,8 @@ mod tests {
     #[tokio::test]
     async fn media_and_rtcp_round_trip_on_loopback() {
         let rt = TokioRuntime;
-        let recv = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
-        let send = SimpleSocket::dial_ephemeral(&rt, false, None).unwrap();
+        let recv = SimpleSocket::dial_ephemeral(&rt, false, 0, None).unwrap();
+        let send = SimpleSocket::dial_ephemeral(&rt, false, 0, None).unwrap();
         // The sockets bind the unspecified address (0.0.0.0); send to loopback.
         let loop_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let recv_media_addr = SocketAddr::new(loop_ip, recv.media_local().unwrap().port());
@@ -495,8 +503,8 @@ mod tests {
         let zero = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         assert!(MainSocket::listen(&rt, zero, None).is_err());
 
-        let recv = MainSocket::dial_ephemeral(&rt, false, None).unwrap();
-        let send = MainSocket::dial_ephemeral(&rt, false, None).unwrap();
+        let recv = MainSocket::dial_ephemeral(&rt, false, 0, None).unwrap();
+        let send = MainSocket::dial_ephemeral(&rt, false, 0, None).unwrap();
         let dst = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             recv.local().unwrap().port(),

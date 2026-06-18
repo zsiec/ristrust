@@ -56,6 +56,9 @@ pub(crate) struct SenderSpawned {
     /// Per-block media submit channel (`Sender::send_block`, USE_SEQ + `ts_ntp`);
     /// `Some` only on a Main-profile single sender.
     pub(crate) block_in: Option<mpsc::Sender<crate::driver::AppBlock>>,
+    /// Runtime bonded-path add/remove channel (`Sender::add_path`/`remove_path`);
+    /// `Some` only on a Main/Advanced bonded sender.
+    pub(crate) peer_cmd: Option<mpsc::Sender<crate::driver_bonded::PeerCmd>>,
     /// Application flow attributes to transmit (`Sender::write_flow_attribute`);
     /// `Some` only on an Advanced sender.
     pub(crate) flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
@@ -407,6 +410,7 @@ pub(crate) fn build_sender(
             weight_cmd: None,
             npd_cmd: Some(npd_tx),
             block_in: Some(block_tx),
+            peer_cmd: None,
             flow_attr_cmd: None,
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -454,6 +458,7 @@ pub(crate) fn build_sender(
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
             block_in: None,
+            peer_cmd: None,
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -488,6 +493,7 @@ pub(crate) fn build_sender(
         weight_cmd: None,
         npd_cmd: None, // NPD is Main-only
         block_in: None,
+        peer_cmd: None,
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,
@@ -1048,6 +1054,7 @@ pub(crate) fn build_listener_sender(
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
             block_in: None,
+            peer_cmd: None,
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -1096,6 +1103,7 @@ pub(crate) fn build_listener_sender(
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
             block_in: None,
+            peer_cmd: None,
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -1136,6 +1144,7 @@ pub(crate) fn build_listener_sender(
         weight_cmd: None,
         npd_cmd: Some(npd_tx),
         block_in: Some(block_tx),
+        peer_cmd: None,
         flow_attr_cmd: None,
         oob_in: Some(oob_tx),
         oob_out: Some(rev_oob_rx),
@@ -1398,6 +1407,7 @@ pub(crate) fn build_bonded_sender(
             weight_cmd: Some(weight_tx),
             npd_cmd: None, // NPD is Main-only
             block_in: None,
+            peer_cmd: None,
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -1444,6 +1454,21 @@ pub(crate) fn build_bonded_sender(
     } else {
         (None, None)
     };
+    // The runtime peer add/remove channel + a factory that builds a new path's transport
+    // (the shared source socket) and per-path codec/EAP state from the session config —
+    // so the driver can add a destination at runtime without holding `rt` or the config.
+    let (peer_tx, peer_rx) = mpsc::channel(16);
+    let factory_cfg = cfg.clone();
+    let factory_socket = socket.clone();
+    let factory_timeout = dur_to_micros(cfg.session_timeout);
+    let path_factory: crate::driver_bonded::PathFactory = Box::new(move |addr: SocketAddr| {
+        Ok(PathParts {
+            socket: factory_socket.clone(),
+            peer: Peer::with_addrs(factory_timeout, addr, addr),
+            codec: build_main_codec(&factory_cfg, ssrc)?,
+            eap: build_eap_role(&factory_cfg, true)?,
+        })
+    });
     let (app_in, close, stats, task) = BondedDriver::spawn_sender(
         flow,
         group,
@@ -1459,6 +1484,8 @@ pub(crate) fn build_bonded_sender(
         build_fec(cfg),
         cfg.split_mode,
         npd_rx,
+        peer_rx,
+        path_factory,
     );
     Ok(SenderSpawned {
         local,
@@ -1466,6 +1493,7 @@ pub(crate) fn build_bonded_sender(
         weight_cmd: Some(weight_tx),
         npd_cmd,
         block_in: None, // per-block send is Main single-sender only for now
+        peer_cmd: Some(peer_tx),
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,

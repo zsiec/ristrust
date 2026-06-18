@@ -82,6 +82,29 @@ pub(crate) struct Inbound {
     data: Bytes,
 }
 
+/// A runtime bonded-path command from `Sender::add_path` / `Sender::remove_path`
+/// (libRIST `rist_peer_create` / `rist_peer_destroy`), applied to a live bonded
+/// sender's path set on its loop. Sender-side only: a bonded sender shares one source
+/// socket across paths, so adding a destination needs no new socket or reader.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PeerCmd {
+    /// Add a destination path at `index` (`weight` `0` = full 2022-7 duplication),
+    /// transmitting to `addr`. A duplicate index is ignored.
+    Add {
+        index: u8,
+        addr: SocketAddr,
+        weight: u32,
+        priority: u32,
+    },
+    /// Remove the path with `index` from the fan-out, NACK selection, and stats.
+    Remove { index: u8 },
+}
+
+/// Builds the per-path transport + codec state for a runtime-added bonded sender path
+/// targeting `addr`. The session captures the shared source socket and the cfg-derived
+/// codec / EAP-role builders; the driver invokes it on a [`PeerCmd::Add`].
+pub(crate) type PathFactory = Box<dyn FnMut(SocketAddr) -> std::io::Result<PathParts> + Send>;
+
 /// The transport + per-path protocol state of one bonded path. The flow, group,
 /// and sender bookkeeping are shared on the [`BondedDriver`]; everything that is
 /// per-tunnel lives here.
@@ -147,6 +170,12 @@ pub(crate) struct BondedDriver {
     /// `Some` only on a Main-profile bonded sender (NPD is Main-only). Applied to every
     /// path's codec so the 2022-7 copies stay identical.
     npd_cmd: Option<mpsc::Receiver<bool>>,
+    /// Runtime bonded-path add/remove commands from `Sender::add_path`/`remove_path`
+    /// (libRIST `rist_peer_create`/`_destroy`); `Some` only on a bonded sender.
+    peer_cmd: Option<mpsc::Receiver<PeerCmd>>,
+    /// Builds a runtime-added path's transport+codec state (sender only); invoked on a
+    /// [`PeerCmd::Add`]. `None` on a receiver.
+    path_factory: Option<PathFactory>,
     /// The highest first-transmission sequence sent (shared across paths — the RTP
     /// sequence space is one stream), the NACK-widening reference.
     highest_sent: u32,
@@ -215,6 +244,8 @@ impl BondedDriver {
         fec: Option<FecState>,
         split_mode: SplitMode,
         npd_cmd: Option<mpsc::Receiver<bool>>,
+        peer_cmd: mpsc::Receiver<PeerCmd>,
+        path_factory: PathFactory,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -240,6 +271,8 @@ impl BondedDriver {
             app_in: Some(rx),
             weight_cmd: Some(weight_rx),
             npd_cmd,
+            peer_cmd: Some(peer_cmd),
+            path_factory: Some(path_factory),
             highest_sent: start_seq,
             ssrc,
             data_out: None,
@@ -298,6 +331,8 @@ impl BondedDriver {
             app_in: None,
             weight_cmd: None,
             npd_cmd: None, // a receiver does not delete null packets
+            peer_cmd: None,
+            path_factory: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
@@ -359,6 +394,8 @@ impl BondedDriver {
             app_in: None,
             weight_cmd: None,
             npd_cmd: None,
+            peer_cmd: None,
+            path_factory: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(data_tx),
@@ -462,6 +499,11 @@ impl BondedDriver {
                 on = recv_opt(&mut self.npd_cmd) => match on {
                     Some(on) => for link in &mut self.paths { link.codec.set_npd(on); },
                     None => self.npd_cmd = None,
+                },
+                // Runtime bonded-path add/remove (`Sender::add_path`/`remove_path`).
+                pc = recv_opt(&mut self.peer_cmd) => match pc {
+                    Some(c) => self.apply_peer_cmd(c),
+                    None => self.peer_cmd = None,
                 },
                 // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
                 ctrl = recv_opt(&mut self.rx_ctrl) => match ctrl {
@@ -781,6 +823,45 @@ impl BondedDriver {
             .collect();
         self.stats
             .publish_peers(self.flow.stats(), self.fec_recovered(), peers);
+    }
+
+    /// Applies one runtime bonded-path command (libRIST `rist_peer_create`/`_destroy`)
+    /// to the live sender path set. `Add` builds the new path (shared source socket, a
+    /// fresh codec + EAP role) via the path factory and registers it with the group so
+    /// the next media fan-out reaches it; `Remove` drops it from the paths and the group
+    /// (the shared socket stays alive for the others). Duplicate adds and unknown removes
+    /// are ignored; the new path greets and (if EAP) authenticates on the next keepalive.
+    fn apply_peer_cmd(&mut self, cmd: PeerCmd) {
+        match cmd {
+            PeerCmd::Add {
+                index,
+                addr,
+                weight,
+                priority,
+            } => {
+                if self.paths.iter().any(|p| p.index == index) {
+                    return; // duplicate index: ignore (matches Group::add_path)
+                }
+                let Some(factory) = self.path_factory.as_mut() else {
+                    return;
+                };
+                match factory(addr) {
+                    Ok(parts) => {
+                        self.paths.push(link_path_at(index, parts));
+                        self.group.add_path(index, weight, priority);
+                        tracing::debug!(target: crate::logging::BONDING, %addr, index, "rist: bonded path added at runtime");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: crate::logging::BONDING, %addr, "rist: bonded add_path failed: {e}");
+                    }
+                }
+            }
+            PeerCmd::Remove { index } => {
+                self.paths.retain(|p| p.index != index);
+                self.group.remove_path(index);
+                tracing::debug!(target: crate::logging::BONDING, index, "rist: bonded path removed at runtime");
+            }
+        }
     }
 
     /// Folds a per-path RTT sample into the bonding group when `fb` is an RTT-echo
@@ -1259,16 +1340,22 @@ fn link_paths(parts: Vec<PathParts>) -> Vec<PathLink> {
     parts
         .into_iter()
         .enumerate()
-        .map(|(i, p)| PathLink {
-            index: u8::try_from(i).unwrap_or(u8::MAX),
-            socket: p.socket,
-            peer: p.peer,
-            codec: p.codec,
-            authed: p.eap.is_none(),
-            eap: p.eap,
-            greeted: false,
-        })
+        .map(|(i, p)| link_path_at(u8::try_from(i).unwrap_or(u8::MAX), p))
         .collect()
+}
+
+/// Builds one [`PathLink`] at an explicit `index` (a runtime [`PeerCmd::Add`], where
+/// the caller owns the index space), seeding the handshake flags fresh.
+fn link_path_at(index: u8, p: PathParts) -> PathLink {
+    PathLink {
+        index,
+        socket: p.socket,
+        peer: p.peer,
+        codec: p.codec,
+        authed: p.eap.is_none(),
+        eap: p.eap,
+        greeted: false,
+    }
 }
 
 /// Spawns a per-path reader task funnelling inbound datagrams (tagged with the path

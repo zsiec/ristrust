@@ -146,6 +146,15 @@ impl Group {
         }
     }
 
+    /// Removes the path with `index` (libRIST `rist_peer_destroy`), dropping it from
+    /// the fan-out, NACK selection, and per-peer stats. Unknown indices are ignored.
+    /// Returns whether a path was removed.
+    pub(crate) fn remove_path(&mut self, index: u8) -> bool {
+        let before = self.paths.len();
+        self.paths.retain(|p| p.index != index);
+        self.paths.len() != before
+    }
+
     /// Registers a path. `index` is its stable identity (the flow `path`
     /// argument); `weight` of [`WEIGHT_DUPLICATE`] selects full redundancy;
     /// `priority` orders NACK-peer selection. A duplicate `index` is ignored.

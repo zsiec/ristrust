@@ -29,6 +29,7 @@ pub struct Sender {
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     npd_cmd: Option<mpsc::Sender<bool>>,
     block_in: Option<mpsc::Sender<crate::driver::AppBlock>>,
+    peer_cmd: Option<mpsc::Sender<crate::driver_bonded::PeerCmd>>,
     flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -94,6 +95,58 @@ impl Sender {
         };
         let index = u8::try_from(path).map_err(|_| Error::InvalidAddr(format!("path {path}")))?;
         cmd.send((index, weight)).await.map_err(|_| Error::Closed)
+    }
+
+    /// Adds a bonded destination path at runtime (libRIST `rist_peer_create`): the sender
+    /// begins transmitting to `addr` (a bare `IP:port`) at `index`, with load-share
+    /// `weight` (`0` = full SMPTE 2022-7 duplication). The caller owns the index space —
+    /// the construction paths are `0..N`, so a fresh path uses an unused index `>= N`; a
+    /// duplicate index is ignored. The path greets and (under EAP-SRP) authenticates on
+    /// the next keepalive, then joins the fan-out. Main and Advanced bonded senders only.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-bonded or Simple-bonded sender,
+    /// [`Error::InvalidAddr`] if `addr`/`index` is invalid, or [`Error::Closed`] if the
+    /// session has shut down.
+    pub async fn add_path(&self, index: usize, addr: &str, weight: u32) -> Result<(), Error> {
+        let Some(cmd) = &self.peer_cmd else {
+            return Err(Error::Unimplemented(
+                "add_path requires a Main/Advanced bonded sender",
+            ));
+        };
+        let index = u8::try_from(index).map_err(|_| Error::InvalidAddr(format!("path {index}")))?;
+        let addr: SocketAddr = addr
+            .parse()
+            .map_err(|_| Error::InvalidAddr(addr.to_string()))?;
+        cmd.send(crate::driver_bonded::PeerCmd::Add {
+            index,
+            addr,
+            weight,
+            priority: 0,
+        })
+        .await
+        .map_err(|_| self.close.error())
+    }
+
+    /// Removes a bonded path at runtime (libRIST `rist_peer_destroy`): the sender stops
+    /// transmitting on `index` and drops it from NACK selection and per-peer stats. The
+    /// shared source socket stays open for the remaining paths. An unknown index is a
+    /// no-op. Main and Advanced bonded senders only.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-bonded or Simple-bonded sender,
+    /// [`Error::InvalidAddr`] if `index` is out of range, or [`Error::Closed`] if the
+    /// session has shut down.
+    pub async fn remove_path(&self, index: usize) -> Result<(), Error> {
+        let Some(cmd) = &self.peer_cmd else {
+            return Err(Error::Unimplemented(
+                "remove_path requires a Main/Advanced bonded sender",
+            ));
+        };
+        let index = u8::try_from(index).map_err(|_| Error::InvalidAddr(format!("path {index}")))?;
+        cmd.send(crate::driver_bonded::PeerCmd::Remove { index })
+            .await
+            .map_err(|_| self.close.error())
     }
 
     /// Enables or disables null-packet deletion (NPD) on the send path at runtime — the
@@ -295,6 +348,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
         block_in: spawned.block_in,
+        peer_cmd: spawned.peer_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -346,6 +400,7 @@ pub async fn dial_bonded_with(
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
         block_in: spawned.block_in,
+        peer_cmd: spawned.peer_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -404,6 +459,7 @@ pub async fn dial_bonded_weighted_with(
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
         block_in: spawned.block_in,
+        peer_cmd: spawned.peer_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -454,6 +510,7 @@ pub async fn listen_sender_with(
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
         block_in: spawned.block_in,
+        peer_cmd: spawned.peer_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,

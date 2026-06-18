@@ -230,10 +230,11 @@ impl MainCodec {
         }
     }
 
-    /// Whether a PSK is configured (a send key is present). When a passphrase was
-    /// configured (`with_secret`), the data channel keys from it and the EAP-SRP
-    /// handshake only gates the channel; with no PSK, the host re-keys to the SRP
-    /// session key K after authentication.
+    /// Whether a PSK is configured (a send key is present at construction). When a
+    /// passphrase was configured (`with_secret`), the data channel keys from it and the
+    /// EAP-SRP handshake only gates the channel; with no PSK, the media stays cleartext and
+    /// the host keys only the receiver→sender feedback direction with the SRP session key K
+    /// after authentication (see [`Self::set_send_session_key`]).
     pub(crate) fn has_psk(&self) -> bool {
         self.send_key.is_some()
     }

@@ -156,11 +156,15 @@ composes with everything.
   is `PBKDF2-HMAC-SHA256(passphrase, nonce)`, 256-bit by default (`with_aes_key_bits` /
   `?aes-type=128|256`).
 - **EAP-SRP** — set credentials with `with_srp_credentials` (or
-  `?username=&password=`); a sender authenticates, a receiver verifies. Use it
-  alongside a `secret` (the libRIST-interoperable combined mode), or alone
-  (`use_key_as_passphrase`, a ristrust↔ristrust mode). `with_srp_compat` /
-  `?srp-compat=1` selects the legacy EAPOL v2 handshake for old peers. The
-  handshake retransmits under loss and recovers a NAT source-port rebind.
+  `?username=&password=`); a sender authenticates, a receiver verifies. Alongside a
+  `secret` it is the combined PSK+SRP mode (the secret encrypts the media, SRP gates).
+  Alone (no secret, `use_key_as_passphrase`) it **authenticates only** — the media stays
+  in the clear and only the receiver→sender feedback is keyed with the SRP session key
+  (libRIST's model; for media encryption use a secret). Both modes interoperate with
+  libRIST and ristgo, single-flow and bonded. `with_srp_compat` / `?srp-compat=1` selects
+  the legacy EAPOL v2 handshake for old peers. The handshake retransmits under loss and
+  recovers a NAT source-port rebind (with a `secret`; a cleartext pure-SRP tuple cannot
+  supply a forge-proof rebind identity).
 
 ## FEC, source adaptation, OOB, multicast
 

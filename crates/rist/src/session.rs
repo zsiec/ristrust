@@ -241,13 +241,13 @@ fn random_start_seq(even: bool) -> u32 {
 /// per-session salt (advertised in the CHALLENGE).
 fn build_eap_role(cfg: &Config, sender: bool) -> io::Result<Option<EapRole>> {
     let invalid = |e: eap::EapError| io::Error::new(io::ErrorKind::InvalidInput, e.to_string());
-    // With a configured PSK secret the data channel keys from it and SRP only gates
-    // (the role must not push "use K" and override the secret); with no secret the
-    // channel re-keys to the SRP session key K. NOTE: the pure-SRP (no-secret) path
-    // is a ristrust↔ristrust mode — a libRIST *listener* rejects it ("configured
-    // without keysize"), because its keysize gate checks the parent peer's key,
-    // which only an explicit `-s` passphrase configures (not the SRP-derived key).
-    // For libRIST interop, configure a secret too (the combined PSK+SRP mode).
+    // With a configured PSK secret the data channel keys from it and SRP only gates (the
+    // role must not push "use K" and override the secret). With no secret the pure-SRP
+    // use_key_as_passphrase mode applies: SRP AUTHENTICATES but does not encrypt the media
+    // (it stays cleartext); only the receiver→sender feedback is keyed with the SRP session
+    // key K. This is libRIST's actual model and interoperates with libRIST and ristgo (the
+    // role drives the post-SUCCESS PASSWORD exchange that installs the feedback keys). For
+    // media encryption, configure a secret too (the combined PSK+SRP mode).
     let use_key = cfg.secret.is_none();
     if sender {
         // A sender authenticates AS one identity; multi-user credentials are listener-only.

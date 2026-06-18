@@ -116,6 +116,15 @@ impl Runtime for TokioRuntime {
         let sock = socket2::SockRef::from(&inner);
         let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES);
         let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES);
+        // DEVIATION(librist): libRIST sets the IP Don't-Fragment bit on every UDP socket
+        // (IP_MTU_DISCOVER=DO / IP_DONTFRAG / IP_DONTFRAGMENT) so an oversized datagram is
+        // dropped rather than silently IP-fragmented. ristrust does NOT — there is no
+        // portable safe API for it (socket2 0.6 exposes no DF/MTU-discovery setter), and a
+        // raw `setsockopt` needs `unsafe`/libc FFI, which the workspace `#![forbid(unsafe_code)]`
+        // and pure-Rust no-C-dependency rule prohibit. RIST media (≈1316-byte TS payload +
+        // headers) stays well under a 1500-byte MTU, so fragmentation is not normally
+        // reached; the Go sibling sets DF where the platform allows. Revisit if socket2 (or
+        // quinn-udp's socket state) grows a safe DF setter.
         Ok(Arc::new(TokioUdpSocket { inner }))
     }
 }

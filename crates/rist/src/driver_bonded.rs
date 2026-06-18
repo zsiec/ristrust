@@ -1055,6 +1055,8 @@ impl BondedDriver {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    // FEC-recovered packets carry no virtual ports (not in the matrix).
+                    ..Default::default()
                 },
             );
         }

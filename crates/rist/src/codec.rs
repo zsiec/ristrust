@@ -174,6 +174,8 @@ impl MediaDecoder {
             path_id: 0,
             // The Simple profile does not fragment; every payload is whole.
             frag: rist_core::wire::FragRole::Standalone,
+            // The Simple profile (bare RTP) has no virtual ports.
+            ..Default::default()
         })
     }
 
@@ -381,6 +383,7 @@ mod tests {
             retransmit,
             path_id: 0,
             frag: rist_core::wire::FragRole::Standalone,
+            ..Default::default()
         }
     }
 

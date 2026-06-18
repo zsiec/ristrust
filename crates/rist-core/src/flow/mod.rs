@@ -539,6 +539,7 @@ pub(crate) mod testutil {
             retransmit: false,
             path_id: 0,
             frag: FragRole::Standalone,
+            ..Default::default()
         }
     }
 

@@ -93,6 +93,13 @@ pub enum Event {
         /// Simple/Main profiles). The host reassembler folds non-standalone roles
         /// into whole application payloads.
         frag: crate::wire::FragRole,
+        /// The RIST virtual source port decoded from the delivered packet (Main/Advanced),
+        /// for the host to surface per block (libRIST data-block `virt_src_port`). `0` on
+        /// the Simple profile.
+        virt_src_port: u16,
+        /// The RIST virtual destination port decoded from the delivered packet
+        /// (Main/Advanced) — the virtual-stream demux key. `0` on the Simple profile.
+        virt_dst_port: u16,
     },
 }
 

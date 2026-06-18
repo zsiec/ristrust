@@ -11,6 +11,26 @@ use crate::driver::RxControl;
 use crate::error::{ConfigError, Error};
 use crate::runtime::{Runtime, TokioRuntime};
 
+/// One recovered media packet with its per-packet metadata, delivered by
+/// [`Receiver::recv_block`] when [`Config::with_block_delivery`](crate::Config::with_block_delivery)
+/// is enabled (libRIST's `rist_receiver_data_block`). Raw per-packet granularity: it
+/// bypasses the split-merge recombination that `recv` applies.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DataBlock {
+    /// The recovered media payload.
+    pub payload: Bytes,
+    /// The 32-bit (widened) sequence number of the packet.
+    pub seq: u32,
+    /// The sender's NTP-64 source timestamp (libRIST `ts_ntp`).
+    pub source_time: u64,
+    /// The RIST virtual source port decoded from the packet's reduced-overhead header.
+    pub virt_src_port: u16,
+    /// The RIST virtual destination port decoded from the packet's reduced-overhead
+    /// header — the virtual-stream demux key.
+    pub virt_dst_port: u16,
+}
+
 /// An io-native RIST media receiver. Created with [`listen`]; yields in-order,
 /// ARQ-recovered media payloads from a background session task.
 #[derive(Debug)]
@@ -18,6 +38,9 @@ pub struct Receiver {
     cfg: Config,
     local: SocketAddr,
     data_out: mpsc::Receiver<Bytes>,
+    /// Per-packet block delivery channel ([`Config::with_block_delivery`]); `Some` makes
+    /// [`recv_block`](Self::recv_block) the delivery path and `recv` unavailable.
+    block_out: Option<mpsc::Receiver<crate::driver::MediaBlock>>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     rx_ctrl: Option<mpsc::Sender<RxControl>>,
@@ -51,6 +74,7 @@ impl Receiver {
             // setters return `Unimplemented` on it.
             rx_ctrl: None,
             peer_cmd: None,
+            block_out: None,
             close,
             stats,
             task,
@@ -262,9 +286,43 @@ impl Receiver {
     /// # Errors
     /// Returns [`Error::Closed`] when the session has shut down and no further data
     /// will arrive — or the more specific [`Error::SessionTimeout`] / [`Error::Auth`]
-    /// when peer silence or a failed handshake was the cause.
+    /// when peer silence or a failed handshake was the cause. Returns
+    /// [`Error::Unimplemented`] on a block-delivery receiver
+    /// ([`Config::with_block_delivery`](crate::Config::with_block_delivery)) — use
+    /// [`recv_block`](Self::recv_block) there.
     pub async fn recv(&mut self) -> Result<Bytes, Error> {
+        if self.block_out.is_some() {
+            return Err(Error::Unimplemented(
+                "recv is unavailable on a block-delivery receiver; use recv_block",
+            ));
+        }
         self.data_out.recv().await.ok_or_else(|| self.close.error())
+    }
+
+    /// Reads the next recovered packet as a [`DataBlock`] with its per-packet metadata —
+    /// sequence, source timestamp, and decoded virtual ports (libRIST
+    /// `rist_receiver_data_block`). Delivery is at raw per-packet granularity (no
+    /// split-merge recombination). Requires
+    /// [`Config::with_block_delivery`](crate::Config::with_block_delivery).
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] unless the receiver was built with block delivery,
+    /// or [`Error::Closed`] (or [`Error::SessionTimeout`] / [`Error::Auth`]) once the
+    /// session has shut down.
+    pub async fn recv_block(&mut self) -> Result<DataBlock, Error> {
+        let Some(rx) = self.block_out.as_mut() else {
+            return Err(Error::Unimplemented(
+                "recv_block requires Config::with_block_delivery on a Main receiver",
+            ));
+        };
+        let b = rx.recv().await.ok_or_else(|| self.close.error())?;
+        Ok(DataBlock {
+            payload: b.payload,
+            seq: b.seq,
+            source_time: b.source_time,
+            virt_src_port: b.virt_src_port,
+            virt_dst_port: b.virt_dst_port,
+        })
     }
 
     /// Closes the receiver, stopping its background task and releasing its sockets.
@@ -313,6 +371,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
         peer_cmd: spawned.peer_cmd,
+        block_out: spawned.block_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -358,6 +417,7 @@ pub async fn dial_receiver_with(
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
         peer_cmd: spawned.peer_cmd,
+        block_out: spawned.block_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -431,6 +491,7 @@ fn bonded_receiver(cfg: Config, spawned: crate::session::ReceiverSpawned) -> Rec
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
         peer_cmd: spawned.peer_cmd,
+        block_out: spawned.block_out,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

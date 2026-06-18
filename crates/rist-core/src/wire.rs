@@ -29,7 +29,7 @@ use bytes::Bytes;
 /// Codecs produce it on receive and consume it on send; `flow` stores it in the
 /// seq-indexed ring and deduplicates it by the `(seq, source_time)` pair — the
 /// single test that implements the SMPTE 2022-7 multipath merge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaPacket {
     /// The media sequence number, **always 32-bit at this layer**. Simple and
     /// Main codecs widen the 16-bit RTP sequence number by rollover counting (the
@@ -71,6 +71,20 @@ pub struct MediaPacket {
     /// delivery; only the Advanced codec (the header F/L bits) and the host
     /// reassembler interpret it. Simple/Main always set [`FragRole::Standalone`].
     pub frag: FragRole,
+
+    /// The RIST virtual source port carried in the reduced-overhead data header
+    /// (Main/Advanced). The receiving codec sets it per packet from the wire header;
+    /// the core carries it opaquely through the ring to delivery so the host can
+    /// surface it per block (libRIST data-block `virt_src_port`). `0` on a send-built
+    /// packet (the sending codec uses the configured port) and on the Simple profile,
+    /// which has no virtual ports.
+    pub virt_src_port: u16,
+
+    /// The RIST virtual destination port carried in the reduced-overhead data header
+    /// (Main/Advanced) — the demux key for virtual-stream muxing. Set per packet on
+    /// receive; `0` on a send-built packet and on the Simple profile. See
+    /// [`MediaPacket::virt_src_port`].
+    pub virt_dst_port: u16,
 }
 
 /// The Advanced-profile fragment role of a [`MediaPacket`] (TR-06-3 §5.2.2),

@@ -112,6 +112,10 @@ pub(crate) struct MediaBlock {
     pub(crate) seq: u32,
     /// The packet's NTP-64 source timestamp.
     pub(crate) source_time: u64,
+    /// The RIST virtual source/destination ports decoded from the packet (Main; `0` on
+    /// the Simple/Advanced profiles, which carry none). Surfaced per block to the app.
+    pub(crate) virt_src_port: u16,
+    pub(crate) virt_dst_port: u16,
     /// The delivered media payload.
     pub(crate) payload: Bytes,
 }
@@ -578,6 +582,8 @@ impl Driver {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    // FEC-recovered packets carry no virtual ports (not in the matrix).
+                    ..Default::default()
                 },
             );
         }

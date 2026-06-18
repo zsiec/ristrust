@@ -199,6 +199,10 @@ impl Flow {
                 retransmit: false,
                 path_id: tx_path,
                 frag,
+                // The sending codec encodes the configured virtual ports; the waist
+                // carries them only on the receive path (per-packet decode).
+                virt_src_port: 0,
+                virt_dst_port: 0,
             },
         });
         self.sender.data_bw.feed(now, wire_n); // recovery_maxbitrate data-rate EWMA
@@ -302,6 +306,8 @@ impl Flow {
                         retransmit: true,
                         path_id: tx_path,
                         frag,
+                        virt_src_port: 0,
+                        virt_dst_port: 0,
                     },
                 });
                 self.sender.retry_bw.feed(now, retry_n);
@@ -405,6 +411,7 @@ mod tests {
                         retransmit: false,
                         path_id: 0,
                         frag: FragRole::Standalone,
+                        ..Default::default()
                     },
                 },
             ]
@@ -430,6 +437,7 @@ mod tests {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    ..Default::default()
                 },
             }]
         );
@@ -533,6 +541,7 @@ mod tests {
                 retransmit: true,
                 path_id: 0,
                 frag: FragRole::Standalone,
+                ..Default::default()
             }]
         );
         let st = f.stats();

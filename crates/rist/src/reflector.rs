@@ -147,6 +147,7 @@ async fn pump(mut block_out: mpsc::Receiver<MediaBlock>, senders: Vec<Sender>) {
         seq,
         source_time,
         payload,
+        ..
     }) = block_out.recv().await
     {
         for s in &senders {

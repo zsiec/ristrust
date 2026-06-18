@@ -101,6 +101,10 @@ enum Region {
         region: Bytes,
         is_rtcp: bool,
         encrypted: bool,
+        /// The reduced-overhead virtual source/destination ports from this datagram's
+        /// header, carried to the media decoder so they reach the delivered packet.
+        virt_src_port: u16,
+        virt_dst_port: u16,
     },
     /// A VSF control datagram that carries no media or feedback.
     Control(Decoded),
@@ -215,6 +219,7 @@ impl MainCodec {
                 region,
                 is_rtcp: true,
                 encrypted: true,
+                ..
             }) => rtcp::parse_compound(&region).ok().and_then(|pkts| {
                 pkts.into_iter().find_map(|p| match p {
                     RtcpPacket::Sdes(s) => Some(s.cname),
@@ -723,14 +728,21 @@ impl MainCodec {
                 region,
                 is_rtcp: true,
                 encrypted,
+                ..
             } => Ok(Decoded::Feedback(
                 self.decode_feedback_main(&region, nack_ref, encrypted)?,
             )),
             Region::Inner {
                 region,
                 is_rtcp: false,
+                virt_src_port,
+                virt_dst_port,
                 ..
-            } => Ok(Decoded::Media(self.decode_media_main(&region)?)),
+            } => Ok(Decoded::Media(self.decode_media_main(
+                &region,
+                virt_src_port,
+                virt_dst_port,
+            )?)),
         }
     }
 
@@ -774,8 +786,9 @@ impl MainCodec {
             region = region.slice(vn..);
         }
 
-        // Strip the reduced-overhead header; the inner packet follows.
-        let (_, n) = gre::ReducedHeader::parse(&region)?;
+        // Strip the reduced-overhead header; the inner packet follows. Keep its virtual
+        // ports so the media decoder can surface them per packet (libRIST data-block).
+        let (reduced, n) = gre::ReducedHeader::parse(&region)?;
         region = region.slice(n..);
 
         // Demux on the inner packet's payload-type byte (the authoritative rule).
@@ -787,6 +800,8 @@ impl MainCodec {
             region,
             is_rtcp: (RTCP_PT_MIN..=RTCP_PT_MAX).contains(&pt),
             encrypted,
+            virt_src_port: reduced.src_port,
+            virt_dst_port: reduced.dst_port,
         })
     }
 
@@ -815,7 +830,12 @@ impl MainCodec {
     /// payload when the RTP X bit carries the RIST NPD extension at its canonical
     /// shape. The 32-bit media sequence always widens by rollover counting (the
     /// extension's seq_ext is ignored, as libRIST never populates it on this path).
-    fn decode_media_main(&mut self, region: &Bytes) -> Result<MediaPacket, CodecError> {
+    fn decode_media_main(
+        &mut self,
+        region: &Bytes,
+        virt_src_port: u16,
+        virt_dst_port: u16,
+    ) -> Result<MediaPacket, CodecError> {
         let p = rtp::Packet::decode(region)?;
         if p.header.version != rtp::VERSION {
             return Err(CodecError::BadVersion(p.header.version));
@@ -853,6 +873,8 @@ impl MainCodec {
             path_id: 0,
             // The Main profile does not fragment; every payload is whole.
             frag: rist_core::wire::FragRole::Standalone,
+            virt_src_port,
+            virt_dst_port,
         })
     }
 
@@ -1060,6 +1082,7 @@ mod tests {
             retransmit: false,
             path_id: 0,
             frag: rist_core::wire::FragRole::Standalone,
+            ..Default::default()
         };
         let got = c.encode_media(&pkt).unwrap();
         let want: &[u8] = &[
@@ -1095,6 +1118,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             };
             let dg = enc.encode_media(&pkt).unwrap();
             let got = must_media(&mut dec, &dg);
@@ -1122,6 +1146,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             };
             let dg = enc.encode_media(&pkt).unwrap();
             let got = must_media(&mut dec, &dg);
@@ -1148,6 +1173,7 @@ mod tests {
             retransmit: false,
             path_id: 0,
             frag: rist_core::wire::FragRole::Standalone,
+            ..Default::default()
         };
         let dg0 = enc.encode_media(&orig).unwrap();
         let d0 = must_media(&mut dec, &dg0);
@@ -1160,6 +1186,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             };
             must_media(&mut dec, &enc.encode_media(&p).unwrap());
         }
@@ -1272,6 +1299,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         assert!(matches!(dec.decode(&media, 0).unwrap(), Decoded::Media(_)));
@@ -1305,6 +1333,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         assert!(
@@ -1324,6 +1353,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         assert!(
@@ -1345,6 +1375,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         let lead = RtcpPacket::EmptyReceiverReport(EmptyReceiverReport { ssrc: 1 });
@@ -1358,6 +1389,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         assert_eq!((seq_of(&m0), seq_of(&f1), seq_of(&m2)), (0, 1, 2));
@@ -1378,6 +1410,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: rist_core::wire::FragRole::Standalone,
+                ..Default::default()
             })
             .unwrap();
         let got = must_media(&mut dec, &dg);
@@ -1418,6 +1451,7 @@ mod tests {
             retransmit: false,
             path_id: 0,
             frag: rist_core::wire::FragRole::Standalone,
+            ..Default::default()
         };
         let dg = enc.encode_media(&pkt).unwrap();
         let (mut hdr, off) = gre::Header::parse(&dg).unwrap();
@@ -1485,6 +1519,7 @@ mod tests {
                     retransmit: false,
                     path_id: 0,
                     frag: rist_core::wire::FragRole::Standalone,
+                    ..Default::default()
                 })
                 .unwrap();
             let (kind, _, _) = dec.peek_control(&md);

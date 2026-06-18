@@ -88,6 +88,9 @@ pub(crate) struct ReceiverSpawned {
     /// Runtime bonded-path add/remove channel (`Receiver::add_path`/`remove_path`);
     /// `Some` only on a default-runtime Main/Advanced bonded receiver.
     pub(crate) peer_cmd: Option<mpsc::Sender<crate::driver_bonded::PeerCmd>>,
+    /// Per-packet block delivery channel (`Config::block_delivery`, `Receiver::recv_block`);
+    /// `Some` only on a Main receiver built with block delivery.
+    pub(crate) block_out: Option<mpsc::Receiver<crate::driver::MediaBlock>>,
     /// Received out-of-band datagrams (`Receiver::read_oob`); `Some` on a
     /// Main/Advanced receiver. Each is `(GRE protocol type, payload)`.
     pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -573,6 +576,15 @@ pub(crate) fn build_receiver(
         let eap = build_eap_role(cfg, false)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
         let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+        // Per-packet block delivery (Config::block_delivery): the driver delivers each
+        // recovered packet as a MediaBlock on this channel for `Receiver::recv_block`,
+        // bypassing the split-merge payload path.
+        let (block_tx, block_rx) = if cfg.block_delivery {
+            let (t, r) = mpsc::channel(crate::driver::DATA_CAPACITY);
+            (Some(t), Some(r))
+        } else {
+            (None, None)
+        };
         let (data_out, close, stats, task) = MainDriver::spawn_receiver(
             flow,
             socket,
@@ -591,12 +603,14 @@ pub(crate) fn build_receiver(
             cfg.merge_mode,
             rxctrl_rx,
             crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
+            block_tx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
             peer_cmd: None,
+            block_out: block_rx,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -636,6 +650,7 @@ pub(crate) fn build_receiver(
             data_out,
             rx_ctrl: Some(rxctrl_tx),
             peer_cmd: None,
+            block_out: None,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -671,6 +686,7 @@ pub(crate) fn build_receiver(
         data_out,
         rx_ctrl: Some(rxctrl_tx),
         peer_cmd: None,
+        block_out: None,
         oob_out: None,
         oob_in: None,
         close,
@@ -1237,6 +1253,7 @@ pub(crate) fn build_caller_receiver(
             data_out,
             rx_ctrl: Some(rxctrl_tx),
             peer_cmd: None,
+            block_out: None,
             oob_out: None,
             oob_in: None,
             close,
@@ -1282,6 +1299,7 @@ pub(crate) fn build_caller_receiver(
             data_out,
             rx_ctrl: Some(rxctrl_tx),
             peer_cmd: None,
+            block_out: None,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -1316,12 +1334,14 @@ pub(crate) fn build_caller_receiver(
         cfg.merge_mode,
         rxctrl_rx,
         crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
+        None, // caller-receiver: no per-packet block delivery
     );
     Ok(ReceiverSpawned {
         local,
         data_out,
         rx_ctrl: Some(rxctrl_tx),
         peer_cmd: None,
+        block_out: None,
         oob_out: Some(oob_rx),
         oob_in: Some(rev_oob_tx),
         close,
@@ -1610,7 +1630,8 @@ pub(crate) fn build_bonded_receiver(
             local: bound,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
-            peer_cmd: None, // Simple-bonded receiver runtime add/remove is deferred
+            peer_cmd: None,  // Simple-bonded receiver runtime add/remove is deferred
+            block_out: None, // block delivery is single-flow Main only
             oob_out: None,
             oob_in: None,
             close,
@@ -1703,6 +1724,7 @@ pub(crate) fn build_bonded_receiver(
         data_out,
         rx_ctrl: Some(rxctrl_tx),
         peer_cmd,
+        block_out: None, // block delivery is single-flow Main only
         oob_out: None,
         oob_in: None,
         close,

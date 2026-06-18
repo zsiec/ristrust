@@ -68,6 +68,12 @@ struct Slot {
     /// The Advanced fragment role carried by the packet, surfaced at delivery for
     /// the host reassembler.
     frag: FragRole,
+    /// The RIST virtual source port decoded from the packet (Main/Advanced), surfaced at
+    /// delivery so the host can report it per block. `0` on the Simple profile.
+    virt_src_port: u16,
+    /// The RIST virtual destination port decoded from the packet (Main/Advanced). `0` on
+    /// the Simple profile (no virtual ports).
+    virt_dst_port: u16,
     /// `Empty` or `Filled`.
     state: SlotState,
 }
@@ -401,6 +407,10 @@ impl Flow {
         self.receiver.ips_last_arrival = now;
     }
 
+    // The receiver feed: arrival spacing, packet-time mapping, dedup, insert, missing
+    // detection, and timer scheduling in one pass mirroring libRIST's receiver_enqueue;
+    // splitting it would scatter the tightly-ordered state updates.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn recv_feed(&mut self, now: Timestamp, path: u8, pkt: MediaPacket) {
         self.sample_arrival_spacing(now);
 
@@ -515,6 +525,8 @@ impl Flow {
             s.source_time = source_time;
             s.payload = pkt.payload;
             s.frag = pkt.frag;
+            s.virt_src_port = pkt.virt_src_port;
+            s.virt_dst_port = pkt.virt_dst_port;
             s.arrival = now;
             s.packet_time = packet_time;
             s.output_time = output_time;
@@ -707,6 +719,8 @@ impl Flow {
             s.source_time = pkt.source_time;
             s.payload = pkt.payload;
             s.frag = pkt.frag;
+            s.virt_src_port = pkt.virt_src_port;
+            s.virt_dst_port = pkt.virt_dst_port;
             s.arrival = now;
             s.packet_time = now;
             s.output_time = output_time;
@@ -997,10 +1011,17 @@ impl Flow {
     /// Hands the slot's payload to the application and advances the cursor. The
     /// payload reference moves into the event; the slot is cleared.
     fn emit_deliver(&mut self, idx: usize) {
-        let (seqn, source_time, payload, frag) = {
+        let (seqn, source_time, payload, frag, virt_src_port, virt_dst_port) = {
             let s = &mut self.receiver.ring[idx];
             s.state = SlotState::Empty;
-            (s.seq, s.source_time, std::mem::take(&mut s.payload), s.frag)
+            (
+                s.seq,
+                s.source_time,
+                std::mem::take(&mut s.payload),
+                s.frag,
+                s.virt_src_port,
+                s.virt_dst_port,
+            )
         };
         let discontinuity = self.receiver.pending_discontinuity;
         self.receiver.pending_discontinuity = false;
@@ -1010,6 +1031,8 @@ impl Flow {
             payload,
             discontinuity,
             frag,
+            virt_src_port,
+            virt_dst_port,
         });
         self.stats.delivered += 1;
         self.receiver.deliver_next = self.receiver.deliver_next.wrapping_add(1);

@@ -339,6 +339,8 @@ impl AdvCodec {
             retransmit: p.retransmit,
             path_id: 0,
             frag: flags_to_frag(p.first_frag, p.last_frag),
+            // The Advanced compact header carries no virtual ports.
+            ..Default::default()
         })
     }
 
@@ -637,6 +639,7 @@ mod tests {
             retransmit,
             path_id: 0,
             frag: rist_core::wire::FragRole::Standalone,
+            ..Default::default()
         }
     }
 
@@ -709,6 +712,7 @@ mod tests {
                 retransmit: false,
                 path_id: 0,
                 frag: role,
+                ..Default::default()
             };
             let dg = enc.encode_media(&pkt).unwrap();
             let got = must_media(&mut dec, &dg);

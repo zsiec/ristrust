@@ -828,6 +828,7 @@ impl AdvDriver {
             payload,
             discontinuity,
             frag,
+            ..
         }) = self.flow.poll_event()
         {
             // Reassemble a fragment run before delivery; an unfragmented payload

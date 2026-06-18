@@ -169,6 +169,13 @@ pub struct Config {
     /// (the sender stamps `source_time` from the real-time clock — Main/Advanced).
     /// Receiver-side, except RTC also drives the sender's wall-clock stamping.
     pub timing_mode: TimingMode,
+    /// Deliver each recovered packet as a [`DataBlock`](crate::DataBlock) with its
+    /// per-packet metadata — sequence, source timestamp, and decoded virtual ports —
+    /// via [`Receiver::recv_block`](crate::Receiver::recv_block), instead of merged
+    /// payloads via `recv` (libRIST's `rist_receiver_data_block`). Raw per-packet
+    /// granularity: it bypasses the split-merge recombination. Main profile, receiver-
+    /// side; `false` (default) keeps payload delivery.
+    pub block_delivery: bool,
     /// libRIST's return-bandwidth in kbps: caps the receiver's outbound NACK channel
     /// so its retransmission requests stay within an upstream budget on an asymmetric
     /// link. `0` (the default) means unlimited. Receiver-side; ignored by a sender.
@@ -333,6 +340,7 @@ impl Default for Config {
             max_bitrate_kbps: 100_000,
             congestion_control: CongestionMode::Normal,
             timing_mode: TimingMode::Source,
+            block_delivery: false,
             return_bandwidth: 0,
             virt_src_port: 1971,
             virt_dst_port: 1968,
@@ -580,6 +588,17 @@ impl Config {
         self
     }
 
+    /// Enables per-packet block delivery on a receiver (libRIST `rist_receiver_data_block`):
+    /// [`Receiver::recv_block`](crate::Receiver::recv_block) then yields each recovered
+    /// packet as a [`DataBlock`](crate::DataBlock) with its sequence, source timestamp,
+    /// and decoded virtual ports — at raw per-packet granularity (bypassing the
+    /// split-merge recombination), so `recv` is unavailable. Main profile only.
+    #[must_use]
+    pub fn with_block_delivery(mut self, on: bool) -> Config {
+        self.block_delivery = on;
+        self
+    }
+
     /// Caps the receiver's outbound NACK channel at `kbps` (libRIST return-bandwidth);
     /// `0` (the default) means unlimited.
     #[must_use]
@@ -749,6 +768,16 @@ impl Config {
         // Fail closed: reject features a profile would silently ignore.
         let unsupported =
             |feature, profile| ConfigError::ProfileFeatureUnsupported { feature, profile };
+        // Per-packet block delivery (with decoded virtual ports) is wired for the Main
+        // profile's GRE reduced-overhead header.
+        if self.block_delivery && self.profile != Profile::Main {
+            let name = if self.profile == Profile::Simple {
+                "Simple"
+            } else {
+                "Advanced"
+            };
+            return Err(unsupported("per-packet block delivery", name));
+        }
         // Flow attributes are an Advanced-only control message.
         if self.on_flow_attr.is_some() && self.profile != Profile::Advanced {
             let name = if self.profile == Profile::Simple {

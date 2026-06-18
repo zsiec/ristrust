@@ -476,6 +476,7 @@ impl MainDriver {
         merge_mode: MergeMode,
         rx_ctrl: mpsc::Receiver<RxControl>,
         auth: AuthGate,
+        block_out: Option<mpsc::Sender<MediaBlock>>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -511,7 +512,7 @@ impl MainDriver {
             npd_cmd: None,  // a receiver does not delete null packets
             block_in: None, // …nor submit media
             data_out: Some(tx),
-            block_out: None, // a plain receiver delivers payloads, not blocks
+            block_out, // Some => per-packet block delivery (Config::block_delivery)
             rx_ctrl: Some(rx_ctrl),
             oob_out: Some(oob_out),
             learned_ssrc: None,
@@ -1107,21 +1108,26 @@ impl MainDriver {
             source_time,
             payload,
             discontinuity,
+            virt_src_port,
+            virt_dst_port,
             ..
         }) = self.flow.poll_event()
         {
-            // Reflector tap: forward each recovered packet verbatim with its wire
-            // identity (no split merge — a relay re-emits raw packets).
+            // Block tap (reflector or a recv_block consumer): forward each recovered
+            // packet verbatim with its wire identity + per-packet metadata (no split
+            // merge — a relay / metadata reader sees raw packets).
             if let Some(b) = &block {
                 if b.send(MediaBlock {
                     seq,
                     source_time,
+                    virt_src_port,
+                    virt_dst_port,
                     payload,
                 })
                 .await
                 .is_err()
                 {
-                    return; // the reflector pump was dropped.
+                    return; // the block consumer (reflector pump or Receiver) was dropped.
                 }
                 continue;
             }
@@ -1194,6 +1200,8 @@ impl MainDriver {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    // FEC-recovered packets carry no virtual ports (not in the matrix).
+                    ..Default::default()
                 },
             );
         }

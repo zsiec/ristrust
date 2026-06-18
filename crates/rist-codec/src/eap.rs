@@ -1086,6 +1086,14 @@ impl Authenticator {
         self.state == State::Success
     }
 
+    /// The username the peer presented in its IDENTITY RESPONSE (empty until one has
+    /// been received). After a successful handshake this is the authenticated identity,
+    /// used by the host's connection callback (libRIST multi-user SRP).
+    #[must_use]
+    pub fn peer_username(&self) -> &str {
+        &self.username
+    }
+
     /// The SRP session key K derived during a successful handshake, or `None`.
     #[must_use]
     pub fn session_key(&self) -> Option<[u8; HASH_LEN]> {

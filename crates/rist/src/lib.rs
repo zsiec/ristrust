@@ -32,7 +32,9 @@ mod socket;
 pub mod split;
 mod stats;
 
-pub use config::{Config, FlowAttrCallback, NackType, Profile, RateCallback};
+pub use config::{
+    Config, ConnectCallback, ConnectInfo, FlowAttrCallback, NackType, Profile, RateCallback,
+};
 pub use error::{ConfigError, Error};
 pub use fec::{FecCarriage, FecConfig, FecVariant};
 pub use multi::{

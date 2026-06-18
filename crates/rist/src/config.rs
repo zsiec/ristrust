@@ -63,6 +63,47 @@ impl std::fmt::Debug for FlowAttrCallback {
     }
 }
 
+/// Information about a peer offered to a [`ConnectCallback`] when it connects: its
+/// remote address and, for an EAP-SRP-authenticated connection, the username it
+/// authenticated as (libRIST `rist_auth_handler_set`'s connect callback args).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectInfo {
+    /// The peer's remote socket address.
+    pub remote: std::net::SocketAddr,
+    /// The SRP username the peer authenticated as, or `None` for an unauthenticated
+    /// (no-SRP) connection.
+    pub username: Option<String>,
+}
+
+/// An authentication / connection callback (libRIST `rist_auth_handler_set` connect
+/// callback): invoked once when a peer connects — after a successful EAP-SRP handshake,
+/// with the authenticated [`ConnectInfo::username`]. Return `true` to accept the
+/// connection or `false` to reject it (the session is torn down, mirroring libRIST's
+/// non-zero-return rejection). The callback runs on the session task, so it must not
+/// block. Pair it with [`Config::with_srp_users`] to gate which of several configured
+/// identities may connect.
+#[derive(Clone)]
+pub struct ConnectCallback(Arc<dyn Fn(&ConnectInfo) -> bool + Send + Sync>);
+
+impl ConnectCallback {
+    /// Wraps `f` as a connect callback (`true` accepts, `false` rejects).
+    pub fn new(f: impl Fn(&ConnectInfo) -> bool + Send + Sync + 'static) -> ConnectCallback {
+        ConnectCallback(Arc::new(f))
+    }
+
+    /// Invokes the callback; `true` accepts the connection.
+    pub(crate) fn accept(&self, info: &ConnectInfo) -> bool {
+        (self.0)(info)
+    }
+}
+
+impl std::fmt::Debug for ConnectCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectCallback(..)")
+    }
+}
+
 /// The RIST profile (wire dialect) a session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -157,6 +198,13 @@ pub struct Config {
     /// legacy mode from the listener's advertised version, so this flag only affects a
     /// listener. Default: off (the 0.2.16+ PAD-compliant mode).
     pub srp_compat: bool,
+    /// Additional EAP-SRP `(username, password)` credentials a listener (authenticator)
+    /// accepts (libRIST multi-user SRP / `rist_enable_eap_srp_2`): when non-empty, the
+    /// authenticator looks up the verifier for whichever username a connecting peer
+    /// presents, so any of these users (plus `srp_username`/`srp_password` if also set)
+    /// can authenticate. Ignored on a sender. Pair with [`Config::with_connect_callback`]
+    /// to gate which authenticated users are admitted.
+    pub srp_users: Vec<(String, String)>,
     /// Enable LZ4 payload compression on the send path (Advanced profile).
     pub compression: bool,
     /// Split an outbound application payload larger than this many bytes across
@@ -223,6 +271,11 @@ pub struct Config {
     /// Invoked with each inbound flow-attribute payload. `None` (default) ignores
     /// them. Advanced profile only.
     pub on_flow_attr: Option<FlowAttrCallback>,
+    /// The connection accept/reject callback (libRIST `rist_auth_handler_set`). When
+    /// set on a listener, it is invoked once per peer after a successful EAP-SRP
+    /// handshake; returning `false` rejects (tears down) the connection. `None`
+    /// (default) accepts every authenticated peer. See [`Config::with_connect_callback`].
+    pub on_connect: Option<ConnectCallback>,
     /// SMPTE ST 2022-1 / ST 2022-5 forward error correction (TR-06-2 §8.4 /
     /// TR-06-3 §5.3.5). When set, the sender emits row/column FEC and the receiver
     /// recovers loss with no NACK round trip; ARQ remains the backstop. Carried
@@ -289,6 +342,7 @@ impl Default for Config {
             srp_username: None,
             srp_password: None,
             srp_compat: false,
+            srp_users: Vec::new(),
             compression: false,
             fragment_size: 0,
             null_packet_deletion: false,
@@ -301,6 +355,7 @@ impl Default for Config {
             min_bitrate_kbps: 500,
             on_rate_adapt: None,
             on_flow_attr: None,
+            on_connect: None,
             fec: None,
             #[cfg(feature = "dtls")]
             dtls: None,
@@ -580,6 +635,32 @@ impl Config {
         self
     }
 
+    /// Sets the connection accept/reject callback (libRIST `rist_auth_handler_set`) on a
+    /// listener: after a peer completes the EAP-SRP handshake, `f` is invoked with its
+    /// [`ConnectInfo`] (remote address + authenticated username); returning `false`
+    /// rejects and tears the connection down. Pair it with [`Config::with_srp_users`] to
+    /// admit only chosen identities. No-op on a sender or a session without SRP.
+    #[must_use]
+    pub fn with_connect_callback(
+        mut self,
+        f: impl Fn(&ConnectInfo) -> bool + Send + Sync + 'static,
+    ) -> Config {
+        self.on_connect = Some(ConnectCallback::new(f));
+        self
+    }
+
+    /// Adds EAP-SRP `(username, password)` credentials a listener accepts (libRIST
+    /// multi-user SRP / `rist_enable_eap_srp_2`): any of these users may authenticate
+    /// (the verifier is looked up by the username the peer presents), in addition to a
+    /// single `srp_username`/`srp_password` if also configured. Ignored on a sender.
+    /// Each call appends; an entry with an empty username or password is rejected when
+    /// the listener is built.
+    #[must_use]
+    pub fn with_srp_users(mut self, users: impl IntoIterator<Item = (String, String)>) -> Config {
+        self.srp_users.extend(users);
+        self
+    }
+
     /// Sets the canonical name (RTCP SDES CNAME).
     #[must_use]
     pub fn with_cname(mut self, cname: impl Into<String>) -> Config {
@@ -613,6 +694,9 @@ impl Config {
     /// # Errors
     /// Returns the [`ConfigError`] describing the first violation found (buffer,
     /// RTT, retry, keepalive, or bitrate bounds).
+    // A flat sequence of independent range/profile checks; splitting it would only
+    // scatter the validation rules.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ConfigError> {
         let min_ms = self.buffer_min.as_millis();
         if !(50..=30_000).contains(&min_ms) {
@@ -651,7 +735,11 @@ impl Config {
             return Err(ConfigError::MaxBitrateZero);
         }
         // One-way mode has no return channel, so the EAP-SRP handshake cannot run.
-        if self.one_way && (self.srp_username.is_some() || self.srp_password.is_some()) {
+        if self.one_way
+            && (self.srp_username.is_some()
+                || self.srp_password.is_some()
+                || !self.srp_users.is_empty())
+        {
             return Err(ConfigError::OneWayWithAuth);
         }
         // Fail closed: reject features a profile would silently ignore.
@@ -671,7 +759,10 @@ impl Config {
                 if self.secret.is_some() {
                     return Err(unsupported("PSK encryption (secret)", "Simple"));
                 }
-                if self.srp_username.is_some() || self.srp_password.is_some() {
+                if self.srp_username.is_some()
+                    || self.srp_password.is_some()
+                    || !self.srp_users.is_empty()
+                {
                     return Err(unsupported("EAP-SRP authentication", "Simple"));
                 }
                 if self.compression {

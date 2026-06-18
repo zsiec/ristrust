@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use rist_codec::crypto::{self, AesKeyBits};
-use rist_codec::eap::{self, Authenticatee, Authenticator, static_verifier};
+use rist_codec::eap::{self, Authenticatee, Authenticator};
 use rist_codec::srp;
 use rist_core::clock::{Micros, Timestamp};
 use rist_core::flow::{Config as FlowConfig, Flow, Role};
@@ -230,15 +230,13 @@ fn random_start_seq(even: bool) -> u32 {
     if even { seq & !1 } else { seq }
 }
 
-/// Builds the EAP-SRP role for a Main-profile flow when credentials are
-/// configured: a sender authenticates (authenticatee), a listener verifies
-/// (authenticator). The authenticator derives the verifier from a fresh per-session
-/// salt (which it advertises in the CHALLENGE), so it only needs the same
-/// `(username, password)` the sender uses.
+/// Builds the EAP-SRP role for a Main-profile flow when credentials are configured: a
+/// sender authenticates (authenticatee) as its one `(srp_username, srp_password)`; a
+/// listener verifies (authenticator) via a verifier lookup over that user plus any
+/// [`Config::with_srp_users`] multi-user credentials (libRIST multi-user SRP), so any of
+/// them can authenticate. The authenticator derives each verifier from a fresh
+/// per-session salt (advertised in the CHALLENGE).
 fn build_eap_role(cfg: &Config, sender: bool) -> io::Result<Option<EapRole>> {
-    let (Some(user), Some(pass)) = (&cfg.srp_username, &cfg.srp_password) else {
-        return Ok(None);
-    };
     let invalid = |e: eap::EapError| io::Error::new(io::ErrorKind::InvalidInput, e.to_string());
     // With a configured PSK secret the data channel keys from it and SRP only gates
     // (the role must not push "use K" and override the secret); with no secret the
@@ -249,31 +247,55 @@ fn build_eap_role(cfg: &Config, sender: bool) -> io::Result<Option<EapRole>> {
     // For libRIST interop, configure a secret too (the combined PSK+SRP mode).
     let use_key = cfg.secret.is_none();
     if sender {
+        // A sender authenticates AS one identity; multi-user credentials are listener-only.
+        let (Some(user), Some(pass)) = (&cfg.srp_username, &cfg.srp_password) else {
+            return Ok(None);
+        };
         let mut a = Authenticatee::new(user, pass).map_err(invalid)?;
         a.set_use_key_passphrase(use_key);
-        Ok(Some(EapRole::Authenticatee(Box::new(a))))
-    } else {
+        return Ok(Some(EapRole::Authenticatee(Box::new(a))));
+    }
+
+    // Listener (authenticator): collect the single user plus any multi-user credentials.
+    let mut creds: Vec<(&str, &str)> = Vec::new();
+    if let (Some(u), Some(p)) = (&cfg.srp_username, &cfg.srp_password) {
+        creds.push((u, p));
+    }
+    creds.extend(cfg.srp_users.iter().map(|(u, p)| (u.as_str(), p.as_str())));
+    if creds.is_empty() {
+        return Ok(None); // no credentials configured: authentication disabled
+    }
+    // Derive (verifier, salt) per user with a fresh per-session salt, into a lookup
+    // table keyed by username (libRIST's `user_verifier_lookup_t` resolves by the
+    // username a connecting peer presents in its IDENTITY RESPONSE).
+    let group = srp::default_group();
+    let mut table: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> =
+        std::collections::HashMap::with_capacity(creds.len());
+    for (user, pass) in creds {
+        if user.is_empty() || pass.is_empty() {
+            return Err(invalid(eap::EapError::EmptyCredentials));
+        }
         let mut salt = [0u8; 32];
         getrandom::fill(&mut salt)
             .map_err(|_| io::Error::other("rist: srp: CSPRNG unavailable"))?;
-        let verifier =
-            srp::make_verifier(&srp::default_group(), user, pass, &salt).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "rist: srp: invalid credentials",
-                )
-            })?;
-        let lookup = static_verifier(user, verifier, salt.to_vec());
-        // Legacy mode (libRIST srp-compat=1) advertises EAPOL version 2 + unpadded-k/u
-        // SRP; the caller auto-negotiates the matching mode from the version byte.
-        let mut a = if cfg.srp_compat {
-            Authenticator::new_legacy(lookup)
-        } else {
-            Authenticator::new(lookup)
-        };
-        a.set_use_key_passphrase(use_key);
-        Ok(Some(EapRole::Authenticator(Box::new(a))))
+        let verifier = srp::make_verifier(&group, user, pass, &salt).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rist: srp: invalid credentials",
+            )
+        })?;
+        table.insert(user.to_owned(), (verifier, salt.to_vec()));
     }
+    let lookup: eap::VerifierLookup = Box::new(move |username| table.get(username).cloned());
+    // Legacy mode (libRIST srp-compat=1) advertises EAPOL version 2 + unpadded-k/u
+    // SRP; the caller auto-negotiates the matching mode from the version byte.
+    let mut a = if cfg.srp_compat {
+        Authenticator::new_legacy(lookup)
+    } else {
+        Authenticator::new(lookup)
+    };
+    a.set_use_key_passphrase(use_key);
+    Ok(Some(EapRole::Authenticator(Box::new(a))))
 }
 
 /// Derives the PSK send key + receive decryptor pair (both directions encrypt under
@@ -567,6 +589,7 @@ pub(crate) fn build_receiver(
             build_fec(cfg),
             cfg.merge_mode,
             rxctrl_rx,
+            crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -1290,6 +1313,7 @@ pub(crate) fn build_caller_receiver(
         None, // FEC + reversed-role deferred
         cfg.merge_mode,
         rxctrl_rx,
+        crate::driver_main::AuthGate::new(cfg.on_connect.clone()),
     );
     Ok(ReceiverSpawned {
         local,

@@ -30,6 +30,7 @@ use rist_core::wire::{Feedback, FragRole, MediaPacket};
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
+use crate::config::{ConnectCallback, ConnectInfo};
 use crate::driver::{
     AppBlock, COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, MediaBlock, RxControl,
     recv_opt,
@@ -108,6 +109,15 @@ impl EapRole {
         }
     }
 
+    /// The authenticated peer's SRP username, on the authenticator (listener) side
+    /// once it has been presented; `None` on the authenticatee or before identity.
+    pub(crate) fn peer_username(&self) -> Option<&str> {
+        match self {
+            EapRole::Authenticator(a) if !a.peer_username().is_empty() => Some(a.peer_username()),
+            _ => None,
+        }
+    }
+
     /// Whether the handshake reached a terminal failure (the credentials were
     /// rejected): the role is done but not authenticated.
     pub(crate) fn failed(&self) -> bool {
@@ -146,6 +156,40 @@ impl EapRole {
         let mut w = Vec::new();
         frame.append_to(&mut w);
         w
+    }
+}
+
+/// The host connection accept/reject gate (libRIST `rist_auth_handler_set`): on the
+/// listener's first successful authentication it invokes the configured connect callback
+/// once with the peer's [`ConnectInfo`]; a `false` return is recorded as a rejection that
+/// the driver loop turns into an auth teardown. Absent a callback, every peer is admitted.
+pub(crate) struct AuthGate {
+    connect: Option<ConnectCallback>,
+    rejected: bool,
+}
+
+impl AuthGate {
+    /// Builds a gate from the optional connect callback (`None` admits every peer).
+    pub(crate) fn new(connect: Option<ConnectCallback>) -> AuthGate {
+        AuthGate {
+            connect,
+            rejected: false,
+        }
+    }
+
+    /// Offers a freshly-authenticated peer to the callback; returns `true` to admit. A
+    /// `false` return is latched in `rejected` for the loop to tear the session down.
+    fn admit(&mut self, info: &ConnectInfo) -> bool {
+        let ok = self.connect.as_ref().is_none_or(|cb| cb.accept(info));
+        if !ok {
+            self.rejected = true;
+        }
+        ok
+    }
+
+    /// Whether the connect callback rejected the peer.
+    fn rejected(&self) -> bool {
+        self.rejected
     }
 }
 
@@ -295,6 +339,11 @@ pub(crate) struct MainDriver {
     /// The instant of the last rebind (`Timestamp::ZERO` if none), for the backoff and
     /// the recovered-stream reset.
     last_rebind: Timestamp,
+
+    // --- connection accept/reject (libRIST rist_auth_handler_set) ---
+    /// The host connection gate: invoked once on the listener's first authentication to
+    /// accept or reject the peer. A no-op (always admit) without a configured callback.
+    auth: AuthGate,
 }
 
 impl MainDriver {
@@ -376,6 +425,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
+            auth: AuthGate::new(None),
         };
         (tx, close, stats, tokio::spawn(driver.run()))
     }
@@ -401,6 +451,7 @@ impl MainDriver {
         fec: Option<FecState>,
         merge_mode: MergeMode,
         rx_ctrl: mpsc::Receiver<RxControl>,
+        auth: AuthGate,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -458,6 +509,7 @@ impl MainDriver {
             caller_rebind,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
+            auth,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -540,6 +592,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
+            auth: AuthGate::new(None),
         };
         (rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -622,6 +675,7 @@ impl MainDriver {
             caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
+            auth: AuthGate::new(None),
         };
         (in_tx, rx, close, stats, tokio::spawn(driver.run()))
     }
@@ -673,7 +727,15 @@ impl MainDriver {
             let timer_at = self.earliest_timer().map(|ts| self.deadline(ts));
             tokio::select! {
                 msg = inbound.recv() => match msg {
-                    Some(inb) => self.on_inbound(inb).await,
+                    Some(inb) => {
+                        self.on_inbound(inb).await;
+                        // The host connection callback rejected this peer on its first
+                        // authentication: tear the session down with an auth close.
+                        if self.auth.rejected() {
+                            self.close.set_auth();
+                            break;
+                        }
+                    }
                     None => break, // the reader exited (socket error) or the demuxer closed
                 },
                 // Hold outbound media until the data channel is unblocked: the
@@ -1430,6 +1492,25 @@ impl MainDriver {
     /// on a regression out of (or failure after) a prior success it holds media and
     /// arms the bounded re-auth window — a forged or replayed EAPOL frame can then
     /// force at most a bounded media gap, never deliver under an unproven tuple.
+    /// Offers a just-authenticated peer to the host connection gate (libRIST
+    /// `rist_auth_handler_set`): builds the [`ConnectInfo`] (remote address + the SRP
+    /// username) and returns whether the peer is admitted. Admits unconditionally when
+    /// the peer's address is not yet known (it always is at auth success).
+    fn admit_peer(&mut self) -> bool {
+        let Some(remote) = self.peer.media() else {
+            return true;
+        };
+        let info = ConnectInfo {
+            remote,
+            username: self
+                .eap
+                .as_ref()
+                .and_then(EapRole::peer_username)
+                .map(str::to_owned),
+        };
+        self.auth.admit(&info)
+    }
+
     async fn handle_eap(&mut self, now: Timestamp, payload: &[u8]) {
         let was_authed = self.authed;
         // An inbound EAP frame is forward progress: reset the retransmit budget.
@@ -1447,8 +1528,17 @@ impl MainDriver {
         if self.authed {
             // SUCCESS — the initial handshake, or a NAT-rebind / in-band re-auth just
             // completed and re-proved the migrated tuple.
+            let first_connect = !self.ever_authed;
             self.ever_authed = true;
             self.reauthing = false; // any re-auth is now proven and complete
+            // The host connection callback gates the FIRST authentication only (a
+            // re-auth re-proves an already-admitted peer). On rejection, re-gate the
+            // data channel — all media is then dropped (the `!authed` guard in
+            // `on_recv`) — and let the loop tear the session down on `auth.rejected()`.
+            if first_connect && !self.admit_peer() {
+                self.authed = false;
+                return;
+            }
             // On the transition to authenticated, key the data channel. A configured
             // PSK secret keys it already (SRP only gates); with no PSK, re-key to the
             // SRP session key K and push it to the peer.

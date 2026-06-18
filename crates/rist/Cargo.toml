@@ -38,7 +38,7 @@ rist-codec.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "io-util"] }
 # OS CSPRNG for the Main-profile EAP-SRP authenticator's per-session salt.
 getrandom.workspace = true
 # Multicast group membership/egress socket options and `miface` resolution.

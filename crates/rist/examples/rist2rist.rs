@@ -29,12 +29,10 @@ async fn main() {
     // The reflector is Main-profile; default to it so a bare input addr works (a
     // `profile=` query knob in the input URL still overrides).
     let cfg = Config::default().with_profile(Profile::Main);
-    let reflector = reflect(&input, &outputs, cfg)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("rist2rist: {e}");
-            std::process::exit(1);
-        });
+    let reflector = reflect(&input, &outputs, cfg).await.unwrap_or_else(|e| {
+        eprintln!("rist2rist: {e}");
+        std::process::exit(1);
+    });
     let local = reflector
         .local_addr()
         .map_or_else(|_| input.clone(), |a| a.to_string());

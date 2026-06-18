@@ -677,6 +677,18 @@ async fn diff_main_srp_lossy_ristgo_rx() {
 async fn diff_main_srp_lossy_ristrust_rx() {
     ristrust_rx_from_tx("main/srp lossy ristrust-rx", main_srp(), 0.12).await;
 }
+// Pure-SRP (no secret) under loss: the media is cleartext but the receiver→sender feedback
+// — the RTCP carrying NACKs — is encrypted with the SRP session key K. ARQ recovery here
+// therefore exercises the cross-stack K-encrypted-NACK path (the sender must decrypt the
+// peer's K-keyed NACKs to retransmit), which the clean-link pure-SRP cases never do.
+#[tokio::test]
+async fn diff_main_srp_pure_lossy_ristgo_rx() {
+    rx_from_ristrust_tx("main/srp-pure lossy ristgo-rx", main_srp_pure(), 0.12).await;
+}
+#[tokio::test]
+async fn diff_main_srp_pure_lossy_ristrust_rx() {
+    ristrust_rx_from_tx("main/srp-pure lossy ristrust-rx", main_srp_pure(), 0.12).await;
+}
 
 // ---------------------------------------------------------------------------
 // Packet split/merge bonding (libRIST split=/merge=) — both directions, all three

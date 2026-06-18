@@ -96,6 +96,13 @@ pub struct Stats {
     /// `100 × received / (received + lost)`. `100.0` when no packets are expected
     /// (e.g. on a pure sender).
     pub quality: f64,
+    /// Smallest inter-packet arrival gap seen so far (libRIST `min_ips`); zero before
+    /// the first inter-arrival sample, and on a sender.
+    pub inter_packet_min: Duration,
+    /// Most recent inter-packet arrival gap (libRIST `cur_ips`).
+    pub inter_packet_cur: Duration,
+    /// Largest inter-packet arrival gap seen so far (libRIST `max_ips`).
+    pub inter_packet_max: Duration,
 }
 
 impl From<rist_core::flow::Stats> for Stats {
@@ -141,6 +148,9 @@ impl From<rist_core::flow::Stats> for Stats {
             bandwidth_bps: u64::try_from(f.data_bitrate_bps).unwrap_or(0),
             retry_bandwidth_bps: u64::try_from(f.retry_bitrate_bps).unwrap_or(0),
             quality,
+            inter_packet_min: Duration::from_micros(u64::try_from(f.ips_min_us).unwrap_or(0)),
+            inter_packet_cur: Duration::from_micros(u64::try_from(f.ips_cur_us).unwrap_or(0)),
+            inter_packet_max: Duration::from_micros(u64::try_from(f.ips_max_us).unwrap_or(0)),
         }
     }
 }
@@ -163,7 +173,8 @@ impl Stats {
                 "\"sent\":{},\"sent_bytes\":{},\"retransmitted\":{},\"retransmitted_bytes\":{},",
                 "\"retransmit_skipped\":{},\"retransmit_suppressed\":{},",
                 "\"retransmit_exhausted\":{},\"bandwidth_skipped\":{},",
-                "\"rtt_us\":{},\"bandwidth_bps\":{},\"retry_bandwidth_bps\":{},\"quality\":{:.3}",
+                "\"rtt_us\":{},\"bandwidth_bps\":{},\"retry_bandwidth_bps\":{},\"quality\":{:.3},",
+                "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{}",
                 "}}"
             ),
             self.received,
@@ -196,6 +207,9 @@ impl Stats {
             self.bandwidth_bps,
             self.retry_bandwidth_bps,
             self.quality,
+            self.inter_packet_min.as_micros(),
+            self.inter_packet_cur.as_micros(),
+            self.inter_packet_max.as_micros(),
         )
     }
 }
@@ -277,6 +291,9 @@ mod tests {
         core.smoothed_rtt_us = 8_000;
         core.data_bitrate_bps = 12_000_000;
         core.retry_bitrate_bps = 800_000;
+        core.ips_min_us = 3_000;
+        core.ips_cur_us = 4_000;
+        core.ips_max_us = 9_000;
         let s: Stats = core.into();
         assert_eq!(s.received_bytes, 90 * 1316);
         assert_eq!(s.sent_bytes, 100 * 1316);
@@ -286,6 +303,9 @@ mod tests {
         assert_eq!(s.rtt, Duration::from_micros(8_000));
         assert_eq!(s.bandwidth_bps, 12_000_000);
         assert_eq!(s.retry_bandwidth_bps, 800_000);
+        assert_eq!(s.inter_packet_min, Duration::from_micros(3_000));
+        assert_eq!(s.inter_packet_cur, Duration::from_micros(4_000));
+        assert_eq!(s.inter_packet_max, Duration::from_micros(9_000));
         // quality = 100 * received / (received + lost) = 100 * 90 / 100 = 90.0.
         assert!((s.quality - 90.0).abs() < 1e-9, "quality = {}", s.quality);
     }
@@ -311,6 +331,7 @@ mod tests {
             "\"rtt_us\":5000",
             "\"bandwidth_bps\":0",
             "\"quality\":100.000",
+            "\"ips_max_us\":0",
         ] {
             assert!(j.contains(key), "JSON missing {key:?}: {j}");
         }

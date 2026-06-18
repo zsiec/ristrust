@@ -165,6 +165,15 @@ pub(super) struct ReceiverState {
     nack_token_burst: f64,
     nack_tokens: f64,
     nack_tokens_time: Timestamp,
+
+    /// Inter-packet arrival spacing (libRIST `min_ips`/`cur_ips`/`max_ips`): the gap
+    /// between consecutive received media packets, sampled on every arrival.
+    /// `ips_last_arrival` is the previous arrival instant; `ips_min_us` starts at
+    /// `i64::MAX` (a sentinel reported as `0` until the first delta).
+    ips_last_arrival: Timestamp,
+    ips_min_us: i64,
+    ips_cur_us: i64,
+    ips_max_us: i64,
 }
 
 impl ReceiverState {
@@ -195,6 +204,10 @@ impl ReceiverState {
             nack_token_burst: 0.0,
             nack_tokens: 0.0,
             nack_tokens_time: Timestamp::ZERO,
+            ips_last_arrival: Timestamp::ZERO,
+            ips_min_us: i64::MAX,
+            ips_cur_us: 0,
+            ips_max_us: 0,
         }
     }
 
@@ -336,7 +349,34 @@ impl Flow {
     /// The receiver-role body of [`Flow::feed`]: first-packet init, packet-time
     /// mapping, too-late shedding, `(seq, source_time)` dedup, insert, missing
     /// detection, then timer scheduling — following `receiver_enqueue`.
+    /// The inter-packet arrival spacing gauges `(min, cur, max)` in microseconds;
+    /// `min` is reported as `0` until the first inter-arrival delta is sampled.
+    pub(crate) fn ips_gauges(&self) -> (i64, i64, i64) {
+        let min = if self.receiver.ips_min_us == i64::MAX {
+            0
+        } else {
+            self.receiver.ips_min_us
+        };
+        (min, self.receiver.ips_cur_us, self.receiver.ips_max_us)
+    }
+
+    /// Samples the inter-packet arrival gap from the previous arrival, updating the
+    /// spacing gauges. Called on every received packet before any dedup/too-late/reset
+    /// test (matching libRIST's per-arrival measurement); the first packet
+    /// (`started == false`) only seeds the anchor.
+    fn sample_arrival_spacing(&mut self, now: Timestamp) {
+        if self.receiver.started {
+            let delta = (now - self.receiver.ips_last_arrival).as_micros();
+            self.receiver.ips_cur_us = delta;
+            self.receiver.ips_min_us = self.receiver.ips_min_us.min(delta);
+            self.receiver.ips_max_us = self.receiver.ips_max_us.max(delta);
+        }
+        self.receiver.ips_last_arrival = now;
+    }
+
     pub(crate) fn recv_feed(&mut self, now: Timestamp, path: u8, pkt: MediaPacket) {
+        self.sample_arrival_spacing(now);
+
         // Flow-id change (libRIST "Detected flow id change ... resetting state"): a
         // started flow receiving a fresh packet whose flow id (the SSRC with the
         // retransmit LSB masked) differs from the one it anchored on is seeing a new
@@ -1168,6 +1208,23 @@ mod tests {
         let mut p = mk_pkt(seq, src_us, b"x");
         p.ssrc = ssrc;
         p
+    }
+
+    #[test]
+    fn inter_packet_spacing_tracks_arrival_gaps() {
+        const FLOW_A: u32 = 0x1000_0000;
+        let mut f = recv();
+        // First packet only seeds the anchor (no delta yet).
+        f.feed(ts(10_000), 0, pkt_on(100, 0, FLOW_A));
+        let s = f.stats();
+        assert_eq!((s.ips_min_us, s.ips_cur_us, s.ips_max_us), (0, 0, 0));
+        // +5 ms, then +3 ms: cur tracks the last gap, min/max the extremes.
+        f.feed(ts(15_000), 0, pkt_on(101, 7_000, FLOW_A));
+        f.feed(ts(18_000), 0, pkt_on(102, 11_000, FLOW_A));
+        let s = f.stats();
+        assert_eq!(s.ips_cur_us, 3_000);
+        assert_eq!(s.ips_min_us, 3_000);
+        assert_eq!(s.ips_max_us, 5_000);
     }
 
     #[test]

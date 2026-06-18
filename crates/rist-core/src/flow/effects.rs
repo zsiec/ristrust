@@ -113,6 +113,13 @@ pub struct Stats {
     /// The sender's smoothed retransmission bit rate (bits/sec, 1 s window) —
     /// libRIST's `retry_bandwidth`. 0 on a receiver flow.
     pub retry_bitrate_bps: i64,
+    /// Smallest inter-packet arrival gap seen so far, microseconds (libRIST
+    /// `min_ips`); 0 before the first inter-arrival sample, and on a sender flow.
+    pub ips_min_us: i64,
+    /// Most recent inter-packet arrival gap, microseconds (libRIST `cur_ips`).
+    pub ips_cur_us: i64,
+    /// Largest inter-packet arrival gap seen so far, microseconds (libRIST `max_ips`).
+    pub ips_max_us: i64,
 
     // --- Receiver half ---
     /// Media packets accepted into the receiver ring (first copies and accepted

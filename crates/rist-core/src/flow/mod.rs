@@ -284,14 +284,18 @@ impl Flow {
     }
 
     /// A snapshot of this flow's counters, with the live gauges
-    /// ([`smoothed_rtt_us`](Stats::smoothed_rtt_us) and the sender bit-rate fields)
-    /// filled from the current estimator/bitrate state.
+    /// ([`smoothed_rtt_us`](Stats::smoothed_rtt_us), the sender bit-rate fields, and
+    /// the receiver inter-packet-spacing fields) filled from current live state.
     #[must_use]
     pub fn stats(&self) -> Stats {
         let mut s = self.stats;
         s.smoothed_rtt_us = self.est.smoothed().as_micros();
         s.data_bitrate_bps = self.data_bitrate_bps();
         s.retry_bitrate_bps = self.retry_bitrate_bps();
+        let (ips_min, ips_cur, ips_max) = self.ips_gauges();
+        s.ips_min_us = ips_min;
+        s.ips_cur_us = ips_cur;
+        s.ips_max_us = ips_max;
         s
     }
 

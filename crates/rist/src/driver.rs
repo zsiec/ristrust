@@ -62,6 +62,30 @@ pub(crate) enum SimpleInbound {
     Fec { data: Bytes },
 }
 
+/// A runtime control command a [`Receiver`](crate::Receiver) handle sends into its
+/// driver's `select!` loop — the host side of libRIST's receiver runtime setters
+/// (`rist_receiver_nack_type_set`, `rist_recovery_rtt_multiplier_set`). Rare control
+/// traffic on a small-depth channel, applied to live driver/flow state by
+/// [`RxControl::apply`]. The matching sender setter (NPD) rides its own `bool` channel.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RxControl {
+    /// Select the NACK feedback format: `true` = bitmask, `false` = range.
+    NackBitmask(bool),
+    /// Set the recovery-buffer RTT multiplier pushed into the flow core.
+    RttMultiplier(u32),
+}
+
+impl RxControl {
+    /// Applies this command to the driver's NACK-format flag and flow core. Shared
+    /// by every receiver driver so the runtime-setter semantics live in one place.
+    pub(crate) fn apply(self, bitmask: &mut bool, flow: &mut Flow) {
+        match self {
+            RxControl::NackBitmask(b) => *bitmask = b,
+            RxControl::RttMultiplier(m) => flow.set_rtt_multiplier(m),
+        }
+    }
+}
+
 /// Why a session's driver task exited, shared with the public [`Sender`](crate::Sender)
 /// / [`Receiver`](crate::Receiver) handle so a closed channel can surface a specific
 /// [`Error`] (peer timeout, auth failure) instead of a bare [`Error::Closed`]. A
@@ -152,6 +176,10 @@ pub(crate) struct Driver {
     /// The packet-merge state machine (libRIST `merge=`) folding split pairs back
     /// together at delivery; [`MergeMode::Off`] on a sender.
     merger: Merger,
+    /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
+    /// (`set_nack_type` / `set_rtt_multiplier`); `None` on a sender or an injected
+    /// (multi-flow) receiver, which take no such commands.
+    rx_ctrl: Option<mpsc::Receiver<RxControl>>,
 
     // --- source adaptation (TR-06-4 Part 1) ---
     /// The receiver's Link Quality Message emitter, when source adaptation is on.
@@ -223,6 +251,7 @@ impl Driver {
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             merger: Merger::new(MergeMode::Off),
+            rx_ctrl: None, // a sender takes no receiver-control commands
             lqm: None,
             rate,
             fec,
@@ -247,6 +276,7 @@ impl Driver {
         lqm: Option<LqmEmitter>,
         fec: Option<FecState>,
         merge_mode: MergeMode,
+        rx_ctrl: mpsc::Receiver<RxControl>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -278,6 +308,7 @@ impl Driver {
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             merger: Merger::new(merge_mode),
+            rx_ctrl: Some(rx_ctrl),
             lqm,
             rate: None,
             fec,
@@ -335,6 +366,9 @@ impl Driver {
             mdec: MediaDecoder::new(),
             learned_ssrc: None,
             merger: Merger::new(merge_mode),
+            // A demuxed per-flow receiver surfaced via `from_parts` has no control
+            // channel, so runtime setters return `Unimplemented` on it.
+            rx_ctrl: None,
             lqm,
             rate: None,
             fec: None, // multi-flow rejects separate-port FEC (see listen_multi)
@@ -395,6 +429,11 @@ impl Driver {
                         self.drain(now).await;
                     }
                     None => break, // sender's app channel closed: shut down.
+                },
+                // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
+                cmd = recv_opt(&mut self.rx_ctrl) => match cmd {
+                    Some(c) => c.apply(&mut self.bitmask, &mut self.flow),
+                    None => self.rx_ctrl = None, // handle dropped: stop watching
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();
@@ -874,6 +913,17 @@ pub(crate) async fn recv_app_gated(
         return std::future::pending().await;
     }
     match app_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next message on an optional control channel, or never resolves when
+/// there is none (the role takes no such command). Generic over the command type so
+/// every driver shares it for the runtime-setter channels ([`RxControl`], the NPD
+/// `bool`). Mirrors the per-driver `recv_weight` helper, generalized.
+pub(crate) async fn recv_opt<T>(ch: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match ch {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

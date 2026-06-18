@@ -27,6 +27,7 @@ pub struct Sender {
     remote: SocketAddr,
     app_in: mpsc::Sender<Bytes>,
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
+    npd_cmd: Option<mpsc::Sender<bool>>,
     flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -92,6 +93,25 @@ impl Sender {
         };
         let index = u8::try_from(path).map_err(|_| Error::InvalidAddr(format!("path {path}")))?;
         cmd.send((index, weight)).await.map_err(|_| Error::Closed)
+    }
+
+    /// Enables or disables null-packet deletion (NPD) on the send path at runtime — the
+    /// counterpart of libRIST's `rist_sender_npd_enable` / `rist_sender_npd_disable`. NPD
+    /// suppresses MPEG-TS null packets before transmission and signals their positions so
+    /// the receiver reconstructs them byte-exact, shrinking the wire on a padded stream.
+    /// Takes effect from the next submitted packet; the receiver always expands, so the
+    /// toggle is one-sided.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a Simple- or Advanced-profile sender (NPD is a
+    /// Main-profile feature), or [`Error::Closed`] if the session has shut down.
+    pub async fn set_null_packet_deletion(&self, on: bool) -> Result<(), Error> {
+        let Some(cmd) = &self.npd_cmd else {
+            return Err(Error::Unimplemented(
+                "null-packet deletion requires the Main profile",
+            ));
+        };
+        cmd.send(on).await.map_err(|_| self.close.error())
     }
 
     /// Sends one Advanced-profile flow attribute (TR-06-3 §5.3.7): an opaque,
@@ -243,6 +263,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         remote,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        npd_cmd: spawned.npd_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -292,6 +313,7 @@ pub async fn dial_bonded_with(
         remote: peers[0].0,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        npd_cmd: spawned.npd_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -348,6 +370,7 @@ pub async fn dial_bonded_weighted_with(
         remote: resolved[0].0,
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        npd_cmd: spawned.npd_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -396,6 +419,7 @@ pub async fn listen_sender_with(
         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
+        npd_cmd: spawned.npd_cmd,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,

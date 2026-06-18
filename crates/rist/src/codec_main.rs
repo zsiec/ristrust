@@ -181,6 +181,14 @@ impl MainCodec {
         }
     }
 
+    /// Toggles null-packet deletion on the media encode path at runtime — the host
+    /// side of libRIST's `rist_sender_npd_enable`/`_disable`. Takes effect on the next
+    /// packet submitted to [`encode_media`](Self::encode_media); decode is unaffected
+    /// (the NPD extension is self-describing on the wire, so a receiver always expands).
+    pub(crate) fn set_npd(&mut self, on: bool) {
+        self.npd_enabled = on;
+    }
+
     /// The peer's SDES CNAME learned from an encrypted RTCP datagram, if any (the
     /// host trusts it only behind an authenticated session). Used to validate a NAT
     /// source-port rebind re-association: a migrated tuple must present the same CNAME.

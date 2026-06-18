@@ -37,7 +37,7 @@ use crate::bonding::Group;
 use crate::codec::{self};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY};
+use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, RxControl, recv_opt};
 use crate::driver_adv::{adv_ctrl_ts, is_adv_framed};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
@@ -142,6 +142,10 @@ pub(crate) struct BondedDriver {
     /// Runtime `(path_index, weight)` commands from `Sender::set_weight` (sender
     /// only). `None` on a receiver.
     weight_cmd: Option<mpsc::Receiver<(u8, u32)>>,
+    /// Runtime null-packet-deletion toggle from `Sender::set_null_packet_deletion`;
+    /// `Some` only on a Main-profile bonded sender (NPD is Main-only). Applied to every
+    /// path's codec so the 2022-7 copies stay identical.
+    npd_cmd: Option<mpsc::Receiver<bool>>,
     /// The highest first-transmission sequence sent (shared across paths — the RTP
     /// sequence space is one stream), the NACK-widening reference.
     highest_sent: u32,
@@ -150,6 +154,9 @@ pub(crate) struct BondedDriver {
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
+    /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
+    /// (`set_nack_type` / `set_rtt_multiplier`); `Some` only on a self-driven receiver.
+    rx_ctrl: Option<mpsc::Receiver<RxControl>>,
     /// The media SSRC learned from the first inbound packet (one stream, any path).
     learned_ssrc: Option<u32>,
 
@@ -206,6 +213,7 @@ impl BondedDriver {
         adv: Option<AdvCodec>,
         fec: Option<FecState>,
         split_mode: SplitMode,
+        npd_cmd: Option<mpsc::Receiver<bool>>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -230,9 +238,11 @@ impl BondedDriver {
             injected: None,
             app_in: Some(rx),
             weight_cmd: Some(weight_rx),
+            npd_cmd,
             highest_sent: start_seq,
             ssrc,
             data_out: None,
+            rx_ctrl: None, // a sender takes no receiver-control commands
             learned_ssrc: None,
             fec,
             last_weighted: None,
@@ -261,6 +271,7 @@ impl BondedDriver {
         adv: Option<AdvCodec>,
         fec: Option<FecState>,
         merge_mode: MergeMode,
+        rx_ctrl: mpsc::Receiver<RxControl>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -285,9 +296,11 @@ impl BondedDriver {
             injected: None,
             app_in: None,
             weight_cmd: None,
+            npd_cmd: None, // a receiver does not delete null packets
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
+            rx_ctrl: Some(rx_ctrl),
             learned_ssrc: None,
             fec,
             last_weighted: None,
@@ -344,9 +357,12 @@ impl BondedDriver {
             injected: Some(in_rx),
             app_in: None,
             weight_cmd: None,
+            npd_cmd: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(data_tx),
+            // A demuxed per-flow bonded receiver has no settable handle.
+            rx_ctrl: None,
             learned_ssrc: None,
             fec: None,
             last_weighted: None,
@@ -439,6 +455,17 @@ impl BondedDriver {
                     // The command channel closed: stop watching it (the dropped
                     // Sender handle also closes the app channel, which breaks above).
                     None => self.weight_cmd = None,
+                },
+                // Runtime NPD toggle (`Sender::set_null_packet_deletion`): apply to
+                // every path codec so the 2022-7 duplicates stay byte-identical.
+                on = recv_opt(&mut self.npd_cmd) => match on {
+                    Some(on) => for link in &mut self.paths { link.codec.set_npd(on); },
+                    None => self.npd_cmd = None,
+                },
+                // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
+                ctrl = recv_opt(&mut self.rx_ctrl) => match ctrl {
+                    Some(c) => c.apply(&mut self.bitmask, &mut self.flow),
+                    None => self.rx_ctrl = None,
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();

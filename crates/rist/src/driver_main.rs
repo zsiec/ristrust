@@ -30,7 +30,9 @@ use rist_core::wire::{Feedback, FragRole, MediaPacket};
 use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
-use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY};
+use crate::driver::{
+    COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, RxControl, recv_opt,
+};
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
 use crate::socket::MainSocket;
@@ -193,9 +195,16 @@ pub(crate) struct MainDriver {
     /// Application out-of-band datagrams to transmit (`Sender::write_oob`); `Some`
     /// on a sender. Each is `(GRE protocol type, payload)`.
     oob_in: Option<mpsc::Receiver<(u16, Vec<u8>)>>,
+    /// Runtime null-packet-deletion toggle from the [`Sender`](crate::Sender) handle
+    /// (`set_null_packet_deletion`); `Some` only on a sender. Each command sets the
+    /// codec's NPD state for subsequently submitted media.
+    npd_cmd: Option<mpsc::Receiver<bool>>,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
+    /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
+    /// (`set_nack_type` / `set_rtt_multiplier`); `Some` only on a single-flow receiver.
+    rx_ctrl: Option<mpsc::Receiver<RxControl>>,
     /// Received out-of-band datagrams handed to `Receiver::read_oob`; `Some` on a
     /// receiver. Each is `(GRE protocol type, payload)`.
     oob_out: Option<mpsc::Sender<(u16, Bytes)>>,
@@ -299,6 +308,7 @@ impl MainDriver {
         oob_out: mpsc::Sender<(u16, Bytes)>,
         fec: Option<FecState>,
         split_mode: SplitMode,
+        npd_cmd: mpsc::Receiver<bool>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -330,7 +340,9 @@ impl MainDriver {
             highest_sent: start_seq,
             ssrc,
             oob_in: Some(oob_in),
+            npd_cmd: Some(npd_cmd),
             data_out: None,
+            rx_ctrl: None, // a sender takes no receiver-control commands
             oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
@@ -376,6 +388,7 @@ impl MainDriver {
         caller_rebind: bool,
         fec: Option<FecState>,
         merge_mode: MergeMode,
+        rx_ctrl: mpsc::Receiver<RxControl>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -407,7 +420,9 @@ impl MainDriver {
             highest_sent: 0,
             ssrc,
             oob_in: Some(oob_in),
+            npd_cmd: None, // a receiver does not delete null packets
             data_out: Some(tx),
+            rx_ctrl: Some(rx_ctrl),
             oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
@@ -484,7 +499,10 @@ impl MainDriver {
             highest_sent: 0,
             ssrc,
             oob_in: None,
+            npd_cmd: None,
             data_out: Some(tx),
+            // A demuxed per-flow receiver has no settable handle (see `from_parts`).
+            rx_ctrl: None,
             oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
@@ -575,6 +593,16 @@ impl MainDriver {
                 oob = recv_oob_gated(&mut self.oob_in, self.authed) => match oob {
                     Some((proto, payload)) => self.send_oob(&payload, proto).await,
                     None => self.oob_in = None, // write side closed: stop watching
+                },
+                // Runtime NPD toggle from the sender handle (`set_null_packet_deletion`).
+                on = recv_opt(&mut self.npd_cmd) => match on {
+                    Some(on) => self.codec.set_npd(on),
+                    None => self.npd_cmd = None, // handle dropped: stop watching
+                },
+                // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
+                cmd = recv_opt(&mut self.rx_ctrl) => match cmd {
+                    Some(c) => c.apply(&mut self.bitmask, &mut self.flow),
+                    None => self.rx_ctrl = None, // handle dropped: stop watching
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();

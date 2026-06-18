@@ -1185,6 +1185,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_rtt_multiplier_takes_effect_on_next_auto_scale() {
+        // Base: mult 7, smoothed 100 ms -> 100*7 + 15 = 715 ms.
+        let mut f = windowed_recv();
+        f.set_sender_max_buffer(ms(1000));
+        f.est = Estimator::new(ms(100));
+        f.auto_scale_buffer();
+        assert_eq!(f.recovery_buffer.as_micros(), ms(715).as_micros(), "mult 7");
+
+        // A runtime change is read live by the next pass: mult 3 -> 100*3 + 15 = 315 ms
+        // (clamped within [200, 1000], so the full value stands). The decrease is
+        // rate-limited to 50 ms/recalc, so converge to the new steady value.
+        f.set_rtt_multiplier(3);
+        converge(&mut f);
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(315).as_micros(),
+            "mult 3 after runtime set"
+        );
+
+        // 0 disables auto-scaling: the buffer then holds wherever it was.
+        f.set_rtt_multiplier(0);
+        f.est = Estimator::new(ms(500)); // would be huge if scaling were live
+        f.auto_scale_buffer();
+        assert_eq!(
+            f.recovery_buffer.as_micros(),
+            ms(315).as_micros(),
+            "mult 0 freezes the buffer"
+        );
+    }
+
     fn ts(us: u64) -> Timestamp {
         Timestamp::from_micros(us)
     }

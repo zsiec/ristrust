@@ -30,7 +30,9 @@ use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec_adv::{AdvCodec, flags_to_frag};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::config::FlowAttrCallback;
-use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY};
+use crate::driver::{
+    COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, RxControl, recv_opt,
+};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_MAX_CTRL_BODY, FecState};
 use crate::peer::Peer;
@@ -113,6 +115,9 @@ pub(crate) struct AdvDriver {
     /// reassembly; [`MergeMode::Off`] on a sender. In `merge=auto` mode it is enabled
     /// by an inbound GRE-substrate keepalive's L bit.
     merger: Merger,
+    /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
+    /// (`set_nack_type` / `set_rtt_multiplier`); `Some` only on a self-driven receiver.
+    rx_ctrl: Option<mpsc::Receiver<RxControl>>,
 
     // --- EAP-SRP authentication ---
     eap: Option<EapRole>,
@@ -218,6 +223,7 @@ impl AdvDriver {
             greeted: false,
             reasm: FragReassembler::default(),
             merger: Merger::new(MergeMode::Off),
+            rx_ctrl: None, // a sender takes no receiver-control commands
             eap,
             authed,
             ever_authed: false,
@@ -252,6 +258,7 @@ impl AdvDriver {
         oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
         fec: Option<FecState>,
         merge_mode: MergeMode,
+        rx_ctrl: mpsc::Receiver<RxControl>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -287,6 +294,7 @@ impl AdvDriver {
             greeted: false,
             reasm: FragReassembler::default(),
             merger: Merger::new(merge_mode),
+            rx_ctrl: Some(rx_ctrl),
             eap,
             authed,
             ever_authed: false,
@@ -358,6 +366,8 @@ impl AdvDriver {
             greeted: false,
             reasm: FragReassembler::default(),
             merger: Merger::new(merge_mode),
+            // A demuxed per-flow receiver has no settable handle.
+            rx_ctrl: None,
             eap,
             authed,
             ever_authed: false,
@@ -435,6 +445,11 @@ impl AdvDriver {
                 oob = recv_oob(&mut self.oob_in, self.authed) => match oob {
                     Some((proto, payload)) => self.send_oob(&payload, proto).await,
                     None => self.oob_in = None,
+                },
+                // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
+                ctrl = recv_opt(&mut self.rx_ctrl) => match ctrl {
+                    Some(c) => c.apply(&mut self.bitmask, &mut self.flow),
+                    None => self.rx_ctrl = None,
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();

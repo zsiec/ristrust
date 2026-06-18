@@ -5,8 +5,9 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::config::Config;
-use crate::error::Error;
+use crate::config::{Config, NackType};
+use crate::driver::RxControl;
+use crate::error::{ConfigError, Error};
 use crate::runtime::{Runtime, TokioRuntime};
 
 /// An io-native RIST media receiver. Created with [`listen`]; yields in-order,
@@ -18,6 +19,7 @@ pub struct Receiver {
     data_out: mpsc::Receiver<Bytes>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
+    rx_ctrl: Option<mpsc::Sender<RxControl>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -43,6 +45,9 @@ impl Receiver {
             oob_out,
             // A demultiplexed per-flow receiver has no reverse-OOB send channel.
             oob_in: None,
+            // …nor a runtime-control channel (its driver was injected): the runtime
+            // setters return `Unimplemented` on it.
+            rx_ctrl: None,
             close,
             stats,
             task,
@@ -93,6 +98,54 @@ impl Receiver {
     #[must_use]
     pub fn ssrc(&self) -> u32 {
         self.stats.ssrc()
+    }
+
+    /// Switches the NACK feedback format at runtime (libRIST `rist_receiver_nack_type_set`):
+    /// [`NackType::Range`] (the libRIST default) or [`NackType::Bitmask`]. Takes effect
+    /// from the next NACK the receiver emits; the choice is local — a libRIST or ristrust
+    /// sender decodes either format regardless.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a demultiplexed per-flow receiver from a
+    /// [`MultiReceiver`](crate::MultiReceiver) (which has no control channel), or
+    /// [`Error::Closed`] if the session has shut down.
+    pub async fn set_nack_type(&self, nack_type: NackType) -> Result<(), Error> {
+        let Some(cmd) = &self.rx_ctrl else {
+            return Err(Error::Unimplemented(
+                "set_nack_type requires a single-flow receiver",
+            ));
+        };
+        let bitmask = matches!(nack_type, NackType::Bitmask);
+        cmd.send(RxControl::NackBitmask(bitmask))
+            .await
+            .map_err(|_| self.close.error())
+    }
+
+    /// Sets the recovery-buffer RTT multiplier at runtime (libRIST
+    /// `rist_recovery_rtt_multiplier_set`): the factor by which the auto-scaling
+    /// recovery buffer grows relative to the smoothed RTT. Effective only when the
+    /// buffer is windowed (`buffer_min != buffer_max`) and the sender has advertised its
+    /// retained buffer; it then takes effect on the next recalculation cycle (~1 s).
+    /// `multiplier` must be in `1..=100` (the same range [`Config`] validates).
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] if `multiplier` is out of range, [`Error::Unimplemented`]
+    /// on a demultiplexed per-flow receiver, or [`Error::Closed`] if the session has
+    /// shut down.
+    pub async fn set_rtt_multiplier(&self, multiplier: u32) -> Result<(), Error> {
+        if !(1..=100).contains(&multiplier) {
+            return Err(Error::Config(ConfigError::RttMultiplierOutOfRange {
+                value: multiplier,
+            }));
+        }
+        let Some(cmd) = &self.rx_ctrl else {
+            return Err(Error::Unimplemented(
+                "set_rtt_multiplier requires a single-flow receiver",
+            ));
+        };
+        cmd.send(RxControl::RttMultiplier(multiplier))
+            .await
+            .map_err(|_| self.close.error())
     }
 
     /// Reads the next out-of-band datagram's payload (the protocol type is
@@ -203,6 +256,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
+        rx_ctrl: spawned.rx_ctrl,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -246,6 +300,7 @@ pub async fn dial_receiver_with(
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
+        rx_ctrl: spawned.rx_ctrl,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -290,6 +345,7 @@ pub async fn listen_bonded_with(
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
+        rx_ctrl: spawned.rx_ctrl,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -336,6 +392,7 @@ pub async fn listen_bonded_priority_with(
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
+        rx_ctrl: spawned.rx_ctrl,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,

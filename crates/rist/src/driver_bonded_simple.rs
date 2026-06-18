@@ -30,8 +30,8 @@ use crate::adapt::{LqmEmitter, RateControl};
 use crate::bonding::Group;
 use crate::codec::{self, MediaDecoder};
 use crate::driver::{
-    COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, recv_app_gated, seq_after, sleep_until_opt,
-    wall_clock_ntp,
+    COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, RxControl, recv_app_gated, recv_opt, seq_after,
+    sleep_until_opt, wall_clock_ntp,
 };
 use crate::peer::Peer;
 use crate::socket::SimpleSocket;
@@ -114,6 +114,9 @@ pub(crate) struct BondedSimpleDriver {
     /// has no GRE keepalive, so `merge=auto` has no L-bit signal and stays dormant —
     /// use `merge=pairs` on Simple bonding.
     merger: Merger,
+    /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
+    /// (`set_nack_type` / `set_rtt_multiplier`); `Some` only on a self-driven receiver.
+    rx_ctrl: Option<mpsc::Receiver<RxControl>>,
 
     /// Pre-routed inbound feed for a multi-flow demultiplexed receiver: when `Some`,
     /// the [`MultiReceiver`](crate::MultiReceiver) demultiplexer owns the path readers
@@ -170,6 +173,7 @@ impl BondedSimpleDriver {
             lqm: None,
             rate,
             merger: Merger::new(MergeMode::Off),
+            rx_ctrl: None, // a sender takes no receiver-control commands
             injected: None,
         };
         (tx, close, stats, tokio::spawn(driver.run()))
@@ -188,6 +192,7 @@ impl BondedSimpleDriver {
         keepalive: Duration,
         lqm: Option<LqmEmitter>,
         merge_mode: MergeMode,
+        rx_ctrl: mpsc::Receiver<RxControl>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -220,6 +225,7 @@ impl BondedSimpleDriver {
             lqm,
             rate: None,
             merger: Merger::new(merge_mode),
+            rx_ctrl: Some(rx_ctrl),
             injected: None,
         };
         (rx, close, stats, tokio::spawn(driver.run()))
@@ -276,6 +282,8 @@ impl BondedSimpleDriver {
             lqm,
             rate: None,
             merger: Merger::new(merge_mode),
+            // A demuxed per-flow bonded receiver has no settable handle.
+            rx_ctrl: None,
             injected: Some(in_rx),
         };
         (in_tx, data_rx, close, stats, tokio::spawn(driver.run()))
@@ -357,6 +365,11 @@ impl BondedSimpleDriver {
                 cmd = recv_weight(&mut self.weight_cmd) => match cmd {
                     Some((index, weight)) => self.group.set_weight(index, weight),
                     None => self.weight_cmd = None,
+                },
+                // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
+                ctrl = recv_opt(&mut self.rx_ctrl) => match ctrl {
+                    Some(c) => c.apply(&mut self.bitmask, &mut self.flow),
+                    None => self.rx_ctrl = None,
                 },
                 () = sleep_until_opt(timer_at) => {
                     let now = self.now();

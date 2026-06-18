@@ -22,7 +22,7 @@ use crate::bonding::{self, Group};
 use crate::codec_adv::AdvCodec;
 use crate::codec_main::MainCodec;
 use crate::config::{Config, NackType, Profile};
-use crate::driver::{Driver, SimpleInbound};
+use crate::driver::{Driver, RxControl, SimpleInbound};
 use crate::driver_adv::AdvDriver;
 use crate::driver_bonded::{BondedDriver, PathParts};
 use crate::driver_bonded_simple::{BondedSimpleDriver, SimplePathParts};
@@ -50,6 +50,9 @@ pub(crate) struct SenderSpawned {
     /// Runtime `(path, weight)` commands for a bonded sender (`Sender::set_weight`);
     /// `None` for non-bonded senders.
     pub(crate) weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
+    /// Runtime null-packet-deletion toggle (`Sender::set_null_packet_deletion`);
+    /// `Some` only on a Main-profile sender (NPD is Main-only).
+    pub(crate) npd_cmd: Option<mpsc::Sender<bool>>,
     /// Application flow attributes to transmit (`Sender::write_flow_attribute`);
     /// `Some` only on an Advanced sender.
     pub(crate) flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
@@ -73,6 +76,9 @@ pub(crate) struct ReceiverSpawned {
     pub(crate) local: SocketAddr,
     /// Receives delivered payloads from the driver.
     pub(crate) data_out: mpsc::Receiver<Bytes>,
+    /// Runtime receiver-control commands (`Receiver::set_nack_type` /
+    /// `set_rtt_multiplier`); `None` on a demuxed (multi-flow) receiver.
+    pub(crate) rx_ctrl: Option<mpsc::Sender<RxControl>>,
     /// Received out-of-band datagrams (`Receiver::read_oob`); `Some` on a
     /// Main/Advanced receiver. Each is `(GRE protocol type, payload)`.
     pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -369,6 +375,8 @@ pub(crate) fn build_sender(
         let eap = build_eap_role(cfg, true)?;
         let (oob_tx, oob_rx) = mpsc::channel(16);
         let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+        // The runtime NPD-toggle command channel (rare control traffic, small depth).
+        let (npd_tx, npd_rx) = mpsc::channel(16);
         let (app_in, close, stats, task) = MainDriver::spawn_sender(
             flow,
             socket,
@@ -385,11 +393,13 @@ pub(crate) fn build_sender(
             rev_oob_tx,
             build_fec(cfg),
             cfg.split_mode,
+            npd_rx,
         );
         return Ok(SenderSpawned {
             local,
             app_in,
             weight_cmd: None,
+            npd_cmd: Some(npd_tx),
             flow_attr_cmd: None,
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -435,6 +445,7 @@ pub(crate) fn build_sender(
             local,
             app_in,
             weight_cmd: None,
+            npd_cmd: None, // NPD is Main-only
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -467,6 +478,7 @@ pub(crate) fn build_sender(
         local,
         app_in,
         weight_cmd: None,
+        npd_cmd: None, // NPD is Main-only
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,
@@ -500,6 +512,10 @@ pub(crate) fn build_receiver(
     let peer = Peer::new(dur_to_micros(cfg.session_timeout));
     // Multicast group membership when `local` is a group; `None` for unicast.
     let membership = crate::multicast::receiver_membership(cfg, local)?;
+    // The runtime receiver-control channel (`set_nack_type` / `set_rtt_multiplier`);
+    // rare control traffic, small depth. `rxctrl_rx` is moved into whichever profile
+    // branch runs (each returns), `rxctrl_tx` rides out on the spawned handle.
+    let (rxctrl_tx, rxctrl_rx) = mpsc::channel(16);
 
     if cfg.profile == Profile::Main {
         let mut socket = main_receiver_socket(rt, cfg, local, membership.as_ref())?;
@@ -532,10 +548,12 @@ pub(crate) fn build_receiver(
             false, // a listening receiver is not a caller; no caller-rebind
             build_fec(cfg),
             cfg.merge_mode,
+            rxctrl_rx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
+            rx_ctrl: Some(rxctrl_tx),
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -568,10 +586,12 @@ pub(crate) fn build_receiver(
             rev_oob_rx,
             build_fec(cfg),
             cfg.merge_mode,
+            rxctrl_rx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
+            rx_ctrl: Some(rxctrl_tx),
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -600,10 +620,12 @@ pub(crate) fn build_receiver(
         build_lqm_emitter(cfg),
         build_fec(cfg),
         cfg.merge_mode,
+        rxctrl_rx,
     );
     Ok(ReceiverSpawned {
         local: bound,
         data_out,
+        rx_ctrl: Some(rxctrl_tx),
         oob_out: None,
         oob_in: None,
         close,
@@ -945,6 +967,7 @@ pub(crate) fn build_listener_sender(
             local: bound,
             app_in,
             weight_cmd: None,
+            npd_cmd: None, // NPD is Main-only
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -991,6 +1014,7 @@ pub(crate) fn build_listener_sender(
             local: bound,
             app_in,
             weight_cmd: None,
+            npd_cmd: None, // NPD is Main-only
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -1004,6 +1028,7 @@ pub(crate) fn build_listener_sender(
     let eap = build_eap_role(cfg, true)?; // the media sender is the authenticatee
     let (oob_tx, oob_rx) = mpsc::channel(16);
     let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+    let (npd_tx, npd_rx) = mpsc::channel(16);
     let (app_in, close, stats, task) = MainDriver::spawn_sender(
         flow,
         socket,
@@ -1020,11 +1045,13 @@ pub(crate) fn build_listener_sender(
         rev_oob_tx,
         None, // FEC + reversed-role deferred
         cfg.split_mode,
+        npd_rx,
     );
     Ok(SenderSpawned {
         local: bound,
         app_in,
         weight_cmd: None,
+        npd_cmd: Some(npd_tx),
         flow_attr_cmd: None,
         oob_in: Some(oob_tx),
         oob_out: Some(rev_oob_rx),
@@ -1042,6 +1069,9 @@ pub(crate) fn build_listener_sender(
 ///
 /// # Errors
 /// As [`build_caller_receiver`]'s profile/feature checks, or an I/O bind error.
+// A per-profile dispatch builder (Simple / Advanced / Main), each branch wiring the
+// full session config; splitting it would only scatter that wiring.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn build_caller_receiver(
     rt: &dyn Runtime,
     cfg: &Config,
@@ -1050,6 +1080,9 @@ pub(crate) fn build_caller_receiver(
     require_reversible(cfg)?;
     let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
     let egress = crate::multicast::sender_egress(cfg, remote)?;
+    // The runtime receiver-control channel; `rxctrl_rx` is moved into whichever profile
+    // branch runs (each returns), `rxctrl_tx` rides out on the spawned handle.
+    let (rxctrl_tx, rxctrl_rx) = mpsc::channel(16);
 
     // Simple reversed-role caller-receiver: dial the listener-sender's even/odd pair and
     // announce via RTCP (the keepalive RR teaches the sender our address); media then
@@ -1073,10 +1106,12 @@ pub(crate) fn build_caller_receiver(
             build_lqm_emitter(cfg),
             None, // FEC + reversed-role deferred
             cfg.merge_mode,
+            rxctrl_rx,
         );
         return Ok(ReceiverSpawned {
             local,
             data_out,
+            rx_ctrl: Some(rxctrl_tx),
             oob_out: None,
             oob_in: None,
             close,
@@ -1115,10 +1150,12 @@ pub(crate) fn build_caller_receiver(
             rev_oob_rx,
             None, // FEC + reversed-role deferred
             cfg.merge_mode,
+            rxctrl_rx,
         );
         return Ok(ReceiverSpawned {
             local,
             data_out,
+            rx_ctrl: Some(rxctrl_tx),
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -1151,10 +1188,12 @@ pub(crate) fn build_caller_receiver(
         caller_rebind,
         None, // FEC + reversed-role deferred
         cfg.merge_mode,
+        rxctrl_rx,
     );
     Ok(ReceiverSpawned {
         local,
         data_out,
+        rx_ctrl: Some(rxctrl_tx),
         oob_out: Some(oob_rx),
         oob_in: Some(rev_oob_tx),
         close,
@@ -1273,6 +1312,7 @@ pub(crate) fn build_bonded_sender(
             local,
             app_in,
             weight_cmd: Some(weight_tx),
+            npd_cmd: None, // NPD is Main-only
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -1311,6 +1351,14 @@ pub(crate) fn build_bonded_sender(
     let adv = (cfg.profile == Profile::Advanced)
         .then(|| build_adv_codec(cfg, ssrc))
         .transpose()?;
+    // The runtime NPD-toggle channel, wired only for a Main-profile bonded sender (NPD
+    // is Main-only; an Advanced bonded sender frames media through the shared adv codec).
+    let (npd_cmd, npd_rx) = if cfg.profile == Profile::Main {
+        let (tx, rx) = mpsc::channel(16);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (app_in, close, stats, task) = BondedDriver::spawn_sender(
         flow,
         group,
@@ -1325,11 +1373,13 @@ pub(crate) fn build_bonded_sender(
         adv,
         build_fec(cfg),
         cfg.split_mode,
+        npd_rx,
     );
     Ok(SenderSpawned {
         local,
         app_in,
         weight_cmd: Some(weight_tx),
+        npd_cmd,
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,
@@ -1360,6 +1410,9 @@ pub(crate) fn build_bonded_receiver(
     // Per-path NACK-recovery priority (libRIST recovery-priority); the bonding Group's
     // NACK-peer selection prefers the highest. Missing entries default to 0.
     let prio = |i: usize| priorities.get(i).copied().unwrap_or(0);
+    // The runtime receiver-control channel; `rxctrl_rx` is moved into whichever profile
+    // branch runs (each returns), `rxctrl_tx` rides out on the spawned handle.
+    let (rxctrl_tx, rxctrl_rx) = mpsc::channel(16);
 
     // Simple bonds through the even/odd BondedSimpleDriver: one media+RTCP socket pair
     // per path, all merged into the one flow.
@@ -1401,10 +1454,12 @@ pub(crate) fn build_bonded_receiver(
             cfg.keepalive_interval,
             build_lqm_emitter(cfg),
             cfg.merge_mode,
+            rxctrl_rx,
         );
         return Ok(ReceiverSpawned {
             local: bound,
             data_out,
+            rx_ctrl: Some(rxctrl_tx),
             oob_out: None,
             oob_in: None,
             close,
@@ -1467,10 +1522,12 @@ pub(crate) fn build_bonded_receiver(
         adv,
         build_fec(cfg),
         cfg.merge_mode,
+        rxctrl_rx,
     );
     Ok(ReceiverSpawned {
         local: bound,
         data_out,
+        rx_ctrl: Some(rxctrl_tx),
         oob_out: None,
         oob_in: None,
         close,

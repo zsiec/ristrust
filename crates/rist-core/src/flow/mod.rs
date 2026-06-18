@@ -283,6 +283,18 @@ impl Flow {
         &self.cfg
     }
 
+    /// Sets the recovery-buffer RTT multiplier ([`Config::rtt_multiplier`]) at
+    /// runtime — the receiver mirror of libRIST's `rist_recovery_rtt_multiplier_set`.
+    /// The new value is read live by the next auto-scale pass (the receiver's periodic
+    /// RTT-echo timer), and only when the buffer is windowed (`recovery_buffer_min !=
+    /// recovery_buffer_max`) and the peer has advertised a sender max; otherwise the
+    /// buffer stays the static midpoint and this is inert. `0` disables auto-scaling.
+    /// Range validation is the host's job (libRIST accepts `>= 1`). Already-buffered
+    /// packets keep their fixed deadlines, so this never re-dates a queued packet.
+    pub fn set_rtt_multiplier(&mut self, multiplier: u32) {
+        self.cfg.rtt_multiplier = multiplier;
+    }
+
     /// A snapshot of this flow's counters, with the live gauges
     /// ([`smoothed_rtt_us`](Stats::smoothed_rtt_us), the sender bit-rate fields, and
     /// the receiver inter-packet-spacing fields) filled from current live state.

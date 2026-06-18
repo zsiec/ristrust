@@ -643,6 +643,76 @@ pub(crate) fn build_receiver(
     })
 }
 
+/// The handles of a spawned reflector input: a listening Main receiver that delivers
+/// recovered, in-order [`MediaBlock`](crate::driver::MediaBlock)s (seq + source_time +
+/// payload) to a [`Reflector`](crate::Reflector) pump instead of bare payloads.
+pub(crate) struct ReflectorInputSpawned {
+    /// The bound local address.
+    pub(crate) local: SocketAddr,
+    /// Recovered, in-order media blocks for the reflector pump to re-emit.
+    pub(crate) block_out: mpsc::Receiver<crate::driver::MediaBlock>,
+    /// Why the driver exited, read once the channel closes.
+    pub(crate) close: crate::driver::CloseFlag,
+    /// The live stats snapshot of the input flow.
+    pub(crate) stats: crate::stats::StatsCell,
+    /// The driver task handle (aborted on close).
+    pub(crate) task: tokio::task::JoinHandle<()>,
+}
+
+/// Builds and spawns a Main-profile **reflector input**: a listening receiver bound to
+/// `local` that recovers and orders the inbound flow, delivering each packet as a
+/// [`MediaBlock`](crate::driver::MediaBlock) for transparent re-emission. Main profile
+/// only (a reflector fans GRE flows); OOB and the runtime setters are not exposed.
+///
+/// # Errors
+/// Returns an I/O error if the profile is not Main, the socket cannot be bound, or an
+/// invalid secret prevents PSK key derivation.
+pub(crate) fn build_reflector_input(
+    rt: &dyn Runtime,
+    cfg: &Config,
+    local: SocketAddr,
+) -> io::Result<ReflectorInputSpawned> {
+    if cfg.profile != Profile::Main {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rist: reflector requires the Main profile",
+        ));
+    }
+    let flow = Flow::new(Role::Receiver, flow_config(cfg, 0, 0));
+    let peer = Peer::new(dur_to_micros(cfg.session_timeout));
+    let membership = crate::multicast::receiver_membership(cfg, local)?;
+    let socket = main_receiver_socket(rt, cfg, local, membership.as_ref())?;
+    let bound = socket.local()?;
+    let codec = build_main_codec(cfg, DEFAULT_FLOW_SSRC)?;
+    let eap = build_eap_role(cfg, false)?;
+    // OOB on a reflector input is dropped: the driver's delivery is best-effort, so an
+    // unread oob_out is harmless, and no reverse OOB is ever sent.
+    let (oob_tx, _oob_rx) = mpsc::channel(16);
+    let (_rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
+    let (block_out, close, stats, task) = MainDriver::spawn_reflector_input(
+        flow,
+        socket,
+        peer,
+        codec,
+        DEFAULT_FLOW_SSRC,
+        flow_mac(DEFAULT_FLOW_SSRC),
+        bitmask_of(cfg),
+        cfg.keepalive_interval,
+        eap,
+        build_lqm_emitter(cfg),
+        oob_tx,
+        rev_oob_rx,
+        build_fec(cfg),
+    );
+    Ok(ReflectorInputSpawned {
+        local: bound,
+        block_out,
+        close,
+        stats,
+        task,
+    })
+}
+
 /// Builds one **injected** Simple-profile receiver flow for a [`MultiReceiver`]:
 /// a per-flow [`Driver`] driven by an external demultiplexer rather than its own
 /// socket reader. `socket` is the shared bound socket (cloned per flow for sends);

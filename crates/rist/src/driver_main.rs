@@ -31,7 +31,8 @@ use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::driver::{
-    AppBlock, COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, RxControl, recv_opt,
+    AppBlock, COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, MediaBlock, RxControl,
+    recv_opt,
 };
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
@@ -205,6 +206,11 @@ pub(crate) struct MainDriver {
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
+    /// Reflector tap: when `Some`, in-order recovery-complete deliveries are forwarded
+    /// here as [`MediaBlock`]s (seq + source_time + payload, bypassing the split merger)
+    /// instead of to `data_out`, so a [`Reflector`](crate::Reflector) can re-emit them
+    /// transparently. `Some` only on a reflector-input driver.
+    block_out: Option<mpsc::Sender<MediaBlock>>,
     /// Runtime receiver-control commands from the [`Receiver`](crate::Receiver) handle
     /// (`set_nack_type` / `set_rtt_multiplier`); `Some` only on a single-flow receiver.
     rx_ctrl: Option<mpsc::Receiver<RxControl>>,
@@ -347,7 +353,8 @@ impl MainDriver {
             npd_cmd: Some(npd_cmd),
             block_in: Some(block_in),
             data_out: None,
-            rx_ctrl: None, // a sender takes no receiver-control commands
+            block_out: None, // a sender does not deliver
+            rx_ctrl: None,   // a sender takes no receiver-control commands
             oob_out: Some(oob_out),
             learned_ssrc: None,
             greeted: false,
@@ -428,6 +435,7 @@ impl MainDriver {
             npd_cmd: None,  // a receiver does not delete null packets
             block_in: None, // …nor submit media
             data_out: Some(tx),
+            block_out: None, // a plain receiver delivers payloads, not blocks
             rx_ctrl: Some(rx_ctrl),
             oob_out: Some(oob_out),
             learned_ssrc: None,
@@ -448,6 +456,88 @@ impl MainDriver {
             reader: Some(reader),
             in_tx: Some(in_tx),
             caller_rebind,
+            rebind_attempts: 0,
+            last_rebind: Timestamp::ZERO,
+        };
+        (rx, close, stats, tokio::spawn(driver.run()))
+    }
+
+    /// Builds and spawns a Main-profile **reflector input**: a listening receiver that
+    /// recovers and orders the inbound flow exactly like [`spawn_receiver`](Self::spawn_receiver),
+    /// but delivers each packet as a [`MediaBlock`] (seq + source_time + payload) on the
+    /// returned channel instead of a bare payload, so a [`Reflector`](crate::Reflector)
+    /// can re-emit it preserving its wire identity. No application data channel, no split
+    /// merge (a reflector forwards raw recovered packets), and no caller rebind.
+    #[allow(clippy::too_many_arguments)] // a constructor wiring the session config
+    pub(crate) fn spawn_reflector_input(
+        flow: Flow,
+        socket: MainSocket,
+        peer: Peer,
+        codec: MainCodec,
+        ssrc: u32,
+        mac: [u8; 6],
+        bitmask: bool,
+        keepalive: Duration,
+        eap: Option<EapRole>,
+        lqm: Option<LqmEmitter>,
+        oob_out: mpsc::Sender<(u16, Bytes)>,
+        oob_in: mpsc::Receiver<(u16, Vec<u8>)>,
+        fec: Option<FecState>,
+    ) -> (
+        mpsc::Receiver<MediaBlock>,
+        CloseFlag,
+        StatsCell,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = mpsc::channel(DATA_CAPACITY);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_CAPACITY);
+        let reader = spawn_reader(socket.clone(), in_tx.clone());
+        let authed = eap.is_none();
+        let close = CloseFlag::default();
+        let stats = StatsCell::default();
+        let driver = MainDriver {
+            sender: false,
+            flow,
+            socket,
+            peer,
+            epoch: Instant::now(),
+            timers: HashMap::new(),
+            keepalive,
+            codec,
+            mac,
+            bitmask,
+            split_mode: SplitMode::Off,
+            merger: Merger::new(MergeMode::Off),
+            close: close.clone(),
+            stats: stats.clone(),
+            app_in: None,
+            highest_sent: 0,
+            ssrc,
+            oob_in: Some(oob_in),
+            npd_cmd: None,
+            block_in: None,
+            data_out: None,
+            block_out: Some(tx), // deliver MediaBlocks to the reflector pump
+            rx_ctrl: None,
+            oob_out: Some(oob_out),
+            learned_ssrc: None,
+            greeted: false,
+            eap,
+            authed,
+            peer_cname: None,
+            ever_authed: false,
+            reauthing: false,
+            reauth_deadline: Timestamp::ZERO,
+            eap_start_sent: false,
+            eap_last_tx: None,
+            eap_retx: 0,
+            lqm,
+            rate: None,
+            fec,
+            inbound: Some(in_rx),
+            reader: Some(reader),
+            in_tx: Some(in_tx),
+            caller_rebind: false,
             rebind_attempts: 0,
             last_rebind: Timestamp::ZERO,
         };
@@ -508,6 +598,7 @@ impl MainDriver {
             npd_cmd: None,
             block_in: None,
             data_out: Some(tx),
+            block_out: None,
             // A demuxed per-flow receiver has no settable handle (see `from_parts`).
             rx_ctrl: None,
             oob_out: Some(oob_out),
@@ -918,9 +1009,10 @@ impl MainDriver {
         if !fbs.is_empty() {
             self.send_feedback(&fbs, now).await;
         }
-        // Clone the data channel so the merge loop does not borrow `&self` across the
-        // `await` (the EAP role makes `MainDriver` non-`Sync`).
+        // Clone the data/block channels so the delivery loop does not borrow `&self`
+        // across the `await` (the EAP role makes `MainDriver` non-`Sync`).
         let out = self.data_out.clone();
+        let block = self.block_out.clone();
         while let Some(Event::Deliver {
             seq,
             source_time,
@@ -929,6 +1021,21 @@ impl MainDriver {
             ..
         }) = self.flow.poll_event()
         {
+            // Reflector tap: forward each recovered packet verbatim with its wire
+            // identity (no split merge — a relay re-emits raw packets).
+            if let Some(b) = &block {
+                if b.send(MediaBlock {
+                    seq,
+                    source_time,
+                    payload,
+                })
+                .await
+                .is_err()
+                {
+                    return; // the reflector pump was dropped.
+                }
+                continue;
+            }
             for p in self
                 .merger
                 .deliver(seq, source_time, payload, discontinuity)

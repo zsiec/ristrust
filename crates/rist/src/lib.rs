@@ -25,6 +25,7 @@ mod multicast;
 mod peer;
 mod reassembler;
 mod receiver;
+mod reflector;
 mod sender;
 mod session;
 mod socket;
@@ -42,6 +43,7 @@ pub use receiver::{
     Receiver, dial_receiver, dial_receiver_with, listen, listen_bonded, listen_bonded_priority,
     listen_bonded_priority_with, listen_bonded_with, listen_with,
 };
+pub use reflector::{Reflector, reflect, reflect_with};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
 pub use sender::{
     MAX_FRAGMENTS_PER_WRITE, Sender, dial, dial_bonded, dial_bonded_weighted,

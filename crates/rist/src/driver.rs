@@ -101,6 +101,21 @@ pub(crate) struct AppBlock {
     pub(crate) source_time: Option<u64>,
 }
 
+/// One in-order, recovery-complete media delivery with its wire identity — the
+/// receive-side counterpart of [`AppBlock`], carried to a [`Reflector`](crate::Reflector)
+/// so it can re-emit the packet on every output preserving `(seq, source_time)` (a
+/// transparent fan-out relay). Unlike the plain delivery channel (which carries only the
+/// payload), this keeps the sequence number and source timestamp the core delivered.
+#[derive(Debug, Clone)]
+pub(crate) struct MediaBlock {
+    /// The 32-bit (widened) sequence number of the delivered packet.
+    pub(crate) seq: u32,
+    /// The packet's NTP-64 source timestamp.
+    pub(crate) source_time: u64,
+    /// The delivered media payload.
+    pub(crate) payload: Bytes,
+}
+
 /// Why a session's driver task exited, shared with the public [`Sender`](crate::Sender)
 /// / [`Receiver`](crate::Receiver) handle so a closed channel can surface a specific
 /// [`Error`] (peer timeout, auth failure) instead of a bare [`Error::Closed`]. A

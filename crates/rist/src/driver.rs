@@ -86,6 +86,21 @@ impl RxControl {
     }
 }
 
+/// One application payload submitted with optional per-block metadata — the host
+/// carrier for [`Sender::send_block`](crate::Sender::send_block) (libRIST's
+/// `RIST_DATA_FLAGS_USE_SEQ` + `ts_ntp`). `seq`/`source_time` of `None` take the flow's
+/// auto-incremented sequence and `now`-derived timestamp; `Some` values are used
+/// verbatim so a transparent relay can preserve an upstream flow's `(seq, source_time)`.
+#[derive(Debug, Clone)]
+pub(crate) struct AppBlock {
+    /// The media payload.
+    pub(crate) payload: Bytes,
+    /// An explicit sequence number (USE_SEQ), or `None` for the auto sequence.
+    pub(crate) seq: Option<u32>,
+    /// An explicit NTP-64 source timestamp (`ts_ntp`), or `None` to derive from `now`.
+    pub(crate) source_time: Option<u64>,
+}
+
 /// Why a session's driver task exited, shared with the public [`Sender`](crate::Sender)
 /// / [`Receiver`](crate::Receiver) handle so a closed channel can surface a specific
 /// [`Error`] (peer timeout, auth failure) instead of a bare [`Error::Closed`]. A

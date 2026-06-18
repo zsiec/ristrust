@@ -123,6 +123,23 @@ impl Flow {
     /// ring, and emit its first transmission (libRIST `rist_sender_enqueue` followed
     /// by the data send).
     pub(crate) fn send_push_app(&mut self, now: Timestamp, payload: Bytes, frag: FragRole) {
+        self.send_push_app_block(now, payload, frag, None, None);
+    }
+
+    /// As [`Flow::send_push_app`], but with an optional explicit sequence number and/or
+    /// source timestamp (libRIST's `RIST_DATA_FLAGS_USE_SEQ` + `ts_ntp`). `seq` of
+    /// `None` takes the next auto-incremented sequence; `source_time` of `None` derives
+    /// it from `now`. When `seq` is supplied the auto counter is advanced past it so a
+    /// later auto-sequenced send cannot collide. A transparent relay uses this to
+    /// preserve an upstream flow's `(seq, source_time)` on the re-sent copy.
+    pub(crate) fn send_push_app_block(
+        &mut self,
+        now: Timestamp,
+        payload: Bytes,
+        frag: FragRole,
+        seq: Option<u32>,
+        source_time: Option<u64>,
+    ) {
         if !self.sender.started {
             self.sender.started = true;
             // Originate RTT echo requests so the retransmit gate has a real RTT.
@@ -141,9 +158,12 @@ impl Flow {
             }
         }
 
-        let seqn = self.sender.next_seq;
-        self.sender.next_seq = self.sender.next_seq.wrapping_add(1);
-        let source_time = Ntp64::from_timestamp(now).bits();
+        // An explicit (USE_SEQ) sequence is used verbatim, then the auto counter is
+        // advanced past it so a subsequent auto-sequenced send cannot collide; an
+        // absent override takes and advances the counter as usual.
+        let seqn = seq.unwrap_or(self.sender.next_seq);
+        self.sender.next_seq = seqn.wrapping_add(1);
+        let source_time = source_time.unwrap_or_else(|| Ntp64::from_timestamp(now).bits());
         let payload_len = payload.len();
         let wire_n = wire_bytes(payload_len);
 
@@ -413,6 +433,51 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn push_app_block_uses_explicit_seq_and_source_time() {
+        let mut f = sender();
+        // USE_SEQ + ts_ntp: the explicit seq 5000 and source_time are used verbatim,
+        // not the auto sequence (which would have started at 100).
+        f.push_app_block(
+            ts(10_000),
+            Bytes::from_static(b"a"),
+            FragRole::Standalone,
+            Some(5000),
+            Some(src_ntp(7_000)),
+        );
+        let outs = drain_outputs(&mut f);
+        let ms = media_outputs(&outs);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].seq, 5000, "explicit seq used verbatim");
+        assert_eq!(
+            ms[0].source_time,
+            src_ntp(7_000),
+            "explicit source_time used"
+        );
+        // Stored in the history ring at the explicit sequence (so a NACK recovers it).
+        assert_eq!(slot_of(&f, 5000).state, SlotState::Filled);
+
+        // The auto counter advanced past the override: a plain push_app now takes 5001,
+        // never colliding with the app-supplied sequence.
+        f.push_app(ts(11_000), Bytes::from_static(b"b"));
+        let outs = drain_outputs(&mut f);
+        let ms = media_outputs(&outs);
+        assert_eq!(ms[0].seq, 5001, "auto counter advanced past the override");
+
+        // A None override falls back to auto seq + now-derived source_time.
+        f.push_app_block(
+            ts(12_000),
+            Bytes::from_static(b"c"),
+            FragRole::Standalone,
+            None,
+            None,
+        );
+        let outs = drain_outputs(&mut f);
+        let ms = media_outputs(&outs);
+        assert_eq!(ms[0].seq, 5002);
+        assert_eq!(ms[0].source_time, src_ntp(12_000));
     }
 
     #[test]

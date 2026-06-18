@@ -31,7 +31,7 @@ use crate::adapt::{LqmEmitter, RateControl};
 use crate::codec::{self};
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::driver::{
-    COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, RxControl, recv_opt,
+    AppBlock, COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, INBOUND_CAPACITY, RxControl, recv_opt,
 };
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
@@ -199,6 +199,9 @@ pub(crate) struct MainDriver {
     /// (`set_null_packet_deletion`); `Some` only on a sender. Each command sets the
     /// codec's NPD state for subsequently submitted media.
     npd_cmd: Option<mpsc::Receiver<bool>>,
+    /// Application payloads submitted with explicit per-block metadata
+    /// (`Sender::send_block`, USE_SEQ + `ts_ntp`); `Some` only on a sender.
+    block_in: Option<mpsc::Receiver<AppBlock>>,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
@@ -309,6 +312,7 @@ impl MainDriver {
         fec: Option<FecState>,
         split_mode: SplitMode,
         npd_cmd: mpsc::Receiver<bool>,
+        block_in: mpsc::Receiver<AppBlock>,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -341,6 +345,7 @@ impl MainDriver {
             ssrc,
             oob_in: Some(oob_in),
             npd_cmd: Some(npd_cmd),
+            block_in: Some(block_in),
             data_out: None,
             rx_ctrl: None, // a sender takes no receiver-control commands
             oob_out: Some(oob_out),
@@ -420,7 +425,8 @@ impl MainDriver {
             highest_sent: 0,
             ssrc,
             oob_in: Some(oob_in),
-            npd_cmd: None, // a receiver does not delete null packets
+            npd_cmd: None,  // a receiver does not delete null packets
+            block_in: None, // …nor submit media
             data_out: Some(tx),
             rx_ctrl: Some(rx_ctrl),
             oob_out: Some(oob_out),
@@ -500,6 +506,7 @@ impl MainDriver {
             ssrc,
             oob_in: None,
             npd_cmd: None,
+            block_in: None,
             data_out: Some(tx),
             // A demuxed per-flow receiver has no settable handle (see `from_parts`).
             rx_ctrl: None,
@@ -541,6 +548,9 @@ impl MainDriver {
 
     /// The driver loop. Runs until the application channel closes, the peer expires,
     /// or a socket error occurs.
+    // A flat `select!` pump: one arm per input source (inbound, media, OOB, the runtime
+    // command channels, timer, keepalive). Splitting it would only scatter the loop.
+    #[allow(clippy::too_many_lines)]
     async fn run(mut self) {
         // Inbound datagrams arrive over a channel (the injected-feed seam): in
         // single-flow mode `reader` fills it from the owned socket; in multi-flow mode
@@ -598,6 +608,17 @@ impl MainDriver {
                 on = recv_opt(&mut self.npd_cmd) => match on {
                     Some(on) => self.codec.set_npd(on),
                     None => self.npd_cmd = None, // handle dropped: stop watching
+                },
+                // Per-block media submit (`Sender::send_block`, USE_SEQ + ts_ntp). Gated
+                // on the data channel like ordinary media; bypasses split bonding so the
+                // app-supplied sequence is used verbatim.
+                block = recv_block_gated(&mut self.block_in, self.authed && self.peer.media().is_some()) => match block {
+                    Some(b) => {
+                        let now = self.now();
+                        self.flow.push_app_block(now, b.payload, FragRole::Standalone, b.seq, b.source_time);
+                        self.drain(now).await;
+                    }
+                    None => self.block_in = None,
                 },
                 // Runtime receiver setters (`set_nack_type` / `set_rtt_multiplier`).
                 cmd = recv_opt(&mut self.rx_ctrl) => match cmd {
@@ -1589,6 +1610,22 @@ async fn recv_oob_gated(
         return std::future::pending().await;
     }
     match oob_in {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next per-block media submit (`Sender::send_block`); gated like ordinary
+/// media (held until authenticated and the peer is known) and never resolving when
+/// there is no block channel (a receiver).
+async fn recv_block_gated(
+    block_in: &mut Option<mpsc::Receiver<AppBlock>>,
+    ready: bool,
+) -> Option<AppBlock> {
+    if !ready {
+        return std::future::pending().await;
+    }
+    match block_in {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }

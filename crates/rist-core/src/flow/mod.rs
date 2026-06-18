@@ -410,6 +410,25 @@ impl Flow {
         }
     }
 
+    /// Submits one payload with an explicit sequence number and/or source timestamp —
+    /// libRIST's `RIST_DATA_FLAGS_USE_SEQ` (`seq`) plus `ts_ntp` (`source_time`,
+    /// NTP-64 bits). `None` for either falls back to the auto-incremented sequence and
+    /// the `now`-derived timestamp. A transparent relay re-sends an upstream flow's
+    /// packets through this to preserve their `(seq, source_time)` — the pair the
+    /// receiver's 2022-7 merge and playout key on. Sender-only.
+    pub fn push_app_block(
+        &mut self,
+        now: Timestamp,
+        payload: Bytes,
+        frag: FragRole,
+        seq: Option<u32>,
+        source_time: Option<u64>,
+    ) {
+        if self.role == Role::Sender {
+            self.send_push_app_block(now, payload, frag, seq, source_time);
+        }
+    }
+
     /// Fires a previously requested declarative timer; `now` is the instant it
     /// fired. Stale or no-longer-relevant IDs are ignored.
     pub fn handle_timer(&mut self, now: Timestamp, id: TimerId) {

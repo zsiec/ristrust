@@ -28,6 +28,7 @@ pub struct Sender {
     app_in: mpsc::Sender<Bytes>,
     weight_cmd: Option<mpsc::Sender<(u8, u32)>>,
     npd_cmd: Option<mpsc::Sender<bool>>,
+    block_in: Option<mpsc::Sender<crate::driver::AppBlock>>,
     flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -186,6 +187,35 @@ impl Sender {
         rx.recv().await.ok_or(Error::Closed)
     }
 
+    /// Submits one media payload with explicit per-block metadata: an app-chosen
+    /// sequence number (`seq`, libRIST's `RIST_DATA_FLAGS_USE_SEQ`) and/or source
+    /// timestamp (`source_time`, NTP-64 bits — libRIST's `ts_ntp`). `None` for either
+    /// takes the flow's auto-incremented sequence or a `now`-derived timestamp, exactly
+    /// like [`Sender::send`]. Supplying both lets a transparent relay re-emit an upstream
+    /// flow's packets preserving their `(seq, source_time)` — the pair a receiver's
+    /// SMPTE 2022-7 merge and playout key on. Applies back-pressure like [`Sender::send`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-Main sender (per-block submit is wired
+    /// for the single-socket Main profile), or [`Error::Closed`] if the session has shut
+    /// down.
+    pub async fn send_block(
+        &self,
+        payload: &[u8],
+        seq: Option<u32>,
+        source_time: Option<u64>,
+    ) -> Result<(), Error> {
+        let Some(cmd) = &self.block_in else {
+            return Err(Error::Unimplemented("send_block requires the Main profile"));
+        };
+        let block = crate::driver::AppBlock {
+            payload: Bytes::copy_from_slice(payload),
+            seq,
+            source_time,
+        };
+        cmd.send(block).await.map_err(|_| self.close.error())
+    }
+
     /// Submits one media payload for reliable transmission. Applies back-pressure
     /// when the session's send queue is full.
     ///
@@ -264,6 +294,7 @@ pub async fn dial_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Send
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
+        block_in: spawned.block_in,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -314,6 +345,7 @@ pub async fn dial_bonded_with(
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
+        block_in: spawned.block_in,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -371,6 +403,7 @@ pub async fn dial_bonded_weighted_with(
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
+        block_in: spawned.block_in,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,
@@ -420,6 +453,7 @@ pub async fn listen_sender_with(
         app_in: spawned.app_in,
         weight_cmd: spawned.weight_cmd,
         npd_cmd: spawned.npd_cmd,
+        block_in: spawned.block_in,
         flow_attr_cmd: spawned.flow_attr_cmd,
         oob_in: spawned.oob_in,
         oob_out: spawned.oob_out,

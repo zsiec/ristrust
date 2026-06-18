@@ -53,6 +53,9 @@ pub(crate) struct SenderSpawned {
     /// Runtime null-packet-deletion toggle (`Sender::set_null_packet_deletion`);
     /// `Some` only on a Main-profile sender (NPD is Main-only).
     pub(crate) npd_cmd: Option<mpsc::Sender<bool>>,
+    /// Per-block media submit channel (`Sender::send_block`, USE_SEQ + `ts_ntp`);
+    /// `Some` only on a Main-profile single sender.
+    pub(crate) block_in: Option<mpsc::Sender<crate::driver::AppBlock>>,
     /// Application flow attributes to transmit (`Sender::write_flow_attribute`);
     /// `Some` only on an Advanced sender.
     pub(crate) flow_attr_cmd: Option<mpsc::Sender<Vec<u8>>>,
@@ -377,6 +380,8 @@ pub(crate) fn build_sender(
         let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
         // The runtime NPD-toggle command channel (rare control traffic, small depth).
         let (npd_tx, npd_rx) = mpsc::channel(16);
+        // The per-block media submit channel (`Sender::send_block`).
+        let (block_tx, block_rx) = mpsc::channel(crate::driver::COMMAND_CAPACITY);
         let (app_in, close, stats, task) = MainDriver::spawn_sender(
             flow,
             socket,
@@ -394,12 +399,14 @@ pub(crate) fn build_sender(
             build_fec(cfg),
             cfg.split_mode,
             npd_rx,
+            block_rx,
         );
         return Ok(SenderSpawned {
             local,
             app_in,
             weight_cmd: None,
             npd_cmd: Some(npd_tx),
+            block_in: Some(block_tx),
             flow_attr_cmd: None,
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -446,6 +453,7 @@ pub(crate) fn build_sender(
             app_in,
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
+            block_in: None,
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -479,6 +487,7 @@ pub(crate) fn build_sender(
         app_in,
         weight_cmd: None,
         npd_cmd: None, // NPD is Main-only
+        block_in: None,
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,
@@ -968,6 +977,7 @@ pub(crate) fn build_listener_sender(
             app_in,
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
+            block_in: None,
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -1015,6 +1025,7 @@ pub(crate) fn build_listener_sender(
             app_in,
             weight_cmd: None,
             npd_cmd: None, // NPD is Main-only
+            block_in: None,
             flow_attr_cmd: Some(attr_tx),
             oob_in: Some(oob_tx),
             oob_out: Some(rev_oob_rx),
@@ -1029,6 +1040,7 @@ pub(crate) fn build_listener_sender(
     let (oob_tx, oob_rx) = mpsc::channel(16);
     let (rev_oob_tx, rev_oob_rx) = mpsc::channel(16);
     let (npd_tx, npd_rx) = mpsc::channel(16);
+    let (block_tx, block_rx) = mpsc::channel(crate::driver::COMMAND_CAPACITY);
     let (app_in, close, stats, task) = MainDriver::spawn_sender(
         flow,
         socket,
@@ -1046,12 +1058,14 @@ pub(crate) fn build_listener_sender(
         None, // FEC + reversed-role deferred
         cfg.split_mode,
         npd_rx,
+        block_rx,
     );
     Ok(SenderSpawned {
         local: bound,
         app_in,
         weight_cmd: None,
         npd_cmd: Some(npd_tx),
+        block_in: Some(block_tx),
         flow_attr_cmd: None,
         oob_in: Some(oob_tx),
         oob_out: Some(rev_oob_rx),
@@ -1313,6 +1327,7 @@ pub(crate) fn build_bonded_sender(
             app_in,
             weight_cmd: Some(weight_tx),
             npd_cmd: None, // NPD is Main-only
+            block_in: None,
             flow_attr_cmd: None,
             oob_in: None,
             oob_out: None,
@@ -1380,6 +1395,7 @@ pub(crate) fn build_bonded_sender(
         app_in,
         weight_cmd: Some(weight_tx),
         npd_cmd,
+        block_in: None, // per-block send is Main single-sender only for now
         flow_attr_cmd: None,
         oob_in: None,
         oob_out: None,

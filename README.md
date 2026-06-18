@@ -5,11 +5,11 @@ VSF **TR-06** family), the broadcast industry's open standard for reliable
 low-latency video over lossy IP.
 
 > **Status: feature-complete, pre-1.0.** All three RIST profiles (Simple / Main /
-> Advanced), SMPTE 2022-7 bonding, FEC, source adaptation, reversed-role and
-> multi-flow transport are implemented and interoperate with libRIST byte-for-byte
-> — 24 sender/receiver combinations across the profiles, clean and lossy — and
-> with the `ristgo` reference across a 38-case differential matrix. DTLS 1.2 is
-> optional and feature-gated. See the feature matrix below.
+> Advanced), SMPTE 2022-7 bonding, FEC, source adaptation, EAP-SRP authentication,
+> reversed-role and multi-flow transport are implemented and interoperate with
+> libRIST byte-for-byte — 26 sender/receiver combinations across the profiles,
+> clean and lossy — and with the `ristgo` reference across a 46-case differential
+> matrix. DTLS 1.2 is optional and feature-gated. See the feature matrix below.
 
 ## Why
 
@@ -54,7 +54,8 @@ let tx = dial(&addr, cfg).await?;
 # Ok(()) }
 ```
 
-Runnable versions live in [`crates/rist/examples`](crates/rist/examples).
+Runnable versions live in [`crates/rist/examples`](crates/rist/examples), including a
+`rist2rist` relay (receive one stream, re-transmit it to several outputs).
 
 ## Architecture
 
@@ -184,6 +185,8 @@ let cfg = Config::default().with_profile(Profile::Main).with_fec(FecConfig::defa
 - **Multicast**: bind/destination on a group address; `?miface=`/`?ttl=`/`?source=`
   select egress interface, TTL, and an IGMPv3/MLDv2 source filter (see
   [Limitations](#limitations) for IPv6 SSM).
+- **Metrics**: `rist::prometheus::serve` exposes a session's `Stats` (and per-bonded-path
+  stats) on a Prometheus `/metrics` endpoint, no HTTP-framework dependency.
 
 ## `rist://` URL parameters
 
@@ -213,14 +216,15 @@ let cfg = Config::default().with_profile(Profile::Main).with_fec(FecConfig::defa
 
 ## Interoperability
 
-- **libRIST** v0.2.18-rc1 — 24 sender/receiver combinations across Simple / Main /
+- **libRIST** v0.2.18-rc2 — 26 sender/receiver combinations across Simple / Main /
   Advanced, clean and lossy, byte-exact recovery, including packet split/merge both
-  directions, bitmask (RFC 4585) NACK, and PSK key rotation (behind `--features
-  interop`, graceful-skip when the tools are absent).
-- **ristgo** — a 38-case differential matrix (profiles × clear/AES-128/AES-256/LZ4
-  × both directions × clean+lossy, plus all-profile bonding, EAP-SRP, and packet
-  split/merge), driven by the ristgo example binaries (behind `--features
-  differential`, needs `$RISTGO_DIR`).
+  directions, bitmask (RFC 4585) NACK, PSK key rotation, and EAP-SRP in both the
+  combined PSK+SRP and the pure-SRP (`use_key_as_passphrase`, cleartext-media) modes
+  (behind `--features interop`, graceful-skip when the tools are absent).
+- **ristgo** — a 46-case differential matrix (profiles × clear/AES-128/AES-256/LZ4
+  × both directions × clean+lossy, plus all-profile bonding, EAP-SRP single-flow and
+  bonded in both modes, and packet split/merge), driven by the ristgo example binaries
+  (behind `--features differential`, needs `$RISTGO_DIR`).
 
 ## Design principles
 

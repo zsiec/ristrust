@@ -131,6 +131,9 @@ struct PathLink {
     /// Whether this path's data channel is unblocked (true immediately without
     /// EAP, else once its EAP-SRP handshake succeeds).
     authed: bool,
+    /// This receiver path's owned reader task, kept so a runtime `remove_path` can abort
+    /// it. `None` on a sender (one shared reader) or an injected/multi-flow path.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The bonded Main-profile session driver, run as one detached task per flow.
@@ -173,9 +176,14 @@ pub(crate) struct BondedDriver {
     /// Runtime bonded-path add/remove commands from `Sender::add_path`/`remove_path`
     /// (libRIST `rist_peer_create`/`_destroy`); `Some` only on a bonded sender.
     peer_cmd: Option<mpsc::Receiver<PeerCmd>>,
-    /// Builds a runtime-added path's transport+codec state (sender only); invoked on a
-    /// [`PeerCmd::Add`]. `None` on a receiver.
+    /// Builds a runtime-added path's transport+codec state, invoked on a
+    /// [`PeerCmd::Add`]: a sender path (shared socket + remote) or a receiver path (a
+    /// freshly-bound listen socket). `None` when runtime add is unavailable.
     path_factory: Option<PathFactory>,
+    /// A retained inbound-channel sender for a runtime-add-capable receiver, so a
+    /// [`PeerCmd::Add`] can spawn a reader feeding the same channel. `None` on a sender
+    /// or a non-add-capable / injected receiver.
+    inbound_tx: Option<mpsc::Sender<Inbound>>,
     /// The highest first-transmission sequence sent (shared across paths — the RTP
     /// sequence space is one stream), the NACK-widening reference.
     highest_sent: u32,
@@ -273,6 +281,7 @@ impl BondedDriver {
             npd_cmd,
             peer_cmd: Some(peer_cmd),
             path_factory: Some(path_factory),
+            inbound_tx: None, // sender shares one socket; runtime add needs no reader
             highest_sent: start_seq,
             ssrc,
             data_out: None,
@@ -306,6 +315,8 @@ impl BondedDriver {
         fec: Option<FecState>,
         merge_mode: MergeMode,
         rx_ctrl: mpsc::Receiver<RxControl>,
+        peer_cmd: Option<mpsc::Receiver<PeerCmd>>,
+        path_factory: Option<PathFactory>,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -331,8 +342,9 @@ impl BondedDriver {
             app_in: None,
             weight_cmd: None,
             npd_cmd: None, // a receiver does not delete null packets
-            peer_cmd: None,
-            path_factory: None,
+            peer_cmd,
+            path_factory,
+            inbound_tx: None, // run() retains the inbound sender when add-capable
             highest_sent: 0,
             ssrc,
             data_out: Some(tx),
@@ -396,6 +408,7 @@ impl BondedDriver {
             npd_cmd: None,
             peer_cmd: None,
             path_factory: None,
+            inbound_tx: None,
             highest_sent: 0,
             ssrc,
             data_out: Some(data_tx),
@@ -427,6 +440,9 @@ impl BondedDriver {
     /// The driver loop. One reader task per path funnels inbound datagrams into a
     /// single channel; the pump selects over that channel, the application input,
     /// the timer wheel, and the keepalive tick.
+    // A flat reader-setup + `select!` pump: one arm per input source (inbound, media,
+    // the runtime command channels, timer, keepalive). Splitting it would scatter the loop.
+    #[allow(clippy::too_many_lines)]
     async fn run(mut self) {
         let mut readers = Vec::new();
         let mut in_rx = if let Some(rx) = self.injected.take() {
@@ -439,13 +455,28 @@ impl BondedDriver {
                 // The sender shares one source socket across all paths: a single reader
                 // funnels its inbound (the path is resolved by source in `on_recv`).
                 readers.push(spawn_reader(0, self.paths[0].socket.clone(), in_tx.clone()));
+                drop(in_tx); // the sender holds no inbound sender; the reader keeps it open
             } else {
-                // The receiver binds one socket per path: one reader each, by index.
-                for p in &self.paths {
-                    readers.push(spawn_reader(p.index, p.socket.clone(), in_tx.clone()));
+                // The receiver binds one socket per path: one reader each, owned by the
+                // path so a runtime `remove_path` can abort it.
+                for i in 0..self.paths.len() {
+                    let h = spawn_reader(
+                        self.paths[i].index,
+                        self.paths[i].socket.clone(),
+                        in_tx.clone(),
+                    );
+                    self.paths[i].reader = Some(h);
+                }
+                if self.path_factory.is_some() {
+                    // An add-capable receiver retains the inbound sender so a runtime
+                    // `add_path` can spawn a reader feeding the same channel. The channel
+                    // then no longer closes on reader exhaustion; shutdown rides the
+                    // session-timeout (`all_expired`) path instead.
+                    self.inbound_tx = Some(in_tx);
+                } else {
+                    drop(in_tx); // readers keep the channel open; closes on exhaustion
                 }
             }
-            drop(in_tx); // the driver holds no sender; readers keep the channel open
             in_rx
         };
 
@@ -542,6 +573,12 @@ impl BondedDriver {
 
         for r in readers {
             r.abort();
+        }
+        // Abort each receiver path's owned reader (runtime-added or initial).
+        for p in &mut self.paths {
+            if let Some(r) = p.reader.take() {
+                r.abort();
+            }
         }
     }
 
@@ -847,7 +884,15 @@ impl BondedDriver {
                 };
                 match factory(addr) {
                     Ok(parts) => {
-                        self.paths.push(link_path_at(index, parts));
+                        let mut link = link_path_at(index, parts);
+                        // A receiver path owns its socket, so spawn a reader feeding the
+                        // shared inbound channel (the sender's shared reader already covers
+                        // its added remotes).
+                        if let Some(tx) = &self.inbound_tx {
+                            link.reader =
+                                Some(spawn_reader(index, link.socket.clone(), tx.clone()));
+                        }
+                        self.paths.push(link);
                         self.group.add_path(index, weight, priority);
                         tracing::debug!(target: crate::logging::BONDING, %addr, index, "rist: bonded path added at runtime");
                     }
@@ -857,7 +902,12 @@ impl BondedDriver {
                 }
             }
             PeerCmd::Remove { index } => {
-                self.paths.retain(|p| p.index != index);
+                if let Some(pos) = self.paths.iter().position(|p| p.index == index) {
+                    if let Some(r) = self.paths[pos].reader.take() {
+                        r.abort(); // stop the removed receiver path's reader
+                    }
+                    self.paths.remove(pos);
+                }
                 self.group.remove_path(index);
                 tracing::debug!(target: crate::logging::BONDING, index, "rist: bonded path removed at runtime");
             }
@@ -1355,6 +1405,7 @@ fn link_path_at(index: u8, p: PathParts) -> PathLink {
         authed: p.eap.is_none(),
         eap: p.eap,
         greeted: false,
+        reader: None,
     }
 }
 

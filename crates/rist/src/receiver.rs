@@ -1,6 +1,7 @@
 //! The public media receiver and the [`listen`] constructor.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -20,6 +21,7 @@ pub struct Receiver {
     oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
     oob_in: Option<mpsc::Sender<(u16, Vec<u8>)>>,
     rx_ctrl: Option<mpsc::Sender<RxControl>>,
+    peer_cmd: Option<mpsc::Sender<crate::driver_bonded::PeerCmd>>,
     close: crate::driver::CloseFlag,
     stats: crate::stats::StatsCell,
     task: tokio::task::JoinHandle<()>,
@@ -48,6 +50,7 @@ impl Receiver {
             // …nor a runtime-control channel (its driver was injected): the runtime
             // setters return `Unimplemented` on it.
             rx_ctrl: None,
+            peer_cmd: None,
             close,
             stats,
             task,
@@ -144,6 +147,58 @@ impl Receiver {
             ));
         };
         cmd.send(RxControl::RttMultiplier(multiplier))
+            .await
+            .map_err(|_| self.close.error())
+    }
+
+    /// Adds a bonded input path at runtime (libRIST `rist_peer_create`): the receiver
+    /// binds `local` (a bare `IP:port`) as a new path at `index`, recovering and merging
+    /// its media into the same flow. The caller owns the index space (the construction
+    /// paths are `0..N`, so a fresh path uses an unused index `>= N`); a duplicate index
+    /// is ignored. Available only on a bonded receiver built with the default runtime
+    /// ([`listen_bonded`] / [`listen_bonded_priority`]) — a custom-runtime receiver
+    /// cannot bind a socket at runtime. The added path binds unicast (no multicast group).
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-bonded, Simple-bonded, or custom-runtime
+    /// receiver, [`Error::InvalidAddr`] if `local`/`index` is invalid, or [`Error::Closed`]
+    /// if the session has shut down.
+    pub async fn add_path(&self, index: usize, local: &str, weight: u32) -> Result<(), Error> {
+        let Some(cmd) = &self.peer_cmd else {
+            return Err(Error::Unimplemented(
+                "add_path requires a default-runtime Main/Advanced bonded receiver",
+            ));
+        };
+        let index = u8::try_from(index).map_err(|_| Error::InvalidAddr(format!("path {index}")))?;
+        let local: SocketAddr = local
+            .parse()
+            .map_err(|_| Error::InvalidAddr(local.to_string()))?;
+        cmd.send(crate::driver_bonded::PeerCmd::Add {
+            index,
+            addr: local,
+            weight,
+            priority: 0,
+        })
+        .await
+        .map_err(|_| self.close.error())
+    }
+
+    /// Removes a bonded input path at runtime (libRIST `rist_peer_destroy`): the receiver
+    /// stops reading `index`'s socket and drops it from the merge and per-peer stats. An
+    /// unknown index is a no-op. Same availability as [`add_path`](Self::add_path).
+    ///
+    /// # Errors
+    /// Returns [`Error::Unimplemented`] on a non-bonded, Simple-bonded, or custom-runtime
+    /// receiver, [`Error::InvalidAddr`] if `index` is out of range, or [`Error::Closed`]
+    /// if the session has shut down.
+    pub async fn remove_path(&self, index: usize) -> Result<(), Error> {
+        let Some(cmd) = &self.peer_cmd else {
+            return Err(Error::Unimplemented(
+                "remove_path requires a default-runtime Main/Advanced bonded receiver",
+            ));
+        };
+        let index = u8::try_from(index).map_err(|_| Error::InvalidAddr(format!("path {index}")))?;
+        cmd.send(crate::driver_bonded::PeerCmd::Remove { index })
             .await
             .map_err(|_| self.close.error())
     }
@@ -257,6 +312,7 @@ pub async fn listen_with(addr: &str, cfg: Config, rt: &dyn Runtime) -> Result<Re
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
+        peer_cmd: spawned.peer_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -301,6 +357,7 @@ pub async fn dial_receiver_with(
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
+        peer_cmd: spawned.peer_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
@@ -318,10 +375,31 @@ pub async fn dial_receiver_with(
 /// (which wraps the non-Main rejection) if a port is invalid or the sockets cannot
 /// be bound.
 pub async fn listen_bonded(addrs: &[&str], cfg: Config) -> Result<Receiver, Error> {
-    listen_bonded_with(addrs, cfg, &TokioRuntime).await
+    // The default runtime is owned (an `Arc<TokioRuntime>`), so the bonded receiver can
+    // bind a new path's socket at runtime — `Receiver::add_path` is available. The
+    // borrowed-`&dyn Runtime` form (`listen_bonded_with`) cannot, so it has no runtime add.
+    if addrs.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded receiver needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let locals = crate::sender::resolve_bonded_addrs(addrs)?;
+    let rt: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+    let spawned = crate::session::build_bonded_receiver(
+        rt.as_ref(),
+        &cfg,
+        &locals,
+        &[],
+        Some(Arc::clone(&rt)),
+    )?;
+    tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening");
+    Ok(bonded_receiver(cfg, spawned))
 }
 
-/// Like [`listen_bonded`], but binds every path's transport socket through `rt`.
+/// Like [`listen_bonded`], but binds every path's transport socket through `rt`. A
+/// custom runtime cannot be owned by the driver, so runtime [`Receiver::add_path`] is
+/// not available on a receiver built this way.
 ///
 /// # Errors
 /// As [`listen_bonded`].
@@ -337,19 +415,26 @@ pub async fn listen_bonded_with(
     }
     cfg.validate()?;
     let locals = crate::sender::resolve_bonded_addrs(addrs)?;
-    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &[])?;
+    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &[], None)?;
     tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening");
-    Ok(Receiver {
+    Ok(bonded_receiver(cfg, spawned))
+}
+
+/// Assembles a bonded `Receiver` from its spawned parts (shared by the bonded-listen
+/// constructors).
+fn bonded_receiver(cfg: Config, spawned: crate::session::ReceiverSpawned) -> Receiver {
+    Receiver {
         cfg,
         local: spawned.local,
         data_out: spawned.data_out,
         oob_out: spawned.oob_out,
         oob_in: spawned.oob_in,
         rx_ctrl: spawned.rx_ctrl,
+        peer_cmd: spawned.peer_cmd,
         close: spawned.close,
         stats: spawned.stats,
         task: spawned.task,
-    })
+    }
 }
 
 /// Listens as a SMPTE 2022-7 bonded receiver with a per-path NACK-recovery
@@ -363,10 +448,31 @@ pub async fn listen_bonded_with(
 /// # Errors
 /// As [`listen_bonded`].
 pub async fn listen_bonded_priority(peers: &[(&str, u32)], cfg: Config) -> Result<Receiver, Error> {
-    listen_bonded_priority_with(peers, cfg, &TokioRuntime).await
+    if peers.is_empty() {
+        return Err(Error::InvalidAddr(
+            "bonded receiver needs at least one address".into(),
+        ));
+    }
+    cfg.validate()?;
+    let addrs: Vec<&str> = peers.iter().map(|&(a, _)| a).collect();
+    let priorities: Vec<u32> = peers.iter().map(|&(_, p)| p).collect();
+    let locals = crate::sender::resolve_bonded_addrs(&addrs)?;
+    // Owned default runtime → runtime add available (see `listen_bonded`).
+    let rt: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+    let spawned = crate::session::build_bonded_receiver(
+        rt.as_ref(),
+        &cfg,
+        &locals,
+        &priorities,
+        Some(Arc::clone(&rt)),
+    )?;
+    tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening (per-path priority)");
+    Ok(bonded_receiver(cfg, spawned))
 }
 
-/// Like [`listen_bonded_priority`], but binds every path's transport socket through `rt`.
+/// Like [`listen_bonded_priority`], but binds every path's transport socket through
+/// `rt`. Runtime [`Receiver::add_path`] is not available on a receiver built this way
+/// (the borrowed runtime cannot be owned by the driver).
 ///
 /// # Errors
 /// As [`listen_bonded`].
@@ -384,19 +490,9 @@ pub async fn listen_bonded_priority_with(
     let addrs: Vec<&str> = peers.iter().map(|&(a, _)| a).collect();
     let priorities: Vec<u32> = peers.iter().map(|&(_, p)| p).collect();
     let locals = crate::sender::resolve_bonded_addrs(&addrs)?;
-    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &priorities)?;
+    let spawned = crate::session::build_bonded_receiver(rt, &cfg, &locals, &priorities, None)?;
     tracing::debug!(target: crate::logging::BONDING, paths = locals.len(), "rist: bonded receiver listening (per-path priority)");
-    Ok(Receiver {
-        cfg,
-        local: spawned.local,
-        data_out: spawned.data_out,
-        oob_out: spawned.oob_out,
-        oob_in: spawned.oob_in,
-        rx_ctrl: spawned.rx_ctrl,
-        close: spawned.close,
-        stats: spawned.stats,
-        task: spawned.task,
-    })
+    Ok(bonded_receiver(cfg, spawned))
 }
 
 #[cfg(test)]

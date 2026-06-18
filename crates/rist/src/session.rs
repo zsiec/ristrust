@@ -85,6 +85,9 @@ pub(crate) struct ReceiverSpawned {
     /// Runtime receiver-control commands (`Receiver::set_nack_type` /
     /// `set_rtt_multiplier`); `None` on a demuxed (multi-flow) receiver.
     pub(crate) rx_ctrl: Option<mpsc::Sender<RxControl>>,
+    /// Runtime bonded-path add/remove channel (`Receiver::add_path`/`remove_path`);
+    /// `Some` only on a default-runtime Main/Advanced bonded receiver.
+    pub(crate) peer_cmd: Option<mpsc::Sender<crate::driver_bonded::PeerCmd>>,
     /// Received out-of-band datagrams (`Receiver::read_oob`); `Some` on a
     /// Main/Advanced receiver. Each is `(GRE protocol type, payload)`.
     pub(crate) oob_out: Option<mpsc::Receiver<(u16, Bytes)>>,
@@ -569,6 +572,7 @@ pub(crate) fn build_receiver(
             local: bound,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
+            peer_cmd: None,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -607,6 +611,7 @@ pub(crate) fn build_receiver(
             local: bound,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
+            peer_cmd: None,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -641,6 +646,7 @@ pub(crate) fn build_receiver(
         local: bound,
         data_out,
         rx_ctrl: Some(rxctrl_tx),
+        peer_cmd: None,
         oob_out: None,
         oob_in: None,
         close,
@@ -1205,6 +1211,7 @@ pub(crate) fn build_caller_receiver(
             local,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
+            peer_cmd: None,
             oob_out: None,
             oob_in: None,
             close,
@@ -1249,6 +1256,7 @@ pub(crate) fn build_caller_receiver(
             local,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
+            peer_cmd: None,
             oob_out: Some(oob_rx),
             oob_in: Some(rev_oob_tx),
             close,
@@ -1287,6 +1295,7 @@ pub(crate) fn build_caller_receiver(
         local,
         data_out,
         rx_ctrl: Some(rxctrl_tx),
+        peer_cmd: None,
         oob_out: Some(oob_rx),
         oob_in: Some(rev_oob_tx),
         close,
@@ -1519,6 +1528,7 @@ pub(crate) fn build_bonded_receiver(
     cfg: &Config,
     locals: &[SocketAddr],
     priorities: &[u32],
+    owned_rt: Option<std::sync::Arc<dyn Runtime>>,
 ) -> io::Result<ReceiverSpawned> {
     require_bondable(cfg)?;
     // Per-path NACK-recovery priority (libRIST recovery-priority); the bonding Group's
@@ -1574,6 +1584,7 @@ pub(crate) fn build_bonded_receiver(
             local: bound,
             data_out,
             rx_ctrl: Some(rxctrl_tx),
+            peer_cmd: None, // Simple-bonded receiver runtime add/remove is deferred
             oob_out: None,
             oob_in: None,
             close,
@@ -1624,6 +1635,27 @@ pub(crate) fn build_bonded_receiver(
     let adv = (cfg.profile == Profile::Advanced)
         .then(|| build_adv_codec(cfg, DEFAULT_FLOW_SSRC))
         .transpose()?;
+    // Runtime receiver path add/remove: a factory that binds a new listen socket and
+    // builds its codec/EAP from the config, wired only when an owned runtime is
+    // available (the default `listen_bonded` path; the borrowed-`&dyn Runtime` form
+    // cannot, so it has no runtime add). The added path binds unicast (no multicast
+    // membership), via the session's runtime.
+    let (peer_cmd, peer_rx, path_factory) = if let Some(rt_arc) = owned_rt {
+        let (tx, rx) = mpsc::channel(16);
+        let factory_cfg = cfg.clone();
+        let factory_timeout = dur_to_micros(cfg.session_timeout);
+        let factory: crate::driver_bonded::PathFactory = Box::new(move |local: SocketAddr| {
+            Ok(PathParts {
+                socket: MainSocket::listen(rt_arc.as_ref(), local, None)?,
+                peer: Peer::new(factory_timeout),
+                codec: build_main_codec(&factory_cfg, DEFAULT_FLOW_SSRC)?,
+                eap: build_eap_role(&factory_cfg, false)?,
+            })
+        });
+        (Some(tx), Some(rx), Some(factory))
+    } else {
+        (None, None, None)
+    };
     let (data_out, close, stats, task) = BondedDriver::spawn_receiver(
         flow,
         group,
@@ -1637,11 +1669,14 @@ pub(crate) fn build_bonded_receiver(
         build_fec(cfg),
         cfg.merge_mode,
         rxctrl_rx,
+        peer_rx,
+        path_factory,
     );
     Ok(ReceiverSpawned {
         local: bound,
         data_out,
         rx_ctrl: Some(rxctrl_tx),
+        peer_cmd,
         oob_out: None,
         oob_in: None,
         close,

@@ -25,3 +25,10 @@ URLs. All three profiles, 2022-7 bonding, source adaptation, and multicast
 (group join + egress interface/TTL, via a group bind/destination address and the
 `miface`/`ttl`/`source` URL knobs) are supported; DTLS 1.2 is available behind the
 `dtls` feature.
+
+Two libRIST host-OS features are deliberately **not** implemented: the UDP
+Don't-Fragment bit (`IP_MTU_DISCOVER`/`IP_DONTFRAG`) and TUN/TAP tunnel devices
+(`rist_tun_*`). Both need raw `setsockopt`/`ioctl`/device opens with no portable
+safe-Rust API, which the workspace `#![forbid(unsafe_code)]` and no-C-dependency rule
+preclude; the pure-Go sibling (`ristgo`) carries them instead. They will return if a
+safe-Rust API (socket2/quinn-udp DF, a pure-safe TUN crate) appears.

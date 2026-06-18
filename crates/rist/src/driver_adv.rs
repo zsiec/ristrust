@@ -1064,7 +1064,12 @@ impl AdvDriver {
         let Some(key) = self.eap.as_ref().and_then(EapRole::session_key) else {
             return;
         };
-        let _ = self.main.set_session_key(&key);
+        // The Advanced profile keys its GRE substrate both ways (it is unchanged by the
+        // Main-profile pure-SRP cleartext-media fix, which is the cross-stack interop case;
+        // Advanced pure-SRP stays a within-stack mode). set_session_key split into two
+        // directional setters, so call both to keep the prior both-keyed behavior.
+        let _ = self.main.set_send_session_key(&key);
+        let _ = self.main.set_recv_session_key(&key);
         let _ = self.adv.set_session_key(&key);
         let mut wire = Vec::new();
         rist_codec::eap::passphrase_push(PASSPHRASE_PUSH_ID).append_to(&mut wire);

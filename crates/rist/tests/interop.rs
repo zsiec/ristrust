@@ -795,6 +795,17 @@ fn main_srp_cfg(buffer_ms: u64) -> Config {
         .with_srp_credentials(SRP_USER, SRP_PASS)
 }
 
+/// A Main-profile pure-SRP config: SRP credentials with NO PSK secret
+/// (`use_key_as_passphrase`). The media is cleartext (SRP authenticates, it does not
+/// encrypt) and only the receiver→sender feedback is keyed with the SRP session key K —
+/// libRIST's actual use_key model, which a libRIST tool drives with neither `-s` nor `-e`.
+fn main_srp_pure_cfg(buffer_ms: u64) -> Config {
+    Config::default()
+        .with_profile(Profile::Main)
+        .with_buffer(Duration::from_millis(buffer_ms))
+        .with_srp_credentials(SRP_USER, SRP_PASS)
+}
+
 /// One media chunk carrying its index (4-byte big-endian) and a deterministic
 /// index-derived body, so a receiver can prove contiguity independent of where the
 /// stream started.
@@ -996,6 +1007,133 @@ async fn interop_main_srp_librist_rx_from_ristrust_tx() {
     }
     send.abort();
     assert_contiguous_chunks(&got, RUN, "ristrust SRP sender -> libRIST");
+}
+
+/// libRIST `ristsender` in pure-SRP `use_key_as_passphrase` mode (SRP creds, NO `-s`/`-e`)
+/// → ristrust Receiver. Proves ristrust's libRIST-conformant pure-SRP: SRP authenticates,
+/// the media arrives in the clear (not K-encrypted), and ristrust decodes it.
+#[tokio::test]
+async fn interop_main_srp_pure_ristrust_rx_from_librist_tx() {
+    let Some(sender_bin) = librist_tool("ristsender") else {
+        eprintln!("interop: ristsender not found; skipping");
+        return;
+    };
+    let rx_port = free_udp_port(&[]);
+    let feed_port = free_udp_port(&[rx_port]);
+
+    let mut receiver = listen(&format!("127.0.0.1:{rx_port}"), main_srp_pure_cfg(300))
+        .await
+        .expect("listen for libRIST pure-SRP sender");
+
+    let _tool = spawn_tool(
+        &sender_bin,
+        &[
+            "-p".into(),
+            "1".into(),
+            "-b".into(),
+            "300".into(),
+            "-i".into(),
+            format!("udp://@127.0.0.1:{feed_port}"),
+            "-o".into(),
+            format!("rist://127.0.0.1:{rx_port}?username={SRP_USER}&password={SRP_PASS}"),
+        ],
+    );
+    wait_tool_ready(feed_port, Duration::from_secs(5)).await;
+
+    let feeder = tokio::spawn(async move {
+        let feed = UdpSocket::bind("127.0.0.1:0").await.expect("bind feed");
+        feed.connect(("127.0.0.1", feed_port))
+            .await
+            .expect("connect feed");
+        let mut i: u32 = 0;
+        loop {
+            if feed.send(&indexed_chunk(i)).await.is_err() {
+                return;
+            }
+            i = i.wrapping_add(1);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    const RUN: usize = 100;
+    let mut got = Vec::with_capacity(RUN * CHUNK);
+    for i in 0..RUN {
+        let payload = timeout(Duration::from_secs(20), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out on pure-SRP payload {i}; auth failed"))
+            .expect("session open");
+        got.extend_from_slice(&payload);
+    }
+    feeder.abort();
+    receiver.close().await.expect("close");
+    assert_contiguous_chunks(&got, RUN, "libRIST pure-SRP sender -> ristrust");
+}
+
+/// ristrust Sender in pure-SRP mode → libRIST `ristreceiver` (SRP verifier file, NO
+/// `-s`/`-e`). Proves ristrust sends cleartext pure-SRP media that libRIST authenticates
+/// and accepts — the cross-stack conformance the combined PSK+SRP mode never exercised.
+#[tokio::test]
+async fn interop_main_srp_pure_librist_rx_from_ristrust_tx() {
+    let Some(receiver_bin) = librist_tool("ristreceiver") else {
+        eprintln!("interop: ristreceiver not found; skipping");
+        return;
+    };
+    let Some((srpfile, _guard)) = make_srpfile() else {
+        eprintln!("interop: ristsrppasswd unavailable; skipping");
+        return;
+    };
+    let rx_port = free_udp_port(&[]);
+    let cap_port = free_udp_port(&[rx_port]);
+
+    let cap = UdpSocket::bind(("127.0.0.1", cap_port))
+        .await
+        .expect("bind capture");
+    let _tool = spawn_tool(
+        &receiver_bin,
+        &[
+            "-p".into(),
+            "1".into(),
+            "-b".into(),
+            "300".into(),
+            "-F".into(),
+            srpfile.to_string_lossy().into_owned(),
+            "-i".into(),
+            format!("rist://@127.0.0.1:{rx_port}"),
+            "-o".into(),
+            format!("udp://127.0.0.1:{cap_port}"),
+        ],
+    );
+    wait_tool_ready(rx_port, Duration::from_secs(5)).await;
+
+    let sender = dial(&format!("127.0.0.1:{rx_port}"), main_srp_pure_cfg(300))
+        .await
+        .expect("dial libRIST pure-SRP receiver");
+
+    let send = tokio::spawn(async move {
+        let mut i: u32 = 0;
+        loop {
+            if sender.send(&indexed_chunk(i)).await.is_err() {
+                return sender;
+            }
+            i = i.wrapping_add(1);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    const RUN: usize = 100;
+    let want = RUN * CHUNK;
+    let mut got = Vec::with_capacity(want);
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, cap.recv(&mut buf)).await {
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    send.abort();
+    assert_contiguous_chunks(&got, RUN, "ristrust pure-SRP sender -> libRIST");
 }
 
 // ---- Advanced profile (VSF TR-06-3) interop (libRIST -p 2) ----

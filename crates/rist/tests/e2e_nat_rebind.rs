@@ -19,14 +19,20 @@ use std::time::Duration;
 use rist::{Config, Error, Profile, Sender, dial_receiver, listen_sender};
 use tokio::net::UdpSocket;
 
-/// A reversed-role Main config with EAP-SRP (no PSK secret, so the data channel
-/// re-keys to the SRP session key K — the encrypted RTCP that carries the CNAME the
-/// rebind trigger validates) and a short keepalive (`2×` = the dormancy threshold).
+/// A reversed-role Main config with the combined PSK+SRP mode (a secret keys the data
+/// channel, SRP gates) and a short keepalive (`2×` = the dormancy threshold). NAT-rebind
+/// re-association authenticates the migrated tuple from its ENCRYPTED data channel (the
+/// CNAME in encrypted RTCP, validated against the established peer); the pure-SRP
+/// (no-secret) mode keeps the media — and a sender's RTCP — in the clear (libRIST's
+/// use_key_as_passphrase authenticates but does not encrypt media), so a migrated tuple
+/// there cannot supply a forge-proof identity and rebind recovery is unsupported. The
+/// rebind test therefore uses an explicit secret.
 fn srp_cfg(buffer_ms: u64, keepalive_ms: u64) -> Config {
     Config::default()
         .with_profile(Profile::Main)
         .with_buffer(Duration::from_millis(buffer_ms))
         .with_keepalive(Duration::from_millis(keepalive_ms))
+        .with_secret("nat-rebind-psk")
         .with_srp_credentials("rist", "nat-rebind")
 }
 

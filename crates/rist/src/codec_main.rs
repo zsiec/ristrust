@@ -238,20 +238,31 @@ impl MainCodec {
         self.send_key.is_some()
     }
 
-    /// Re-keys the data channel to the EAP-SRP session key K, deriving a fresh send
-    /// [`crypto::Key`] and receive [`crypto::Decryptor`] over it. After
-    /// authentication libRIST sets the data passphrase to K (the `use_key_as_passphrase`
-    /// mode), so the host calls this with K to flow encrypted media.
+    /// Keys the SEND path with the EAP-SRP session key K. In `use_key_as_passphrase`
+    /// (pure-SRP, no PSK) only ONE direction is keyed with K, matching libRIST: the
+    /// media (sender→receiver) stays in the clear and SRP only authenticates, while the
+    /// receiver→sender feedback is encrypted under K. The receiver (EAP authenticator)
+    /// keys its send to encrypt that feedback; the sender keeps its send cleartext.
     ///
-    /// K is the raw 32-byte SRP session key (a SHA-256 digest), so it keys through
-    /// the **raw** derivation ([`crypto::Key::new_raw`] / [`crypto::Decryptor::new_raw`]):
-    /// libRIST installs an EAP-pushed passphrase via `_librist_crypto_psk_set_passphrase`,
-    /// which hashes the full bytes. Keying it through the NUL-truncating
-    /// configured-`Secret` path would diverge from a libRIST peer whenever K contains
-    /// a NUL byte (≈12% of keys), so media would fail to decrypt for those sessions.
-    pub(crate) fn set_session_key(&mut self, k: &[u8]) -> Result<(), CodecError> {
+    /// K is the raw 32-byte SRP session key (a SHA-256 digest), so it keys through the
+    /// **raw** derivation ([`crypto::Key::new_raw`]): libRIST installs an EAP-pushed
+    /// passphrase via its key-hashing path, which hashes the full bytes. Keying through
+    /// the NUL-truncating configured-`Secret` path would diverge from a libRIST peer
+    /// whenever K contains a NUL byte (≈12% of keys).
+    pub(crate) fn set_send_session_key(&mut self, k: &[u8]) -> Result<(), CodecError> {
         let bits = crypto::AesKeyBits::Aes256;
         self.send_key = Some(crypto::Key::new_raw(k, bits, 0, false)?);
+        self.key_size_256 = true;
+        Ok(())
+    }
+
+    /// Keys the RECV path with the EAP-SRP session key K (the receive-side counterpart of
+    /// [`Self::set_send_session_key`]). In `use_key_as_passphrase` the sender (EAP
+    /// authenticatee) keys its recv to decrypt the receiver→sender feedback; the media it
+    /// receives is cleartext, so a receiver never keys its recv. See that method for the
+    /// raw-derivation rationale.
+    pub(crate) fn set_recv_session_key(&mut self, k: &[u8]) -> Result<(), CodecError> {
+        let bits = crypto::AesKeyBits::Aes256;
         self.recv_key = Some(crypto::Decryptor::new_raw(k, bits)?);
         self.key_size_256 = true;
         Ok(())

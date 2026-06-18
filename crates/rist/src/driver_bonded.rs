@@ -1361,10 +1361,24 @@ impl BondedDriver {
     /// On path `i` reaching authentication with no configured PSK, re-keys its data
     /// channel to the SRP session key K and pushes "use K" to its peer.
     async fn on_authenticated(&mut self, i: usize) {
-        let Some(key) = self.paths[i].eap.as_ref().and_then(EapRole::session_key) else {
+        // use_key_as_passphrase keys only the receiver→sender feedback direction with K
+        // (media stays cleartext, matching libRIST): the authenticator (receiver) keys its
+        // SEND, the authenticatee (sender) keys its RECV. Keying both would encrypt the
+        // media and break interop with a libRIST/ristgo peer (which keeps it cleartext).
+        let (key, is_authenticator) = match self.paths[i].eap.as_ref() {
+            Some(EapRole::Authenticator(a)) => (a.session_key(), true),
+            Some(EapRole::Authenticatee(a)) => (a.session_key(), false),
+            None => return,
+        };
+        let Some(key) = key else {
             return;
         };
-        if let Err(e) = self.paths[i].codec.set_session_key(&key) {
+        let rekey = if is_authenticator {
+            self.paths[i].codec.set_send_session_key(&key)
+        } else {
+            self.paths[i].codec.set_recv_session_key(&key)
+        };
+        if let Err(e) = rekey {
             tracing::debug!(target: crate::logging::CRYPTO, path = i, "rist: bonded post-auth re-key failed: {e}");
             return;
         }

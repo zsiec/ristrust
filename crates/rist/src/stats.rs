@@ -280,7 +280,9 @@ impl Stats {
             concat!(
                 "{{",
                 "\"received\":{},\"received_bytes\":{},\"delivered\":{},\"lost\":{},",
-                "\"recovered\":{},\"recovered_one_retry\":{},\"fec_recovered\":{},\"duplicates\":{},\"reordered\":{},",
+                "\"recovered\":{},\"recovered_one_retry\":{},",
+                "\"recovered_two_nacks\":{},\"recovered_three_nacks\":{},\"recovered_four_nacks\":{},\"recovered_more_nacks\":{},",
+                "\"fec_recovered\":{},\"duplicates\":{},\"reordered\":{},",
                 "\"too_late\":{},\"too_late_retransmit\":{},\"retransmitted_received\":{},",
                 "\"clock_resync\":{},\"missing\":{},\"nacks_sent\":{},\"abandoned\":{},",
                 "\"overwritten\":{},\"flow_resets\":{},\"discontinuities\":{},",
@@ -289,6 +291,7 @@ impl Stats {
                 "\"retransmit_exhausted\":{},\"bandwidth_skipped\":{},",
                 "\"rtt_us\":{},\"bandwidth_bps\":{},\"retry_bandwidth_bps\":{},\"quality\":{:.3},",
                 "\"ips_min_us\":{},\"ips_cur_us\":{},\"ips_max_us\":{},\"avg_buffer_time_us\":{},",
+                "\"profile\":{},\"seq_bits\":{},\"advanced_active\":{},",
                 "\"peers\":[{}]",
                 "}}"
             ),
@@ -298,6 +301,10 @@ impl Stats {
             self.lost,
             self.recovered,
             self.recovered_one_retry,
+            self.recovered_two_nacks,
+            self.recovered_three_nacks,
+            self.recovered_four_nacks,
+            self.recovered_more_nacks,
             self.fec_recovered,
             self.duplicates,
             self.reordered,
@@ -327,6 +334,9 @@ impl Stats {
             self.inter_packet_cur.as_micros(),
             self.inter_packet_max.as_micros(),
             self.avg_buffer_time.as_micros(),
+            self.profile.as_u8(),
+            self.seq_bits,
+            self.advanced_active,
             peers_json,
         )
     }
@@ -534,8 +544,13 @@ mod tests {
         core.sent_bytes = 4096;
         core.smoothed_rtt_us = 5_000;
         core.recovered_one_retry = 2;
+        core.recovered_two_nacks = 6;
+        core.recovered_more_nacks = 1;
         core.avg_buffer_time_us = 700_000;
-        let s: Stats = core.into();
+        core.anchored = true; // 32-bit Advanced framing => seq_bits 32
+        let mut s: Stats = core.into();
+        s.profile = crate::Profile::Advanced;
+        s.advanced_active = true;
         let j = s.to_json();
         assert!(j.starts_with('{') && j.ends_with('}'));
         for key in [
@@ -547,6 +562,12 @@ mod tests {
             "\"ips_max_us\":0",
             "\"recovered_one_retry\":2",
             "\"avg_buffer_time_us\":700000",
+            // libRIST-parity stats fields (4d55974, 8cf3c81).
+            "\"recovered_two_nacks\":6",
+            "\"recovered_more_nacks\":1",
+            "\"profile\":2",
+            "\"seq_bits\":32",
+            "\"advanced_active\":true",
         ] {
             assert!(j.contains(key), "JSON missing {key:?}: {j}");
         }

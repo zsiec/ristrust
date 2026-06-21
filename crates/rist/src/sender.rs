@@ -560,7 +560,10 @@ mod tests {
 
     #[tokio::test]
     async fn dial_rejects_odd_media_port() {
-        let err = dial("127.0.0.1:5001", Config::default()).await.unwrap_err();
+        // The even/odd-port rule is Simple-profile; DefaultConfig is now Advanced
+        // (single-port), which accepts any port.
+        let cfg = Config::default().with_profile(crate::config::Profile::Simple);
+        let err = dial("127.0.0.1:5001", cfg).await.unwrap_err();
         assert!(matches!(err, Error::InvalidAddr(_)));
     }
 

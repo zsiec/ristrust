@@ -329,6 +329,22 @@ fn apply_enum_params(cfg: &mut Config, q: &HashMap<String, String>) -> Result<()
             other => return Err(Error::Url(format!("profile={other} must be 0, 1, or 2"))),
         };
     }
+    // libRIST `?recovery-depth=`: the Advanced recovery-ring exponent (0..=16). Range
+    // is enforced by Config::validate; here we only reject a non-integer / negative.
+    if let Some(n) = int("recovery-depth")? {
+        let depth = u8::try_from(n)
+            .ok()
+            .filter(|d| *d <= crate::RECOVERY_DEPTH_MAX);
+        match depth {
+            Some(d) => cfg.recovery_depth = Some(d),
+            None => {
+                return Err(Error::Url(format!(
+                    "recovery-depth={n} must be 0..={}",
+                    crate::RECOVERY_DEPTH_MAX
+                )));
+            }
+        }
+    }
     // libRIST's numbering: 0=off, 1=normal, 2=aggressive (matches `congestion_control`
     // in `parse_url_options`).
     if let Some(n) = int("congestion-control")? {
@@ -414,6 +430,7 @@ const RECOGNIZED_URL_PARAMS: &[&str] = &[
     "key-rotation",
     "min-retries",
     "max-retries",
+    "recovery-depth",
     "virt-src-port",
     "virt-dst-port",
     "local-port",
@@ -681,6 +698,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_depth_folds_in() {
+        // libRIST ?recovery-depth= (Advanced ring exponent) parses into recovery_depth.
+        let (_, cfg) = parse_url(
+            "rist://h:5000?profile=2&recovery-depth=4",
+            Config::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.profile, Profile::Advanced);
+        assert_eq!(cfg.recovery_depth, Some(4));
+        cfg.validate()
+            .expect("recovery-depth=4 on Advanced validates");
+
+        // Out-of-range and non-integer are rejected, not clamped.
+        assert!(parse_url("rist://h:5000?recovery-depth=17", Config::default()).is_err());
+        assert!(parse_url("rist://h:5000?recovery-depth=deep", Config::default()).is_err());
+    }
+
+    #[test]
     fn malformed_urls_error() {
         let cases = [
             "srt://h:5000",                      // bad scheme
@@ -690,6 +725,7 @@ mod tests {
             "rist://h:5000?virt-dst-port=99999", // port out of range
             "rist://h:5000?aes-type=200",        // unsupported AES size (not 128/192/256)
             "rist://h:5000?profile=9",           // unknown profile
+            "rist://h:5000?recovery-depth=17",   // recovery-depth out of range
         ];
         for raw in cases {
             assert!(

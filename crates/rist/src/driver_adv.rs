@@ -71,6 +71,18 @@ pub(crate) fn adv_ctrl_ts(now: Timestamp) -> u32 {
     (now.as_micros() << 16) as u32
 }
 
+/// Config-derived Advanced-profile options threaded into the driver at spawn,
+/// bundled so the constructors keep a single param instead of one per flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AdvOpts {
+    /// TR-06-3 §9: start the sender in Main framing and upgrade on the peer's I
+    /// bit (off by default; only useful against a strictly Main-only receiver).
+    pub adv_sender_start_main: bool,
+    /// Drop inbound Advanced RTT-echo *requests* (default true; libRIST `>>16`
+    /// interop). Set false to answer them against a fixed libRIST.
+    pub drop_adv_rtt_echo_request: bool,
+}
+
 /// The Advanced-profile session driver, run as one detached task per flow.
 // Justification: the bool fields are independent per-flow flags, not a state enum.
 #[allow(clippy::struct_excessive_bools)]
@@ -103,6 +115,19 @@ pub(crate) struct AdvDriver {
     /// on a receiver. An alternative to F/L fragmentation: a split payload is sent as
     /// two `Standalone` packets (the two mechanisms are not combined).
     split_mode: SplitMode,
+    /// TR-06-3 §9 sender Main fallback (config, off by default): start media in
+    /// Main-Profile (GRE) framing and upgrade to Advanced (Type=5) framing once the
+    /// peer advertises Advanced capability (`remote_supports_advanced`). Lets an
+    /// Advanced sender feed a strictly Main-only receiver.
+    adv_sender_start_main: bool,
+    /// Whether the peer has advertised Advanced capability via a keep-alive I bit
+    /// (the native Advanced keep-alive or the Main GRE keep-alive's extended I bit).
+    /// Gates the §9 framing upgrade when `adv_sender_start_main` is set.
+    remote_supports_advanced: bool,
+    /// Drop inbound Advanced RTT-echo *requests* (config, default true): libRIST's
+    /// Advanced echo-response handler historically mis-scaled the round-trip, so a
+    /// reply could break its recovery. See [`drops_adv_echo_request`].
+    drop_adv_rtt_echo_request: bool,
 
     // --- receiver half ---
     data_out: Option<mpsc::Sender<Bytes>>,
@@ -188,6 +213,7 @@ impl AdvDriver {
         frag_size: usize,
         fec: Option<FecState>,
         split_mode: SplitMode,
+        opts: AdvOpts,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -218,6 +244,9 @@ impl AdvDriver {
             ssrc,
             frag_size,
             split_mode,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
+            drop_adv_rtt_echo_request: opts.drop_adv_rtt_echo_request,
             data_out: None,
             learned_ssrc: None,
             greeted: false,
@@ -259,6 +288,7 @@ impl AdvDriver {
         fec: Option<FecState>,
         merge_mode: MergeMode,
         rx_ctrl: mpsc::Receiver<RxControl>,
+        opts: AdvOpts,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -289,6 +319,9 @@ impl AdvDriver {
             ssrc,
             frag_size: 0,
             split_mode: SplitMode::Off,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
+            drop_adv_rtt_echo_request: opts.drop_adv_rtt_echo_request,
             data_out: Some(tx),
             learned_ssrc: None,
             greeted: false,
@@ -331,6 +364,7 @@ impl AdvDriver {
         on_flow_attr: Option<FlowAttrCallback>,
         oob_out: mpsc::Sender<(u16, Bytes)>,
         merge_mode: MergeMode,
+        opts: AdvOpts,
     ) -> (
         mpsc::Sender<AdvInbound>,
         mpsc::Receiver<Bytes>,
@@ -361,6 +395,9 @@ impl AdvDriver {
             ssrc,
             frag_size: 0,
             split_mode: SplitMode::Off,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
+            drop_adv_rtt_echo_request: opts.drop_adv_rtt_echo_request,
             data_out: Some(tx),
             learned_ssrc: None,
             greeted: false,
@@ -538,14 +575,23 @@ impl AdvDriver {
                 }
                 Ok(None) => {
                     // Keepalive is liveness only; SR/RR/SDES carry no flow input —
-                    // except its L bit drives merge=auto (the peer advertises pair-split).
+                    // except its L bit drives merge=auto (the peer advertises pair-split)
+                    // and its extended I bit advertises Advanced capability (TR-06-3 §9),
+                    // which upgrades this sender's media framing to Advanced.
                     let (kind, ka, _ver) = self.main.peek_control(data);
                     if kind == ControlKind::Keepalive {
                         if let Some(ka) = &ka {
                             self.merger.set_auto_enabled(ka.caps.l);
+                            if ka.has_adv_ext && ka.adv_ext.i {
+                                self.remote_supports_advanced = true;
+                            }
                         }
-                    } else {
-                        let _ = self.main.decode(data, self.highest_sent);
+                    } else if let Ok(d) = self.main.decode(data, self.highest_sent) {
+                        // §9: accept a Main-framed source on the Advanced context
+                        // (libRIST's Advanced sender starts in Main framing), feeding
+                        // its media/feedback to the flow instead of discarding it. The
+                        // flow re-anchors on a Main→Advanced framing switch.
+                        self.feed_main_decoded(now, d);
                     }
                 }
             }
@@ -563,12 +609,19 @@ impl AdvDriver {
             let inner = parsed.payload.clone();
             let (kind, ka, _ver) = self.main.peek_control(&inner);
             if kind == ControlKind::Keepalive {
-                // The keepalive's L bit drives merge=auto (peer advertises pair-split).
+                // The keepalive's L bit drives merge=auto (peer advertises pair-split);
+                // its extended I bit advertises Advanced capability (TR-06-3 §9), which
+                // upgrades this sender's media framing to Advanced.
                 if let Some(ka) = &ka {
                     self.merger.set_auto_enabled(ka.caps.l);
+                    if ka.has_adv_ext && ka.adv_ext.i {
+                        self.remote_supports_advanced = true;
+                    }
                 }
-            } else {
-                let _ = self.main.decode(&inner, self.highest_sent);
+            } else if let Ok(d) = self.main.decode(&inner, self.highest_sent) {
+                // §9: accept Main-framed media/feedback wrapped in Type=8 on the
+                // Advanced substrate, rather than discarding it.
+                self.feed_main_decoded(now, d);
             }
             return;
         }
@@ -625,10 +678,10 @@ impl AdvDriver {
                                 cb.call(json);
                             }
                         }
-                        // Drop inbound Advanced RTT-echo *requests* so the flow
-                        // never answers them — see `drops_adv_echo_request` for the
-                        // libRIST interop rationale.
-                        fb if drops_adv_echo_request(&fb) => {}
+                        // Drop inbound Advanced RTT-echo *requests* so the flow never
+                        // answers them, unless answering is enabled — see
+                        // `drops_adv_echo_request` for the libRIST interop rationale.
+                        fb if self.drop_adv_rtt_echo_request && drops_adv_echo_request(&fb) => {}
                         fb => self.flow.feed_feedback(now, fb),
                     }
                 }
@@ -636,6 +689,11 @@ impl AdvDriver {
             Ok(Decoded::BufferNeg(bn)) => self.on_buffer_neg(bn),
             Ok(Decoded::Ignored) => {}
             Err(e) => crate::driver::decode_warn(self.adv.has_psk(), "advanced", &e),
+        }
+        // TR-06-3 §9: a native Advanced keep-alive's I bit advertises the peer's
+        // Advanced capability, upgrading the sender's media framing to Advanced.
+        if let Some(true) = self.adv.take_peer_adv_cap() {
+            self.remote_supports_advanced = true;
         }
     }
 
@@ -790,15 +848,33 @@ impl AdvDriver {
                     let Some(dst) = self.peer.media() else {
                         continue;
                     };
-                    match self.adv.encode_media(&pkt) {
+                    // TR-06-3 §9 (opt-in): until the peer advertises Advanced (I=1),
+                    // emit Main-Profile (GRE) framing so a Main-only receiver can decode
+                    // it; switch to Advanced (Type=5) once upgraded. Default (flag off)
+                    // is always Advanced framing, so the common path is unchanged. The
+                    // fallback is also skipped when FEC or fragmentation is configured:
+                    // both are Advanced-only ristgo/ristrust features a Main-only peer
+                    // cannot consume, so starting in Main would only break them across the
+                    // framing upgrade for no interop benefit.
+                    let adv_framed = !self.adv_sender_start_main
+                        || self.remote_supports_advanced
+                        || self.fec.is_some()
+                        || self.frag_size > 0;
+                    let encoded = if adv_framed {
+                        self.adv.encode_media(&pkt)
+                    } else {
+                        self.main.encode_media(&pkt)
+                    };
+                    match encoded {
                         Ok(bytes) => {
                             if let Err(e) = sock.send(&bytes, dst).await {
                                 tracing::debug!(target: crate::logging::SOCKET, seq = pkt.seq, "rist: adv send media failed: {e}");
                             }
-                            // FEC over the full wire datagram (first transmissions
-                            // only, in sequence order); frame the resulting FEC
-                            // packets as in-band Type=Control messages.
-                            if self.fec.is_some() && !pkt.retransmit {
+                            // FEC over the full wire datagram (first transmissions only,
+                            // in sequence order); only on Advanced framing (FEC is a
+                            // ristgo/ristrust Advanced feature, not part of §9 Main
+                            // fallback). Frame the FEC packets as in-band Type=Control.
+                            if self.fec.is_some() && !pkt.retransmit && adv_framed {
                                 self.send_fec_adv(now, &bytes, pkt.seq).await;
                             }
                         }
@@ -983,6 +1059,43 @@ impl AdvDriver {
     fn on_buffer_neg(&mut self, bn: gre::BufferNegotiation) {
         if let Some(max) = bn.sender_max() {
             self.flow.set_sender_max_buffer(max);
+        }
+    }
+
+    /// Feeds a decode result from the Main-profile GRE substrate (raw GRE, or the
+    /// inner GRE of a Type=8 packet) into the flow. This is the TR-06-3 §9 receive
+    /// side: an Advanced context accepts Main-framed media from a peer that has not
+    /// (yet) upgraded to Advanced framing, and the flow re-anchors on the framing
+    /// switch via `MediaPacket::short_seq`. Main RTCP feedback (e.g. NACKs from a
+    /// Main-only receiver to an Advanced sender in §9 fallback) drives the flow the
+    /// same way the Main driver routes it. Replaces the prior discard of substrate
+    /// decode results.
+    fn feed_main_decoded(&mut self, now: Timestamp, decoded: Decoded) {
+        match decoded {
+            Decoded::Media(pkt) => {
+                if self.learned_ssrc.is_none() {
+                    self.learned_ssrc = Some(pkt.ssrc);
+                }
+                if let Some(e) = &mut self.lqm {
+                    e.meter(pkt.payload.len(), pkt.retransmit);
+                }
+                self.flow.feed(now, 0, pkt);
+            }
+            Decoded::Feedback(fbs) => {
+                for fb in fbs {
+                    // Main RTCP echo is the correctly-scaled path (not the Advanced
+                    // >>16 case), so it is answered normally — no adv echo drop here.
+                    if let Feedback::LinkQuality { lqm } = fb {
+                        if let Some(r) = &mut self.rate {
+                            r.handle(&lqm);
+                        }
+                    } else {
+                        self.flow.feed_feedback(now, fb);
+                    }
+                }
+            }
+            Decoded::BufferNeg(bn) => self.on_buffer_neg(bn),
+            Decoded::Ignored => {}
         }
     }
 

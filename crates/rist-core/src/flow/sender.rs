@@ -203,6 +203,8 @@ impl Flow {
                 // carries them only on the receive path (per-packet decode).
                 virt_src_port: 0,
                 virt_dst_port: 0,
+                // Meaningless on a send-built packet (the sending codec ignores it).
+                short_seq: false,
             },
         });
         self.sender.data_bw.feed(now, wire_n); // recovery_maxbitrate data-rate EWMA
@@ -308,6 +310,7 @@ impl Flow {
                         frag,
                         virt_src_port: 0,
                         virt_dst_port: 0,
+                        short_seq: false, // meaningless on a send-built packet
                     },
                 });
                 self.sender.retry_bw.feed(now, retry_n);

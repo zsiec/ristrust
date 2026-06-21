@@ -93,6 +93,12 @@ pub(crate) struct AdvCodec {
     /// (TR-06-3 §5.3.10), queued as `(ci, head)` for the host to answer with a
     /// Control Message Unsupported Response. Drained via [`AdvCodec::take_unsupported`].
     pending_unsupported: Vec<(u16, [u8; 6])>,
+
+    /// Side-channel set when an inbound native Advanced keep-alive advertises (or
+    /// stops advertising) Advanced capability via its I bit ([`adv::KEEPALIVE_CAP_I`]).
+    /// The driver consumes it via [`AdvCodec::take_peer_adv_cap`] to drive the
+    /// TR-06-3 §9 sender framing upgrade. `None` until a keep-alive is decoded.
+    peer_adv_cap: Option<bool>,
 }
 
 impl AdvCodec {
@@ -122,6 +128,7 @@ impl AdvCodec {
             ts_ref_seq: 0,
             ts_ref_ticks: 0,
             pending_unsupported: Vec::new(),
+            peer_adv_cap: None,
         }
     }
 
@@ -131,6 +138,13 @@ impl AdvCodec {
     /// Response (TR-06-3 §5.3.10).
     pub(crate) fn take_unsupported(&mut self) -> Vec<(u16, [u8; 6])> {
         std::mem::take(&mut self.pending_unsupported)
+    }
+
+    /// Returns and consumes the Advanced-capability (I bit) advertised by the most
+    /// recent inbound native Advanced keep-alive, if one was decoded since the last
+    /// call. Drives the TR-06-3 §9 sender framing upgrade.
+    pub(crate) fn take_peer_adv_cap(&mut self) -> Option<bool> {
+        self.peer_adv_cap.take()
     }
 
     /// Frames a Control Message Unsupported Response echoing `ci` and `head`, stamped
@@ -252,12 +266,20 @@ impl AdvCodec {
             | adv::CI_LQM_GLOBAL
             | adv::CI_LQM_LINK_SPECIFIC
             | adv::CI_FLOW_ATTR => Ok(Decoded::Feedback(self.decode_control(payload)?)),
-            // Recognized but yielding no flow input: keepalive and SRP-auth are
-            // handled on the substrate; FEC control is consumed before this point;
-            // an inbound Unsupported is logged at the host but never answered (a
-            // reply would loop). None of these triggers an Unsupported response.
-            adv::CI_KEEPALIVE
-            | adv::CI_SRP_AUTH
+            adv::CI_KEEPALIVE => {
+                // No flow input, but the keep-alive's capability word advertises the
+                // peer's Advanced support (I bit) for the TR-06-3 §9 sender upgrade.
+                // A short/malformed body is ignored.
+                if let Ok(ka) = adv::Keepalive::parse(&body) {
+                    self.peer_adv_cap = Some(ka.caps & adv::KEEPALIVE_CAP_I != 0);
+                }
+                Ok(Decoded::Ignored)
+            }
+            // Recognized but yielding no flow input: SRP-auth is handled on the
+            // substrate; FEC control is consumed before this point; an inbound
+            // Unsupported is logged at the host but never answered (a reply would
+            // loop). None of these triggers an Unsupported response.
+            adv::CI_SRP_AUTH
             | adv::CI_UNSUPPORTED
             | adv::CI_FEC_2022_5_ROW
             | adv::CI_FEC_2022_5_COL
@@ -339,6 +361,7 @@ impl AdvCodec {
             retransmit: p.retransmit,
             path_id: 0,
             frag: flags_to_frag(p.first_frag, p.last_frag),
+            short_seq: false, // Advanced profile: native 32-bit extended sequence
             // The Advanced compact header carries no virtual ports.
             ..Default::default()
         })

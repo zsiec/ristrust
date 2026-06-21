@@ -887,6 +887,7 @@ impl MainCodec {
             frag: rist_core::wire::FragRole::Standalone,
             virt_src_port,
             virt_dst_port,
+            short_seq: true, // 16-bit RTP sequence (widened by rollover)
         })
     }
 

@@ -117,6 +117,13 @@ pub(super) struct ReceiverState {
     /// The media-stream SSRC learned from the first packet, echoed in NACKs.
     ssrc: u32,
 
+    /// The wire framing of the anchored flow ([`MediaPacket::short_seq`]): `true`
+    /// for 16-bit Simple/Main framing, `false` for the Advanced 32-bit native
+    /// sequence. A started flow whose next fresh packet carries a different value is
+    /// following a mid-stream framing change (TR-06-3 §9 Main↔Advanced) and is
+    /// re-anchored like a flow-id change.
+    short_seq: bool,
+
     /// libRIST `last_seq_found`: the newest in-order sequence accepted, the
     /// anchor of missing-detection walks.
     last_found: u32,
@@ -198,6 +205,7 @@ impl ReceiverState {
             started: false,
             offset: Micros::ZERO,
             ssrc: 0,
+            short_seq: false,
             last_found: 0,
             max_source_time: 0,
             last_packet_time: Timestamp::ZERO,
@@ -428,6 +436,28 @@ impl Flow {
         {
             self.reset_receiver();
             self.stats.flow_resets += 1;
+        }
+        // Wire framing change (libRIST TR-06-3 §9 Main↔Advanced interop): a started
+        // Advanced flow whose next fresh packet switches sequence framing — Main
+        // 16-bit to Advanced 32-bit (the upgrade once a peer advertises I=1), or vice
+        // versa. The two framings carry different timestamp encodings, so the
+        // source-time→local mapping must be re-derived for the new scale; but the
+        // SEQUENCE is continuous across the switch (one sender counter, and a
+        // 16-bit-zero RTP start makes the Main-widened sequence equal the Advanced
+        // sequence), so this is a LOSSLESS ring-preserving re-anchor: keep the buffered
+        // ring, the delivery cursor, and the missing set, and only re-lock the timing
+        // baseline. Already-buffered packets keep their stored output_time; a gap open
+        // at the switch still heals via ARQ. Re-set max_source_time so the backward-wrap
+        // guard does not misfire on the timestamp-scale change. (Simple/Main/matched-
+        // Advanced flows never change framing, so this never fires.)
+        if self.receiver.started && !pkt.retransmit && pkt.short_seq != self.receiver.short_seq {
+            let src = Ntp64::from_bits(pkt.source_time).to_timestamp();
+            self.receiver.offset = now - src;
+            self.receiver.max_source_time = pkt.source_time;
+            self.receiver.last_packet_time = now;
+            self.receiver.last_resync = now;
+            self.receiver.short_seq = pkt.short_seq;
+            self.stats.framing_resets += 1;
         }
         if !self.receiver.started {
             // A flow cannot start on a retransmit.
@@ -704,6 +734,7 @@ impl Flow {
             r.offset = now - src;
             r.started = true;
             r.ssrc = pkt.ssrc;
+            r.short_seq = pkt.short_seq;
             r.last_found = pkt.seq;
             r.max_source_time = pkt.source_time;
             r.last_packet_time = now; // == src + offset by construction
@@ -1405,6 +1436,78 @@ mod tests {
                 "flow A ring slot survived the reset"
             );
         }
+    }
+
+    #[test]
+    fn framing_change_reanchors_losslessly() {
+        // TR-06-3 §9 Main↔Advanced interop: an anchored Main (16-bit) flow that sees
+        // the Advanced (32-bit) upgrade on the SAME SSRC and the continuing sequence
+        // re-anchors its TIMING baseline while PRESERVING the buffered ring, the
+        // delivery cursor, and the missing set. The switch is lossless: every packet
+        // buffered before the upgrade is still delivered, in order, none lost. The
+        // SSRC stays the same, so the SSRC-change reset alone would miss it.
+        const SSRC: u32 = 0x4000_0000;
+        let mut f = recv();
+        let main_pkt = |seq: u32, src_us: u64| {
+            let mut p = pkt_on(seq, src_us, SSRC);
+            p.short_seq = true;
+            p
+        };
+        let adv_pkt = |seq: u32, src_us: u64| {
+            let mut p = pkt_on(seq, src_us, SSRC);
+            p.short_seq = false;
+            p
+        };
+
+        // Anchor on Main (16-bit) framing and buffer two packets (delivery is
+        // time-driven, so they stay in the ring).
+        f.feed(ts(10_000), 0, main_pkt(100, 0));
+        f.feed(ts(17_000), 0, main_pkt(101, 7_000));
+        assert!(f.receiver.short_seq, "did not anchor on Main framing");
+
+        // A retransmit in the other framing must NOT re-anchor (it cannot anchor a flow).
+        let mut rt = adv_pkt(100, 0);
+        rt.retransmit = true;
+        f.feed(ts(18_000), 0, rt);
+        assert_eq!(
+            f.stats().framing_resets,
+            0,
+            "a retransmit wrongly re-anchored"
+        );
+
+        // The Main→Advanced upgrade on the SAME SSRC and continuing sequence (102).
+        f.feed(ts(24_000), 0, adv_pkt(102, 17_000));
+        assert_eq!(f.stats().framing_resets, 1, "framing switch not counted");
+        assert_eq!(f.stats().flow_resets, 0, "SSRC unchanged across the switch");
+        assert!(
+            !f.receiver.short_seq,
+            "did not re-anchor on Advanced framing"
+        );
+        // Ring-PRESERVING: the cursor is unmoved and all three packets are buffered
+        // (a ring-clearing reset would have re-anchored deliver_next to 102).
+        assert!(
+            f.receiver.started && f.receiver.deliver_next == 100,
+            "re-anchor moved the cursor: deliver_next = {} (ring preserved expected 100)",
+            f.receiver.deliver_next
+        );
+        for seqn in [100u32, 101, 102] {
+            assert_eq!(
+                slot_of(&f, seqn).state,
+                SlotState::Filled,
+                "seq {seqn} not buffered after the switch — ring was cleared"
+            );
+        }
+
+        // Drive playout well past the recovery buffer: all three deliver in order,
+        // none lost.
+        f.handle_timer(ts(10_000_000), TimerId::Playout);
+        let evs = drain_events(&mut f);
+        assert_eq!(
+            delivered_seqs(&evs),
+            vec![100, 101, 102],
+            "framing switch was not lossless"
+        );
+        assert_eq!(f.stats().lost, 0, "framing switch counted lost, want 0");
     }
 
     #[test]

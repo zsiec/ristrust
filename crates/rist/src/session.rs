@@ -23,7 +23,7 @@ use crate::codec_adv::AdvCodec;
 use crate::codec_main::MainCodec;
 use crate::config::{Config, NackType, Profile};
 use crate::driver::{Driver, RxControl, SimpleInbound};
-use crate::driver_adv::AdvDriver;
+use crate::driver_adv::{AdvDriver, AdvOpts};
 use crate::driver_bonded::{BondedDriver, PathParts};
 use crate::driver_bonded_simple::{BondedSimpleDriver, SimplePathParts};
 use crate::driver_main::{EapRole, MainDriver, MainInbound};
@@ -150,7 +150,12 @@ fn flow_config(cfg: &Config, ssrc: u32, start_seq: u32) -> FlowConfig {
         rtt_multiplier: cfg.rtt_multiplier,
         min_retries: cfg.min_retries,
         max_retries: cfg.max_retries,
-        ring_size: 0, // 0 selects the default 2^16 ring
+        // libRIST `?recovery-depth=`: size the Advanced recovery ring to 65536<<depth
+        // packets (an override of the bitrate-derived default). Capped at 2^24 slots so
+        // a large depth saturates rather than OOMs. 0 (None) keeps the default ring.
+        ring_size: cfg
+            .recovery_depth
+            .map_or(0, |d| (1usize << (16 + u32::from(d))).min(1 << 24)),
         recovery_maxbitrate: cfg.max_bitrate_kbps,
         congestion_control: cfg.congestion_control,
         ssrc,
@@ -176,6 +181,14 @@ fn cname_of(cfg: &Config) -> String {
 
 fn bitmask_of(cfg: &Config) -> bool {
     matches!(cfg.nack_type, NackType::Bitmask)
+}
+
+/// Bundles the config-derived Advanced-profile options for the AdvDriver spawns.
+fn adv_opts_of(cfg: &Config) -> AdvOpts {
+    AdvOpts {
+        adv_sender_start_main: cfg.adv_sender_start_main,
+        drop_adv_rtt_echo_request: cfg.drop_advanced_rtt_echo_request,
+    }
 }
 
 /// Builds the receiver's Link Quality Message emitter when source adaptation is
@@ -480,6 +493,7 @@ pub(crate) fn build_sender(
             cfg.fragment_size,
             build_fec(cfg),
             cfg.split_mode,
+            adv_opts_of(cfg),
         );
         return Ok(SenderSpawned {
             local,
@@ -644,6 +658,7 @@ pub(crate) fn build_receiver(
             build_fec(cfg),
             cfg.merge_mode,
             rxctrl_rx,
+            adv_opts_of(cfg),
         );
         return Ok(ReceiverSpawned {
             local: bound,
@@ -884,6 +899,7 @@ pub(crate) fn build_injected_adv(
         cfg.on_flow_attr.clone(),
         oob_tx,
         cfg.merge_mode,
+        adv_opts_of(cfg),
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -955,6 +971,7 @@ pub(crate) fn build_injected_bonded(
         cfg.keepalive_interval,
         adv,
         cfg.merge_mode,
+        adv_opts_of(cfg),
     );
     let receiver = crate::receiver::Receiver::from_parts(
         cfg.clone(),
@@ -1142,6 +1159,7 @@ pub(crate) fn build_listener_sender(
             cfg.fragment_size,
             None, // FEC + reversed-role deferred
             cfg.split_mode,
+            adv_opts_of(cfg),
         );
         return Ok(SenderSpawned {
             local: bound,
@@ -1293,6 +1311,7 @@ pub(crate) fn build_caller_receiver(
             None, // FEC + reversed-role deferred
             cfg.merge_mode,
             rxctrl_rx,
+            adv_opts_of(cfg),
         );
         return Ok(ReceiverSpawned {
             local,
@@ -1541,6 +1560,7 @@ pub(crate) fn build_bonded_sender(
         npd_rx,
         peer_rx,
         path_factory,
+        adv_opts_of(cfg),
     );
     Ok(SenderSpawned {
         local,
@@ -1719,6 +1739,7 @@ pub(crate) fn build_bonded_receiver(
         peer_rx,
         path_factory,
         crate::driver_main::AuthGate::new(cfg.on_connect.clone(), cfg.on_disconnect.clone()),
+        adv_opts_of(cfg),
     );
     Ok(ReceiverSpawned {
         local: bound,

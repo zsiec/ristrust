@@ -85,6 +85,18 @@ pub struct MediaPacket {
     /// receive; `0` on a send-built packet and on the Simple profile. See
     /// [`MediaPacket::virt_src_port`].
     pub virt_dst_port: u16,
+
+    /// The wire framing the packet was decoded from: `true` for 16-bit framing
+    /// (Simple/Main reduced-overhead, the widened RTP sequence) and `false` for the
+    /// Advanced profile's native 32-bit extended sequence. The core treats a change
+    /// of this value on an already-anchored flow like a flow-id change and
+    /// re-anchors, because the two framings carry different sequence widths and
+    /// timestamp encodings; mixing them in one ring would corrupt dedup and playout.
+    /// This is the TR-06-3 §9 Main↔Advanced interop case: an Advanced receiver
+    /// accepts a Main-framed source and follows a mid-stream Main→Advanced upgrade.
+    /// Set by the receiving codec; meaningless on a send-built packet (the sending
+    /// codec ignores it).
+    pub short_seq: bool,
 }
 
 /// The Advanced-profile fragment role of a [`MediaPacket`] (TR-06-3 §5.2.2),

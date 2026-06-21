@@ -243,6 +243,28 @@ pub struct Config {
     pub srp_users: Vec<(String, String)>,
     /// Enable LZ4 payload compression on the send path (Advanced profile).
     pub compression: bool,
+    /// Size the Advanced-profile recovery (retransmit) ring as `65536 << recovery_depth`
+    /// packets — libRIST's `?recovery-depth=` knob, a base-2 exponent over the 16-bit
+    /// base buffer (depth 3 = 524288 packets is libRIST's default; the addressable NACK
+    /// window is roughly half the ring). `None` (the default) sizes the ring from the
+    /// bitrate and recovery buffer. Advanced profile only; valid range
+    /// `0..=RECOVERY_DEPTH_MAX`. Maps to the core's `ring_size` override.
+    pub recovery_depth: Option<u8>,
+    /// Start an Advanced-profile sender in Main-Profile (GRE) framing and upgrade to
+    /// Advanced (Type=5/32-bit) framing only once the peer advertises Advanced
+    /// capability (the keep-alive I bit) — TR-06-3 §9's Main/Advanced interop method.
+    /// `false` by default: enable it only to feed a strictly Main-only receiver.
+    /// Against an Advanced peer it is unnecessary (libRIST and ristrust receivers
+    /// already accept our unconditional Type=5) and the mid-stream framing upgrade
+    /// re-anchors the receiver, briefly dropping in-flight media at the switch.
+    /// Advanced profile only.
+    pub adv_sender_start_main: bool,
+    /// Drop inbound Advanced RTT-echo *requests* instead of answering them. `true` by
+    /// default: libRIST's Advanced echo-response handler historically mis-scaled the
+    /// round-trip (`>>16` instead of `>>32`), so a reply could inflate the peer's RTT
+    /// and stall its recovery. Set `false` to answer them against a libRIST built with
+    /// that fix (commit 9a30f7b). Advanced profile only (Main/Simple always answer).
+    pub drop_advanced_rtt_echo_request: bool,
     /// Split an outbound application payload larger than this many bytes across
     /// consecutive Advanced-profile fragment sequences (TR-06-3 §5), each
     /// independently recoverable by ARQ; the peer reassembles them. `0` (the
@@ -355,10 +377,16 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// The libRIST default parameters.
+    /// The libRIST `RIST_DEFAULT_*` parameter defaults, including the profile: like
+    /// libRIST, ristrust defaults to [`Profile::Advanced`] (TR-06-3). An Advanced
+    /// receiver also decodes Main-framed sources (and follows a libRIST sender's
+    /// mid-stream Main→Advanced upgrade losslessly), and an Advanced sender
+    /// interoperates with any Advanced peer. Feeding a strictly Main-only receiver
+    /// additionally needs [`Config::adv_sender_start_main`], off by default. Set
+    /// [`Config::profile`] explicitly for Simple or Main.
     fn default() -> Config {
         Config {
-            profile: Profile::Simple,
+            profile: Profile::Advanced,
             buffer_min: Duration::from_millis(1000),
             buffer_max: Duration::from_millis(1000),
             reorder_buffer: Duration::from_millis(15),
@@ -386,6 +414,9 @@ impl Default for Config {
             srp_compat: false,
             srp_users: Vec::new(),
             compression: false,
+            recovery_depth: None,
+            adv_sender_start_main: false,
+            drop_advanced_rtt_echo_request: true,
             fragment_size: 0,
             null_packet_deletion: false,
             one_way: false,
@@ -522,6 +553,32 @@ impl Config {
     #[must_use]
     pub fn with_compression(mut self, on: bool) -> Config {
         self.compression = on;
+        self
+    }
+
+    /// Sets the Advanced-profile recovery depth: the retransmit ring holds
+    /// `65536 << depth` packets (libRIST `?recovery-depth=`). See
+    /// [`Config::recovery_depth`].
+    #[must_use]
+    pub fn with_recovery_depth(mut self, depth: u8) -> Config {
+        self.recovery_depth = Some(depth);
+        self
+    }
+
+    /// Starts an Advanced sender in Main framing, upgrading to Advanced once the peer
+    /// advertises Advanced capability (TR-06-3 §9). See
+    /// [`Config::adv_sender_start_main`].
+    #[must_use]
+    pub fn with_adv_sender_start_main(mut self, on: bool) -> Config {
+        self.adv_sender_start_main = on;
+        self
+    }
+
+    /// Sets whether an Advanced session drops inbound RTT-echo requests (the default)
+    /// or answers them. See [`Config::drop_advanced_rtt_echo_request`].
+    #[must_use]
+    pub fn with_drop_advanced_rtt_echo_request(mut self, drop: bool) -> Config {
+        self.drop_advanced_rtt_echo_request = drop;
         self
     }
 
@@ -833,6 +890,35 @@ impl Config {
             };
             return Err(unsupported("flow attributes", name));
         }
+        // Advanced-only knobs: recovery depth, the §9 sender Main fallback, and
+        // answering Advanced RTT-echo (drop = false).
+        let non_adv_name = |p: Profile| {
+            if p == Profile::Simple {
+                "Simple"
+            } else {
+                "Main"
+            }
+        };
+        if self.recovery_depth.is_some() && self.profile != Profile::Advanced {
+            return Err(unsupported("recovery depth", non_adv_name(self.profile)));
+        }
+        if self.adv_sender_start_main && self.profile != Profile::Advanced {
+            return Err(unsupported(
+                "Advanced sender Main fallback",
+                non_adv_name(self.profile),
+            ));
+        }
+        if !self.drop_advanced_rtt_echo_request && self.profile != Profile::Advanced {
+            return Err(unsupported(
+                "answering Advanced RTT-echo",
+                non_adv_name(self.profile),
+            ));
+        }
+        if let Some(depth) = self.recovery_depth
+            && depth > crate::RECOVERY_DEPTH_MAX
+        {
+            return Err(ConfigError::RecoveryDepthOutOfRange { depth });
+        }
         match self.profile {
             Profile::Simple => {
                 if self.secret.is_some() {
@@ -957,10 +1043,12 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// The defaults equal libRIST's `RIST_DEFAULT_*` parameters, including the profile:
+    /// like libRIST, ristrust now defaults to the Advanced profile.
     #[test]
     fn default_matches_librist() {
         let c = Config::default();
-        assert_eq!(c.profile, Profile::Simple);
+        assert_eq!(c.profile, Profile::Advanced);
         assert_eq!(c.buffer_min, Duration::from_millis(1000));
         assert_eq!(c.rtt_min, Duration::from_millis(5));
         assert_eq!(c.rtt_max, Duration::from_millis(500));
@@ -1017,13 +1105,20 @@ mod tests {
     #[test]
     fn validate_fails_closed_on_unsupported_profile_features() {
         // Encryption/auth/compression on Simple, and compression on Main, are
-        // rejected rather than silently ignored.
+        // rejected rather than silently ignored. (DefaultConfig is Advanced, which
+        // supports them, so pin Simple to exercise the rejection.)
         assert!(matches!(
-            Config::default().with_secret("x").validate(),
+            Config::default()
+                .with_profile(Profile::Simple)
+                .with_secret("x")
+                .validate(),
             Err(ConfigError::ProfileFeatureUnsupported { .. })
         ));
         assert!(matches!(
-            Config::default().with_srp_credentials("u", "p").validate(),
+            Config::default()
+                .with_profile(Profile::Simple)
+                .with_srp_credentials("u", "p")
+                .validate(),
             Err(ConfigError::ProfileFeatureUnsupported { .. })
         ));
         assert!(matches!(
@@ -1074,11 +1169,62 @@ mod tests {
     }
 
     #[test]
+    fn validate_gates_advanced_only_knobs() {
+        let adv = || Config::default().with_profile(Profile::Advanced);
+        let simple = || Config::default().with_profile(Profile::Simple);
+
+        // recovery-depth, the §9 sender Main fallback, and answering RTT-echo are
+        // Advanced-only; rejected (not ignored) on Simple/Main.
+        assert!(matches!(
+            simple().with_recovery_depth(3).validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            simple().with_adv_sender_start_main(true).validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+        assert!(matches!(
+            simple()
+                .with_drop_advanced_rtt_echo_request(false)
+                .validate(),
+            Err(ConfigError::ProfileFeatureUnsupported { .. })
+        ));
+
+        // On Advanced they validate.
+        assert!(adv().with_recovery_depth(0).validate().is_ok());
+        assert!(
+            adv()
+                .with_recovery_depth(crate::RECOVERY_DEPTH_MAX)
+                .validate()
+                .is_ok()
+        );
+        assert!(adv().with_adv_sender_start_main(true).validate().is_ok());
+        assert!(
+            adv()
+                .with_drop_advanced_rtt_echo_request(false)
+                .validate()
+                .is_ok()
+        );
+
+        // Out-of-range depth is rejected.
+        assert!(matches!(
+            adv().with_recovery_depth(crate::RECOVERY_DEPTH_MAX + 1).validate(),
+            Err(ConfigError::RecoveryDepthOutOfRange { depth }) if depth == crate::RECOVERY_DEPTH_MAX + 1
+        ));
+
+        // The drop default (true) is fine on any profile (answering is the opt-in).
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
     fn validate_gates_fragmentation_to_advanced() {
         // Payload fragmentation (F/L bits) is an Advanced-profile feature; Simple
         // and Main reject it rather than silently dropping the splitting behavior.
         assert!(matches!(
-            Config::default().with_fragment_size(1200).validate(),
+            Config::default()
+                .with_profile(Profile::Simple)
+                .with_fragment_size(1200)
+                .validate(),
             Err(ConfigError::ProfileFeatureUnsupported { .. })
         ));
         assert!(matches!(
@@ -1103,7 +1249,10 @@ mod tests {
     fn validate_gates_flow_attr_callback_to_advanced() {
         // A flow-attribute callback is an Advanced-only control channel.
         assert!(matches!(
-            Config::default().with_flow_attr_callback(|_| {}).validate(),
+            Config::default()
+                .with_profile(Profile::Simple)
+                .with_flow_attr_callback(|_| {})
+                .validate(),
             Err(ConfigError::ProfileFeatureUnsupported { .. })
         ));
         assert!(

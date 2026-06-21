@@ -1224,6 +1224,7 @@ impl MainDriver {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    short_seq: true, // Main FEC: reconstructed from 16-bit RTP fields
                     // FEC-recovered packets carry no virtual ports (not in the matrix).
                     ..Default::default()
                 },

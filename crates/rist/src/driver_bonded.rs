@@ -39,7 +39,7 @@ use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::config::ConnectInfo;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, RxControl, recv_opt};
-use crate::driver_adv::{adv_ctrl_ts, is_adv_framed};
+use crate::driver_adv::{AdvOpts, adv_ctrl_ts, is_adv_framed};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
@@ -138,6 +138,8 @@ struct PathLink {
 }
 
 /// The bonded Main-profile session driver, run as one detached task per flow.
+// Justification: the bool fields are independent per-flow flags, not a state enum.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct BondedDriver {
     /// Whether this is the media-originating (sender) half.
     sender: bool,
@@ -205,6 +207,15 @@ pub(crate) struct BondedDriver {
     /// The media SSRC learned from the first inbound packet (one stream, any path).
     learned_ssrc: Option<u32>,
 
+    /// TR-06-3 §9 sender Main fallback (config, off by default): start media in Main
+    /// framing and upgrade to Advanced (Type=5) framing once a peer advertises
+    /// Advanced capability. See [`crate::config::Config::adv_sender_start_main`].
+    adv_sender_start_main: bool,
+    /// Whether a peer has advertised Advanced capability via a keep-alive I bit; gates
+    /// the §9 framing upgrade when `adv_sender_start_main` is set. A bonded sender
+    /// upgrades the whole flow once any path's peer advertises it.
+    remote_supports_advanced: bool,
+
     // --- forward error correction (TR-06-2 §8.4, separate-port over bonding) ---
     /// One shared FEC engine across all paths: the sender clips each first-tx payload
     /// once and fans the FEC across the paths; every path's media and FEC feed the one
@@ -261,6 +272,7 @@ impl BondedDriver {
         npd_cmd: Option<mpsc::Receiver<bool>>,
         peer_cmd: mpsc::Receiver<PeerCmd>,
         path_factory: PathFactory,
+        opts: AdvOpts,
     ) -> (
         mpsc::Sender<Bytes>,
         CloseFlag,
@@ -296,6 +308,8 @@ impl BondedDriver {
             data_out: None,
             rx_ctrl: None, // a sender takes no receiver-control commands
             learned_ssrc: None,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
             fec,
             last_weighted: None,
             lqm: None, // a sender does not emit LQM
@@ -327,6 +341,7 @@ impl BondedDriver {
         peer_cmd: Option<mpsc::Receiver<PeerCmd>>,
         path_factory: Option<PathFactory>,
         auth: crate::driver_main::AuthGate,
+        opts: AdvOpts,
     ) -> (
         mpsc::Receiver<Bytes>,
         CloseFlag,
@@ -362,6 +377,8 @@ impl BondedDriver {
             data_out: Some(tx),
             rx_ctrl: Some(rx_ctrl),
             learned_ssrc: None,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
             fec,
             last_weighted: None,
             lqm,
@@ -391,6 +408,7 @@ impl BondedDriver {
         keepalive: Duration,
         adv: Option<AdvCodec>,
         merge_mode: MergeMode,
+        opts: AdvOpts,
     ) -> (
         mpsc::Sender<Inbound>,
         mpsc::Receiver<Bytes>,
@@ -429,6 +447,8 @@ impl BondedDriver {
             // A demuxed per-flow bonded receiver has no settable handle.
             rx_ctrl: None,
             learned_ssrc: None,
+            adv_sender_start_main: opts.adv_sender_start_main,
+            remote_supports_advanced: false,
             fec: None,
             last_weighted: None,
             lqm: None, // multi-flow bonded LQM emission is deferred
@@ -644,6 +664,11 @@ impl BondedDriver {
                 crate::driver::decode_warn(psk, "bonded adv", &e);
             }
         }
+        // TR-06-3 §9: a native Advanced keep-alive's I bit advertises the peer's
+        // Advanced capability, upgrading the bonded sender's media framing to Advanced.
+        if let Some(true) = self.adv.as_mut().and_then(AdvCodec::take_peer_adv_cap) {
+            self.remote_supports_advanced = true;
+        }
         true
     }
 
@@ -724,6 +749,11 @@ impl BondedDriver {
         if kind == ControlKind::Keepalive {
             if let Some(ka) = &ka {
                 self.merger.set_auto_enabled(ka.caps.l);
+                // TR-06-3 §9: the GRE keep-alive's extended I bit advertises Advanced
+                // capability, upgrading the bonded sender's media framing to Advanced.
+                if ka.has_adv_ext && ka.adv_ext.i {
+                    self.remote_supports_advanced = true;
+                }
             }
         } else {
             match self.paths[i].codec.decode(&inb.data, self.highest_sent) {
@@ -811,8 +841,19 @@ impl BondedDriver {
                     self.last_weighted = weighted;
                     // Advanced encodes the media ONCE via the shared adv codec and fans
                     // the identical bytes; Main encodes per-path (each path's GRE
-                    // sequence differs).
-                    let adv_bytes = self.adv.as_mut().map(|a| a.encode_media(&pkt));
+                    // sequence differs). TR-06-3 §9 (opt-in): until a peer advertises
+                    // Advanced (I=1), force the per-path Main path so a Main-only bonded
+                    // receiver can decode it — the same path the pure-Main fan uses.
+                    // Skipped when FEC is configured (an Advanced-only feature a Main-only
+                    // peer cannot consume).
+                    let use_main_fallback = self.adv_sender_start_main
+                        && !self.remote_supports_advanced
+                        && self.fec.is_none();
+                    let adv_bytes = if use_main_fallback {
+                        None
+                    } else {
+                        self.adv.as_mut().map(|a| a.encode_media(&pkt))
+                    };
                     match adv_bytes {
                         Some(Ok(bytes)) => {
                             let bytes = Bytes::from(bytes);
@@ -1079,6 +1120,7 @@ impl BondedDriver {
                     retransmit: false,
                     path_id: 0,
                     frag: FragRole::Standalone,
+                    short_seq: true, // FEC: reconstructed from 16-bit RTP fields
                     // FEC-recovered packets carry no virtual ports (not in the matrix).
                     ..Default::default()
                 },

@@ -571,9 +571,10 @@ mod tests {
 
     #[tokio::test]
     async fn listen_rejects_odd_port() {
-        let err = listen("127.0.0.1:5003", Config::default())
-            .await
-            .unwrap_err();
+        // The even/odd-port rule is Simple-profile; DefaultConfig is now Advanced
+        // (single-port), which accepts any port.
+        let cfg = Config::default().with_profile(crate::config::Profile::Simple);
+        let err = listen("127.0.0.1:5003", cfg).await.unwrap_err();
         assert!(matches!(err, Error::Io(_)));
     }
 }

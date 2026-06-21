@@ -31,6 +31,12 @@ pub enum ConfigError {
         /// The offending multiplier.
         value: u32,
     },
+    /// The Advanced recovery depth exceeds [`RECOVERY_DEPTH_MAX`](crate::RECOVERY_DEPTH_MAX).
+    #[error("rist: recovery_depth {depth} exceeds the 0..=16 range")]
+    RecoveryDepthOutOfRange {
+        /// The offending depth.
+        depth: u8,
+    },
     /// A retry count exceeds the 100 ceiling.
     #[error("rist: retry count exceeds 100")]
     RetriesOutOfRange,

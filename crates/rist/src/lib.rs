@@ -99,3 +99,8 @@ pub const MAX_MEDIA_PAYLOAD: usize = 1460;
 /// payload (`7 × 188`); chunking writes to this size never fragments regardless of
 /// profile or encryption.
 pub const SAFE_MEDIA_PAYLOAD: usize = 1316;
+
+/// The maximum Advanced-profile recovery depth ([`Config::recovery_depth`]), matching
+/// libRIST's `RIST_RECOVERY_DEPTH_MAX` (16 == the full 32-bit sequence space). The
+/// ring holds `65536 << depth` packets, so large depths are bounded by available RAM.
+pub const RECOVERY_DEPTH_MAX: u8 = 16;

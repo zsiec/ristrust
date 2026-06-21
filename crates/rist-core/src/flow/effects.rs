@@ -196,6 +196,12 @@ pub struct Stats {
     /// rather than merging two distinct flows into one ring (libRIST's "Detected
     /// flow id change ... resetting state").
     pub flow_resets: u64,
+    /// Wire-framing changes: a fresh (non-retransmit) packet whose sequence framing
+    /// ([`MediaPacket::short_seq`] — 16-bit Main vs 32-bit Advanced) differed from
+    /// the one the flow anchored on, so the receiver re-anchored rather than blending
+    /// two framings in one ring. This is the TR-06-3 §9 Main↔Advanced interop
+    /// transition (the Main→Advanced upgrade once a peer advertises I=1).
+    pub framing_resets: u64,
 
     // --- Sender half ---
     /// First-transmission media packets emitted by `push_app`.

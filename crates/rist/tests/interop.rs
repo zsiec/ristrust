@@ -164,7 +164,9 @@ async fn interop_librist_rx_from_ristrust_tx() {
     );
     wait_tool_ready(rx_port, Duration::from_secs(5)).await;
 
-    let cfg = Config::default().with_buffer(Duration::from_millis(200));
+    let cfg = Config::default()
+        .with_profile(Profile::Simple)
+        .with_buffer(Duration::from_millis(200));
     let sender = dial(&format!("127.0.0.1:{rx_port}"), cfg)
         .await
         .expect("dial libRIST receiver");
@@ -220,7 +222,9 @@ async fn interop_ristrust_rx_from_librist_tx() {
     let go_port = free_even_port();
     let feed_port = free_udp_port(&[go_port, go_port + 1]);
 
-    let cfg = Config::default().with_buffer(Duration::from_millis(200));
+    let cfg = Config::default()
+        .with_profile(Profile::Simple)
+        .with_buffer(Duration::from_millis(200));
     let mut receiver = listen(&format!("127.0.0.1:{go_port}"), cfg)
         .await
         .expect("listen for libRIST sender");
@@ -457,7 +461,9 @@ async fn ristrust_rx_lossy_recovery(cfg: Config, seed: u64, label: &str) {
 #[tokio::test]
 async fn interop_ristrust_rx_lossy_recovery_from_librist_tx() {
     ristrust_rx_lossy_recovery(
-        Config::default().with_buffer(Duration::from_millis(700)),
+        Config::default()
+            .with_profile(Profile::Simple)
+            .with_buffer(Duration::from_millis(700)),
         7,
         "range-nack",
     )
@@ -473,6 +479,7 @@ async fn interop_ristrust_rx_lossy_recovery_from_librist_tx() {
 async fn interop_ristrust_rx_lossy_bitmask_nack_from_librist_tx() {
     ristrust_rx_lossy_recovery(
         Config::default()
+            .with_profile(Profile::Simple)
             .with_buffer(Duration::from_millis(700))
             .with_nack_type(NackType::Bitmask),
         13,
@@ -513,7 +520,9 @@ async fn interop_librist_rx_lossy_recovery_from_ristrust_tx() {
     let proxy = start_lossy_proxy(proxy_port, rx_port, 0.10, 9).await;
     wait_tool_ready(rx_port, Duration::from_secs(5)).await;
 
-    let cfg = Config::default().with_buffer(Duration::from_millis(700));
+    let cfg = Config::default()
+        .with_profile(Profile::Simple)
+        .with_buffer(Duration::from_millis(700));
     let sender = dial(&format!("127.0.0.1:{proxy_port}"), cfg)
         .await
         .expect("dial proxy");
@@ -1214,6 +1223,74 @@ async fn adv_librist_rx_from_ristrust_tx(secret: Option<&str>) {
     assert_contiguous_chunks(&got, RUN, "ristrust adv sender -> libRIST");
 }
 
+/// ristrust Advanced Sender with `adv_sender_start_main` → libRIST `ristreceiver -p 1`
+/// (Main-only). This is the TR-06-3 §9 sender fallback: a Main-only receiver never
+/// advertises Advanced capability (I=1), so ristrust stays in Main-Profile (GRE)
+/// framing for the whole flow and a Main-only peer decodes it. Without the knob the
+/// sender would emit Advanced Type=5 framing the Main-only receiver cannot decode.
+async fn adv_main_only_rx_from_ristrust_tx(secret: Option<&str>) {
+    let Some(receiver_bin) = librist_tool("ristreceiver") else {
+        eprintln!("interop: ristreceiver not found; skipping");
+        return;
+    };
+    let rx_port = free_udp_port(&[]);
+    let cap_port = free_udp_port(&[rx_port]);
+    let cap = UdpSocket::bind(("127.0.0.1", cap_port))
+        .await
+        .expect("bind capture");
+
+    // libRIST Main-Profile (-p 1) receiver: it never advertises the Advanced I bit.
+    let mut args = vec![
+        "-p".into(),
+        "1".into(),
+        "-b".into(),
+        "300".into(),
+        "-i".into(),
+        format!("rist://@127.0.0.1:{rx_port}"),
+        "-o".into(),
+        format!("udp://127.0.0.1:{cap_port}"),
+    ];
+    if let Some(s) = secret {
+        args.extend(["-s".into(), s.into(), "-e".into(), "256".into()]);
+    }
+    let _tool = spawn_tool(&receiver_bin, &args);
+    wait_tool_ready(rx_port, Duration::from_secs(5)).await;
+
+    let cfg = adv_interop_cfg(secret).with_adv_sender_start_main(true);
+    let sender = dial(&format!("127.0.0.1:{rx_port}"), cfg)
+        .await
+        .expect("dial libRIST Main receiver");
+    let send = tokio::spawn(async move {
+        let mut i: u32 = 0;
+        loop {
+            if sender.send(&indexed_chunk(i)).await.is_err() {
+                return sender;
+            }
+            i = i.wrapping_add(1);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    const RUN: usize = 100;
+    let want = RUN * CHUNK;
+    let mut got = Vec::with_capacity(want);
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, cap.recv(&mut buf)).await {
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    send.abort();
+    assert_contiguous_chunks(
+        &got,
+        RUN,
+        "ristrust adv->Main sender -> libRIST Main receiver",
+    );
+}
+
 /// libRIST `ristsender -p 2` → ristrust Advanced Receiver. Proves ristrust decodes
 /// libRIST's adv-framed media.
 async fn adv_ristrust_rx_from_librist_tx(secret: Option<&str>) {
@@ -1291,6 +1368,16 @@ async fn interop_adv_librist_rx_from_ristrust_tx_aes256() {
 #[tokio::test]
 async fn interop_adv_ristrust_rx_from_librist_tx_aes256() {
     adv_ristrust_rx_from_librist_tx(Some(MAIN_SECRET)).await;
+}
+
+#[tokio::test]
+async fn interop_adv_main_only_rx_from_ristrust_tx_clear() {
+    adv_main_only_rx_from_ristrust_tx(None).await;
+}
+
+#[tokio::test]
+async fn interop_adv_main_only_rx_from_ristrust_tx_aes256() {
+    adv_main_only_rx_from_ristrust_tx(Some(MAIN_SECRET)).await;
 }
 
 /// A compressible indexed chunk: a 4-byte index then a run of one repeated byte

@@ -466,8 +466,10 @@ async fn send_rejects_payload_over_fragment_cap() {
 
 #[tokio::test]
 async fn write_flow_attribute_rejected_off_advanced() {
-    // A non-Advanced sender has no flow-attribute channel.
-    let sender = dial_with("127.0.0.1:5000", Config::default(), &TokioRuntime)
+    // A non-Advanced sender has no flow-attribute channel. (DefaultConfig is Advanced,
+    // which DOES support flow attributes, so pin Simple to exercise the unsupported path.)
+    let cfg = Config::default().with_profile(Profile::Simple);
+    let sender = dial_with("127.0.0.1:5000", cfg, &TokioRuntime)
         .await
         .expect("dial simple");
     assert!(matches!(

@@ -124,9 +124,9 @@ async fn reverse_oob_round_trips_advanced() {
 
 #[tokio::test]
 async fn receiver_write_oob_rejected_on_simple() {
-    // A Simple-profile receiver has no OOB side channel.
+    // A Simple-profile receiver has no OOB side channel. (DefaultConfig is Advanced now.)
     let (rx, _port) = {
-        let c = Config::default(); // Simple
+        let c = Config::default().with_profile(Profile::Simple);
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
         let mut port = probe.local_addr().expect("addr").port();
         if !port.is_multiple_of(2) {
@@ -168,7 +168,9 @@ async fn oob_typed_tunnels_a_custom_protocol() {
 
 #[tokio::test]
 async fn write_oob_rejected_on_simple() {
-    let sender = dial_with("127.0.0.1:5000", Config::default(), &TokioRuntime)
+    // DefaultConfig is Advanced (which has an OOB channel); pin Simple to test rejection.
+    let cfg = Config::default().with_profile(Profile::Simple);
+    let sender = dial_with("127.0.0.1:5000", cfg, &TokioRuntime)
         .await
         .expect("dial simple");
     assert!(matches!(

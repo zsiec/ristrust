@@ -678,6 +678,7 @@ impl Driver {
                 }
             }
         }
+        self.stats.set_framing(0, false); // Simple profile: 16-bit framing, never Advanced
         self.stats.publish(self.flow.stats(), self.fec_recovered());
     }
 

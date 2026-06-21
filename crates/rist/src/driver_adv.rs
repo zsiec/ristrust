@@ -64,6 +64,24 @@ pub(crate) fn is_adv_framed(data: &[u8]) -> bool {
     }
 }
 
+/// Whether Advanced framing is currently active on the wire, for the Prometheus
+/// `advanced_active` stat. A sender leaves the TR-06-3 §9 Main-framing fallback
+/// window once the peer advertises Advanced support; a receiver follows the framing
+/// it anchored on (32-bit only after an Advanced source upgrades framing). The flow
+/// snapshot `core` supplies the receiver's anchored framing.
+pub(crate) fn advanced_framing_active(
+    sender: bool,
+    adv_sender_start_main: bool,
+    remote_supports_advanced: bool,
+    core: &rist_core::flow::Stats,
+) -> bool {
+    if sender {
+        !adv_sender_start_main || remote_supports_advanced
+    } else {
+        core.anchored && !core.short_seq
+    }
+}
+
 /// The Advanced control/media RTP timestamp for a session instant (the effective
 /// 2^16 MHz rate: `micros << 16`).
 #[allow(clippy::cast_possible_truncation)]
@@ -928,7 +946,17 @@ impl AdvDriver {
                 }
             }
         }
-        self.stats.publish(self.flow.stats(), self.fec_recovered());
+        let core = self.flow.stats();
+        self.stats.set_framing(
+            2,
+            advanced_framing_active(
+                self.sender,
+                self.adv_sender_start_main,
+                self.remote_supports_advanced,
+                &core,
+            ),
+        );
+        self.stats.publish(core, self.fec_recovered());
     }
 
     /// The cumulative FEC-recovered count (0 when FEC is off), for `Stats` and LQM.

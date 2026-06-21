@@ -318,6 +318,8 @@ impl Flow {
         s.ips_cur_us = ips_cur;
         s.ips_max_us = ips_max;
         s.avg_buffer_time_us = self.avg_buffer_time_us();
+        s.anchored = self.receiver.started;
+        s.short_seq = self.receiver.short_seq;
         s
     }
 

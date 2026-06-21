@@ -178,6 +178,16 @@ pub struct Stats {
     /// libRIST's `recovered_one_retry`. A high ratio of this to `recovered` means
     /// losses are clearing on the first retransmission request (a healthy link).
     pub recovered_one_retry: u64,
+    /// [`recovered`](Self::recovered) after exactly two NACKs (libRIST
+    /// `recovered_two_nacks`). The bucket series shows whether losses clear promptly
+    /// or grind through repeated retries.
+    pub recovered_two_nacks: u64,
+    /// [`recovered`](Self::recovered) after exactly three NACKs (libRIST `recovered_three_nacks`).
+    pub recovered_three_nacks: u64,
+    /// [`recovered`](Self::recovered) after exactly four NACKs (libRIST `recovered_four_nacks`).
+    pub recovered_four_nacks: u64,
+    /// [`recovered`](Self::recovered) after more than four NACKs (libRIST `recovered_more_nacks`).
+    pub recovered_more_nacks: u64,
     /// Missing entries given up on (after max retries or ageing past the window).
     pub abandoned: u64,
     /// Packets handed to the application via [`Event::Deliver`].
@@ -225,4 +235,16 @@ pub struct Stats {
     /// exceeded `recovery_maxbitrate` under the active congestion-control mode
     /// (libRIST `bandwidth_skip`); the entry stays resendable and is re-NACKed.
     pub bandwidth_skipped: u64,
+
+    // --- Framing facts (filled by `Flow::stats` from receiver state, like the
+    // gauges; the flow stays profile-agnostic, so these describe only the on-wire
+    // sequence framing, never the profile). ---
+    /// Whether the receiver has accepted its first packet and locked a framing
+    /// (libRIST `receiver_queue_has_items`). False on a sender flow and before the
+    /// first received packet.
+    pub anchored: bool,
+    /// The anchored wire framing: `true` for 16-bit (Simple/Main) sequences, `false`
+    /// for the Advanced profile's native 32-bit sequence. Only meaningful when
+    /// [`anchored`](Self::anchored); a host maps it to the seq_bits stat (16 vs 32).
+    pub short_seq: bool,
 }

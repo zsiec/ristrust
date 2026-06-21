@@ -5,9 +5,11 @@
 //! each event; the public [`Sender`](crate::Sender) / [`Receiver`](crate::Receiver)
 //! handle reads the latest snapshot through its `stats()` method.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::Profile;
 
 /// Per-peer (per-path) statistics for one bonded path, or the single peer of a
 /// non-bonded session — the libRIST `rist_stats_*_peer` analog, surfaced in
@@ -61,6 +63,17 @@ pub struct Stats {
     /// The subset of [`recovered`](Stats::recovered) that cleared on the first NACK
     /// (libRIST `recovered_one_retry`) — a high ratio indicates a healthy link.
     pub recovered_one_retry: u64,
+    /// [`recovered`](Stats::recovered) bucketed by NACK depth — the number of NACKs the
+    /// packet needed before it arrived (2, 3, 4, or more than 4) — mirroring libRIST's
+    /// `recovered_{two,three,four,more}_nacks`. The distribution shows whether losses
+    /// clear promptly or grind through repeated retries.
+    pub recovered_two_nacks: u64,
+    /// [`recovered`](Stats::recovered) after three NACKs (libRIST `recovered_three_nacks`).
+    pub recovered_three_nacks: u64,
+    /// [`recovered`](Stats::recovered) after four NACKs (libRIST `recovered_four_nacks`).
+    pub recovered_four_nacks: u64,
+    /// [`recovered`](Stats::recovered) after more than four NACKs (libRIST `recovered_more_nacks`).
+    pub recovered_more_nacks: u64,
     /// Packets reconstructed by SMPTE ST 2022-1 / 2022-5 FEC (no NACK round trip),
     /// distinct from [`recovered`](Stats::recovered) (ARQ).
     pub fec_recovered: u64,
@@ -144,6 +157,19 @@ pub struct Stats {
     /// session reports exactly one peer mirroring the flow; a bonded session reports
     /// one per path with its own RTT, counters, weight, and liveness.
     pub peers: Vec<PeerStats>,
+
+    // --- Wire framing (for the Prometheus `*_info` series) ---
+    /// The configured RIST wire profile (libRIST stats `profile` field).
+    pub profile: Profile,
+    /// The on-wire sequence-number width: 16 (Simple/Main framing) or 32 (Advanced
+    /// framing). An Advanced flow reads 16 until the source upgrades framing
+    /// (TR-06-3 §9); always 16 for Simple/Main (libRIST `seq_bits`).
+    pub seq_bits: u8,
+    /// Whether Advanced framing is currently active on the wire: `true` only for an
+    /// Advanced-profile session whose framing has upgraded to 32-bit, `false` while an
+    /// Advanced session is still on the §9 Main-framing fallback window and `false` for
+    /// Simple/Main (libRIST `advanced_active`).
+    pub advanced_active: bool,
 }
 
 impl From<rist_core::flow::Stats> for Stats {
@@ -169,6 +195,10 @@ impl From<rist_core::flow::Stats> for Stats {
             lost: f.lost,
             recovered: f.recovered,
             recovered_one_retry: f.recovered_one_retry,
+            recovered_two_nacks: f.recovered_two_nacks,
+            recovered_three_nacks: f.recovered_three_nacks,
+            recovered_four_nacks: f.recovered_four_nacks,
+            recovered_more_nacks: f.recovered_more_nacks,
             fec_recovered: 0,
             duplicates: f.duplicates,
             reordered: f.reordered,
@@ -204,6 +234,13 @@ impl From<rist_core::flow::Stats> for Stats {
             // single-peer default is materialized lazily at read time (see
             // `StatsCell::snapshot`), and a bonded driver supplies its per-path list.
             peers: Vec::new(),
+            // seq_bits follows the flow's anchored framing (32 only once an Advanced
+            // source has upgraded). profile and advanced_active are not flow facts
+            // (the core is profile-agnostic); they are overlaid from the session in
+            // `StatsCell::snapshot` via `set_framing`.
+            profile: Profile::Simple,
+            seq_bits: if f.anchored && !f.short_seq { 32 } else { 16 },
+            advanced_active: false,
         }
     }
 }
@@ -350,6 +387,12 @@ struct CellInner {
     authenticated: AtomicBool,
     /// The media SSRC the receiver learned from the first packet (`0` until learned).
     ssrc: AtomicU32,
+    /// The wire profile as a libRIST discriminant (0 simple, 1 main, 2 advanced) and
+    /// whether Advanced framing is currently active, for the Prometheus `*_info`
+    /// series. Published by the driver alongside the counters; the profile is static
+    /// but advanced_active tracks the mutable §9 framing state.
+    profile: AtomicU8,
+    advanced_active: AtomicBool,
 }
 
 /// A shared cell holding a session's latest [`Stats`] snapshot plus its
@@ -396,7 +439,21 @@ impl StatsCell {
         if s.peers.is_empty() {
             s.peers.push(s.single_peer());
         }
+        // Overlay the session-owned framing metadata (seq_bits already came from the
+        // flow snapshot via `From`); profile and advanced_active are not flow facts.
+        s.profile = Profile::from_u8(self.0.profile.load(Ordering::Relaxed));
+        s.advanced_active = self.0.advanced_active.load(Ordering::Relaxed);
         s
+    }
+
+    /// Records the wire-framing metadata for the Prometheus `*_info` series
+    /// (driver-side): the profile discriminant and whether Advanced framing is
+    /// currently active. Called by the driver task when it publishes counters.
+    pub(crate) fn set_framing(&self, profile: u8, advanced_active: bool) {
+        self.0.profile.store(profile, Ordering::Relaxed);
+        self.0
+            .advanced_active
+            .store(advanced_active, Ordering::Relaxed);
     }
 
     /// Records whether the session is currently authenticated (driver-side).

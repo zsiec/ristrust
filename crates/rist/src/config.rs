@@ -132,14 +132,49 @@ impl std::fmt::Debug for DisconnectCallback {
 }
 
 /// The RIST profile (wire dialect) a session speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
     /// VSF TR-06-1: bare RTP/RTCP on an even/odd UDP port pair.
+    #[default]
     Simple,
     /// VSF TR-06-2: GRE-over-UDP tunnel, PSK encryption, EAP-SRP auth.
     Main,
     /// VSF TR-06-3: compact header, AEAD, LZ4 compression, control messages.
     Advanced,
+}
+
+impl Profile {
+    /// The libRIST `enum rist_profile` discriminant (0 simple, 1 main, 2 advanced),
+    /// matching the value the stats output and Prometheus `*_info` series carry.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Profile::Simple => 0,
+            Profile::Main => 1,
+            Profile::Advanced => 2,
+        }
+    }
+
+    /// The reverse of [`as_u8`](Self::as_u8); any out-of-range value maps to `Simple`.
+    #[must_use]
+    pub(crate) fn from_u8(v: u8) -> Profile {
+        match v {
+            1 => Profile::Main,
+            2 => Profile::Advanced,
+            _ => Profile::Simple,
+        }
+    }
+
+    /// The lowercase profile name (`"simple"`/`"main"`/`"advanced"`) used as the
+    /// Prometheus `profile` label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Profile::Simple => "simple",
+            Profile::Main => "main",
+            Profile::Advanced => "advanced",
+        }
+    }
 }
 
 /// Which wire encoding the receiver uses for negative acknowledgements.

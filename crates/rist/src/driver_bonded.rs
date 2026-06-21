@@ -39,7 +39,7 @@ use crate::codec_adv::AdvCodec;
 use crate::codec_main::{ControlKind, Decoded, MainCodec};
 use crate::config::ConnectInfo;
 use crate::driver::{COMMAND_CAPACITY, CloseFlag, DATA_CAPACITY, RxControl, recv_opt};
-use crate::driver_adv::{AdvOpts, adv_ctrl_ts, is_adv_framed};
+use crate::driver_adv::{AdvOpts, adv_ctrl_ts, advanced_framing_active, is_adv_framed};
 use crate::driver_main::EapRole;
 use crate::fec::{FEC_COLUMN_PORT_OFFSET, FEC_PT, FEC_ROW_PORT_OFFSET, FecState};
 use crate::peer::Peer;
@@ -923,8 +923,27 @@ impl BondedDriver {
             .into_iter()
             .map(PeerStats::from)
             .collect();
-        self.stats
-            .publish_peers(self.flow.stats(), self.fec_recovered(), peers);
+        let core = self.flow.stats();
+        let (profile, adv_active) = self.framing_meta(&core);
+        self.stats.set_framing(profile, adv_active);
+        self.stats.publish_peers(core, self.fec_recovered(), peers);
+    }
+
+    /// The profile discriminant (1 main, 2 advanced) and whether Advanced framing is
+    /// active, for the Prometheus `*_info` series. Bonded carries Main (`adv = None`)
+    /// or Advanced (`adv = Some`) framing.
+    fn framing_meta(&self, core: &rist_core::flow::Stats) -> (u8, bool) {
+        if self.adv.is_some() {
+            let active = advanced_framing_active(
+                self.sender,
+                self.adv_sender_start_main,
+                self.remote_supports_advanced,
+                core,
+            );
+            (2, active)
+        } else {
+            (1, false)
+        }
     }
 
     /// Applies one runtime bonded-path command (libRIST `rist_peer_create`/`_destroy`)

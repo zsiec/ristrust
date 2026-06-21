@@ -537,6 +537,7 @@ impl BondedSimpleDriver {
             .into_iter()
             .map(PeerStats::from)
             .collect();
+        self.stats.set_framing(0, false); // Simple profile: 16-bit framing, never Advanced
         self.stats.publish_peers(self.flow.stats(), 0, peers);
     }
 

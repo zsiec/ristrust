@@ -75,9 +75,62 @@ pub fn encode(s: &Stats) -> String {
     );
     counter(
         &mut o,
+        "rist_client_flow_recovered_two_nacks_packets",
+        "Packets recovered after two NACKs.",
+        s.recovered_two_nacks,
+    );
+    counter(
+        &mut o,
+        "rist_client_flow_recovered_three_nacks_packets",
+        "Packets recovered after three NACKs.",
+        s.recovered_three_nacks,
+    );
+    counter(
+        &mut o,
+        "rist_client_flow_recovered_four_nacks_packets",
+        "Packets recovered after four NACKs.",
+        s.recovered_four_nacks,
+    );
+    counter(
+        &mut o,
+        "rist_client_flow_recovered_more_nacks_packets",
+        "Packets recovered after more than four NACKs.",
+        s.recovered_more_nacks,
+    );
+    counter(
+        &mut o,
         "rist_client_flow_reordered_packets",
         "Packets that arrived out of order.",
         s.reordered,
+    );
+    counter(
+        &mut o,
+        "rist_client_flow_duplicate_packets",
+        "Duplicate packets received (ARQ re-sends and extra SMPTE 2022-7 path copies).",
+        s.duplicates,
+    );
+    counter(
+        &mut o,
+        "rist_client_flow_dropped_late_packets",
+        "Packets dropped for arriving too late to deliver.",
+        s.too_late,
+    );
+    // ristrust has no separate buffer-full drop: a packet circularly behind the playout
+    // cursor is shed by the cursor guard and counted in dropped_late, so this
+    // libRIST-parity series is always 0 (the dashboard panel stays populated).
+    counter(
+        &mut o,
+        "rist_client_flow_dropped_full_packets",
+        "Packets dropped because the buffer was full (always 0 in ristrust; see dropped_late).",
+        0,
+    );
+    // retries == the NACK-sequences-queued count, the same underlying counter as
+    // nacks_sent below; exported under libRIST's name for dashboard parity.
+    counter(
+        &mut o,
+        "rist_client_flow_retries_packets",
+        "Retransmissions requested (NACK sequences queued).",
+        s.nacks_sent,
     );
     counter(
         &mut o,
@@ -150,6 +203,26 @@ pub fn encode(s: &Stats) -> String {
         "rist_client_flow_peers",
         "Number of bonded peers.",
         f64_from(s.peers.len() as u64),
+    );
+    // Info series: a constant 1 carrying the profile and on-wire framing as labels, so a
+    // scrape can identify an Advanced flow (and 16- vs 32-bit framing) without changing
+    // the label set of the existing series (libRIST rist_*_info).
+    let _ = write!(
+        o,
+        "# HELP rist_client_flow_info Flow metadata; value is always 1, see profile, seq_bits and advanced_active labels.\n\
+         # TYPE rist_client_flow_info gauge\n\
+         rist_client_flow_info{{profile=\"{}\",seq_bits=\"{}\",advanced_active=\"{}\"}} 1\n",
+        s.profile.as_str(),
+        s.seq_bits,
+        u8::from(s.advanced_active),
+    );
+    let _ = write!(
+        o,
+        "# HELP rist_sender_peer_info Sender peer metadata; value is always 1, see profile and advanced_active labels.\n\
+         # TYPE rist_sender_peer_info gauge\n\
+         rist_sender_peer_info{{profile=\"{}\",advanced_active=\"{}\"}} 1\n",
+        s.profile.as_str(),
+        u8::from(s.advanced_active),
     );
     encode_peers(&mut o, s);
     o
@@ -306,8 +379,16 @@ mod tests {
             received: 100,
             delivered: 98,
             lost: 2,
+            recovered_two_nacks: 5,
+            recovered_more_nacks: 1,
+            duplicates: 7,
+            too_late: 3,
+            nacks_sent: 9,
             rtt: std::time::Duration::from_millis(20),
             quality: 0.98,
+            profile: crate::Profile::Advanced,
+            seq_bits: 32,
+            advanced_active: true,
             ..Default::default()
         };
         let out = encode(&s);
@@ -317,6 +398,20 @@ mod tests {
             "# TYPE rist_client_flow_rtt_seconds gauge\nrist_client_flow_rtt_seconds 0.02\n"
         ));
         assert!(out.contains("rist_client_flow_quality_ratio 0.98\n"));
+        // libRIST-parity counters (8cf3c81).
+        assert!(out.contains("rist_client_flow_recovered_two_nacks_packets 5\n"));
+        assert!(out.contains("rist_client_flow_recovered_more_nacks_packets 1\n"));
+        assert!(out.contains("rist_client_flow_duplicate_packets 7\n"));
+        assert!(out.contains("rist_client_flow_dropped_late_packets 3\n"));
+        assert!(out.contains("rist_client_flow_dropped_full_packets 0\n"));
+        assert!(out.contains("rist_client_flow_retries_packets 9\n"));
+        // Info series with profile/framing labels (4d55974).
+        assert!(out.contains(
+            "rist_client_flow_info{profile=\"advanced\",seq_bits=\"32\",advanced_active=\"1\"} 1\n"
+        ));
+        assert!(
+            out.contains("rist_sender_peer_info{profile=\"advanced\",advanced_active=\"1\"} 1\n")
+        );
         // No peers => no per-peer block.
         assert!(!out.contains("rist_peer_"));
         // Every HELP is paired with a TYPE.

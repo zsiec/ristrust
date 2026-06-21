@@ -122,7 +122,7 @@ pub(super) struct ReceiverState {
     /// sequence. A started flow whose next fresh packet carries a different value is
     /// following a mid-stream framing change (TR-06-3 §9 Main↔Advanced) and is
     /// re-anchored like a flow-id change.
-    short_seq: bool,
+    pub(super) short_seq: bool,
 
     /// libRIST `last_seq_found`: the newest in-order sequence accepted, the
     /// anchor of missing-detection walks.
@@ -931,8 +931,13 @@ impl Flow {
             if filled && slot_seq == e.seq {
                 if e.nack_count > 0 {
                     self.stats.recovered += 1;
-                    if e.nack_count == 1 {
-                        self.stats.recovered_one_retry += 1;
+                    // Bucket by NACK depth (libRIST recovered_{one_retry,two,three,four,more}_nacks).
+                    match e.nack_count {
+                        1 => self.stats.recovered_one_retry += 1,
+                        2 => self.stats.recovered_two_nacks += 1,
+                        3 => self.stats.recovered_three_nacks += 1,
+                        4 => self.stats.recovered_four_nacks += 1,
+                        _ => self.stats.recovered_more_nacks += 1,
                     }
                 }
                 continue; // recovered: remove
@@ -1899,6 +1904,48 @@ mod tests {
             "widened 16-bit flow: gap {GAP} must read as wraparound, not loss"
         );
         assert_eq!(fs.receiver.last_found, 100 + GAP);
+    }
+
+    #[test]
+    fn recovered_nack_depth_buckets() {
+        // A hole NACKed N times before its retransmit arrives is bucketed by depth
+        // (libRIST recovered_{one_retry,two,three,four,more}_nacks). Drive a fresh
+        // flow's single hole to each depth and assert only the matching bucket moves.
+        for (nacks, want) in [(1usize, 0usize), (2, 1), (3, 2), (4, 3), (6, 4)] {
+            let mut f = recv();
+            f.feed(ts(10_000), 0, mk_pkt(100, 0, b""));
+            f.feed(ts(24_000), 0, mk_pkt(102, 14_000, b"")); // hole at 101
+            drain_outputs(&mut f);
+            // Send exactly `nacks` NACKs: each step clears the next-nack interval while
+            // staying inside the 1.1 s recovery window (no abandon).
+            let mut now = 24_000u64;
+            for _ in 0..nacks {
+                now += 30_000;
+                f.process_nacks(ts(now));
+            }
+            assert_eq!(
+                f.receiver.missing.front().expect("hole pending").nack_count as usize,
+                nacks,
+                "nack_count for depth {nacks}"
+            );
+            // Retransmit fills the hole; the next pass books the recovery by depth.
+            f.feed(ts(now + 1_000), 0, rtx(101, 7_000, b""));
+            f.process_nacks(ts(now + 2_000));
+
+            let s = f.stats();
+            assert_eq!(s.recovered, 1, "recovered for depth {nacks}");
+            let got = [
+                s.recovered_one_retry,
+                s.recovered_two_nacks,
+                s.recovered_three_nacks,
+                s.recovered_four_nacks,
+                s.recovered_more_nacks,
+            ];
+            for (i, &v) in got.iter().enumerate() {
+                let exp = u64::from(i == want);
+                assert_eq!(v, exp, "bucket[{i}] for depth {nacks} (all: {got:?})");
+            }
+        }
     }
 
     #[test]

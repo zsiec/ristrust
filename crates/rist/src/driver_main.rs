@@ -1167,6 +1167,7 @@ impl MainDriver {
                 }
             }
         }
+        self.stats.set_framing(1, false); // Main profile: 16-bit framing, never Advanced
         self.stats.publish(self.flow.stats(), self.fec_recovered());
     }
 

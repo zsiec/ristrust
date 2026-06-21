@@ -25,13 +25,19 @@
 )]
 
 /// The largest forward gap a widened 16-bit (Simple/Main) flow interprets as loss
-/// rather than wraparound. libRIST's `receiver_mark_missing` rejects gaps greater
-/// than this unconditionally; the flow core pins its loss threshold here.
+/// rather than wraparound (32768, the half-16-bit-space antipode). Matches the
+/// `short_seq` branch of libRIST's `receiver_mark_missing` cap
+/// (`short_seq ? UINT16_SIZE/2 : receiver_queue_max/2`); native 32-bit Advanced
+/// flows instead scale the cap to half their recovery ring (see `mark_missing`).
 pub const MAX_GAP_16: u64 = 1 << 15;
 
-/// The 32-bit analog of [`MAX_GAP_16`] (a generalization; libRIST pins all gaps to
-/// [`MAX_GAP_16`] — whether native 32-bit Advanced flows use this is decided
-/// against libRIST when the Advanced profile lands).
+/// The half-32-bit-space antipode (2^31), the 32-bit analog of [`MAX_GAP_16`] for
+/// circular ordering.
+///
+/// NOTE: this is **not** the Advanced missing-packet cap. Since libRIST's
+/// 2026-06-20 fix, `receiver_mark_missing` caps a 32-bit flow's gap at
+/// `receiver_queue_max/2` — half the recovery ring, not half the sequence space —
+/// so `mark_missing` scales to `ring.len()/2`, not this constant.
 pub const MAX_GAP_32: u64 = 1 << 31;
 
 macro_rules! define_seq {

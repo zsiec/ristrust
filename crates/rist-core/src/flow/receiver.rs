@@ -784,9 +784,21 @@ impl Flow {
         }
         let last_found = self.receiver.last_found;
         let gap = u64::from(current.wrapping_sub(last_found));
-        // Wraparound guard pinned to seq::MAX_GAP_16 (32768) for flows widened
-        // from 16-bit sequences (libRIST `if (missing_count > 32768) return`).
-        if gap > seq::MAX_GAP_16 {
+        // Wraparound guard: a forward gap larger than the cap reads as a
+        // backward wrap/reorder, not loss, and is not NACKed. The cap is
+        // profile-aware, matching libRIST receiver_mark_missing
+        // `missing_count > (short_seq ? UINT16_SIZE/2 : receiver_queue_max/2)`:
+        // widened 16-bit (Simple/Main) flows pin to seq::MAX_GAP_16 (32768);
+        // native 32-bit Advanced flows scale to half the recovery ring — the
+        // widest contiguous loss the ring can still address and retransmit. At
+        // the default 65536-slot ring the two coincide; they diverge only once
+        // recovery_depth grows the Advanced ring.
+        let max_gap = if self.receiver.short_seq {
+            seq::MAX_GAP_16
+        } else {
+            (self.receiver.ring.len() / 2) as u64
+        };
+        if gap > max_gap {
             return;
         }
         // gap == 0 means a re-keyed packet for last_found itself; libRIST's walk
@@ -1842,6 +1854,51 @@ mod tests {
             f.feed(ts(17_000), 0, mk_pkt(next, 7_000, b""));
             assert_eq!(f.stats().missing, want, "gap {first}->{next}");
         }
+    }
+
+    #[test]
+    fn missing_gap_cap_profile_aware() {
+        // libRIST receiver_mark_missing caps the missing gap at
+        // `short_seq ? UINT16_SIZE/2 : receiver_queue_max/2`. On a native 32-bit
+        // Advanced flow with a ring deeper than the 16-bit space, a contiguous
+        // gap above MAX_GAP_16 but below ring/2 is real, recoverable loss and
+        // must be NACKed — whereas the same gap on a widened 16-bit flow stays an
+        // ambiguous wraparound and is ignored regardless of ring depth.
+        const RING_SIZE: usize = 1 << 18; // 262144 slots; ring/2 == 131072
+        const GAP: u32 = 70_000; // MAX_GAP_16 (32768) < GAP < ring/2 (131072)
+
+        let feed = |short_seq: bool| -> Flow {
+            let mut cfg = Config::librist_defaults();
+            cfg.ring_size = RING_SIZE;
+            let mut f = Flow::new(Role::Receiver, cfg);
+            let mut anchor = mk_pkt(100, 0, b"");
+            anchor.short_seq = short_seq;
+            f.feed(ts(10_000), 0, anchor);
+            let mut next = mk_pkt(100 + GAP, 7_000, b"");
+            next.short_seq = short_seq;
+            f.feed(ts(17_000), 0, next);
+            f
+        };
+
+        // Advanced (short_seq=false): the gap is within the ring's half-span, so
+        // it is detected as loss (count bounded by missing_counter_max, non-zero).
+        let fa = feed(false);
+        assert!(
+            fa.stats().missing > 0,
+            "Advanced 32-bit flow: gap {GAP} marked 0 missing, want > 0 (recoverable within ring/2)"
+        );
+        assert_eq!(fa.receiver.last_found, 100 + GAP);
+
+        // Widened 16-bit (short_seq=true): the same gap exceeds MAX_GAP_16, so it
+        // stays wraparound — the packet is still accepted (last_found advances)
+        // but nothing is marked missing.
+        let fs = feed(true);
+        assert_eq!(
+            fs.stats().missing,
+            0,
+            "widened 16-bit flow: gap {GAP} must read as wraparound, not loss"
+        );
+        assert_eq!(fs.receiver.last_found, 100 + GAP);
     }
 
     #[test]
